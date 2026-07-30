@@ -1,0 +1,103 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "BUILD_TESTING": "ON",
+        "LAZYCOM_BUILD_TESTS": "ON",
+        "LAZYCOM_BUILD_DIAGNOSTICS": "ON",
+        "LAZYCOM_USE_SYSTEM_LIBSERIALPORT": "OFF",
+        "LAZYCOM_WARNINGS_AS_ERRORS": "ON"
+      }
+    },
+    {
+      "name": "gcc-debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/gcc-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "clang-debug",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/clang-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "gcc-release",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build/gcc-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "gcc-debug-no-diagnostics",
+      "inherits": "gcc-debug",
+      "binaryDir": "${sourceDir}/build/gcc-debug-no-diagnostics",
+      "cacheVariables": {
+        "LAZYCOM_BUILD_DIAGNOSTICS": "OFF"
+      }
+    },
+    {
+      "name": "gcc-asan-ubsan",
+      "inherits": "gcc-debug",
+      "binaryDir": "${sourceDir}/build/gcc-asan-ubsan",
+      "cacheVariables": {
+        "LAZYCOM_ENABLE_ASAN": "ON",
+        "LAZYCOM_ENABLE_UBSAN": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "gcc-debug", "configurePreset": "gcc-debug" },
+    { "name": "clang-debug", "configurePreset": "clang-debug" },
+    { "name": "gcc-release", "configurePreset": "gcc-release" },
+    { "name": "gcc-debug-no-diagnostics", "configurePreset": "gcc-debug-no-diagnostics" },
+    { "name": "gcc-asan-ubsan", "configurePreset": "gcc-asan-ubsan" }
+  ],
+  "testPresets": [
+    {
+      "name": "gcc-debug",
+      "configurePreset": "gcc-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "clang-debug",
+      "configurePreset": "clang-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "gcc-release",
+      "configurePreset": "gcc-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "gcc-debug-no-diagnostics",
+      "configurePreset": "gcc-debug-no-diagnostics",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "gcc-asan-ubsan",
+      "configurePreset": "gcc-asan-ubsan",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
