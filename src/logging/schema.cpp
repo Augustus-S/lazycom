@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <exception>
 #include <limits>
+#include <new>
 #include <string>
 #include <utility>
 
@@ -13,6 +15,16 @@ namespace lazycom::logging {
 namespace {
 
 using Json = nlohmann::json;
+
+constexpr std::size_t kMaxJsonDepth = 16U;
+constexpr std::size_t kMaxJsonStructuralEvents = 256U;
+
+class JsonComplexityError final : public std::exception {
+public:
+  [[nodiscard]] const char *what() const noexcept override {
+    return "JSON nesting or structural complexity exceeds its limit";
+  }
+};
 
 [[nodiscard]] SchemaError error(SchemaErrorCode code, std::string field,
                                 std::string detail, std::size_t line = 0) {
@@ -346,13 +358,37 @@ get_metadata(const Json &object, std::string_view name, bool required) {
         error(SchemaErrorCode::InvalidJson, {}, "NDJSON line is empty"));
   }
   try {
-    auto document = Json::parse(input.begin(), input.end());
+    std::size_t structural_events = 0U;
+    Json::parser_callback_t complexity_guard =
+        [&structural_events](const int depth, const Json::parse_event_t event,
+                             Json &) {
+          if (depth < 0 || static_cast<std::size_t>(depth) > kMaxJsonDepth) {
+            throw JsonComplexityError{};
+          }
+          if (event != Json::parse_event_t::object_end &&
+              event != Json::parse_event_t::array_end &&
+              ++structural_events > kMaxJsonStructuralEvents) {
+            throw JsonComplexityError{};
+          }
+          return true;
+        };
+    auto document =
+        Json::parse(input.begin(), input.end(), complexity_guard, true);
     if (!document.is_object()) {
       return tl::unexpected(error(SchemaErrorCode::InvalidType, {},
                                   "NDJSON line must be a JSON object"));
     }
     return document;
+  } catch (const JsonComplexityError &exception) {
+    return tl::unexpected(
+        error(SchemaErrorCode::LimitExceeded, {}, exception.what()));
+  } catch (const std::bad_alloc &) {
+    return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                "JSON parsing exhausted available memory"));
   } catch (const Json::exception &exception) {
+    return tl::unexpected(
+        error(SchemaErrorCode::InvalidJson, {}, exception.what()));
+  } catch (const std::exception &exception) {
     return tl::unexpected(
         error(SchemaErrorCode::InvalidJson, {}, exception.what()));
   }
@@ -828,9 +864,15 @@ required_uint32(const Json &object, std::string_view field) {
         return tl::unexpected(std::move(decoded.error()));
       }
       if (is_strict_utf8(*decoded)) {
-        return tl::unexpected(
-            error(SchemaErrorCode::InvalidRecord, "encoding",
-                  "strict UTF-8 payload must use utf8 encoding"));
+        auto utf8_object = object;
+        utf8_object["encoding"] = "utf8";
+        utf8_object["content"] = bytes_to_string(*decoded);
+        if (dump_line(utf8_object).size() <= kMaxPhysicalLineBytes) {
+          return tl::unexpected(
+              error(SchemaErrorCode::InvalidRecord, "encoding",
+                    "strict UTF-8 payload must use utf8 encoding unless "
+                    "escaping would exceed the physical line limit"));
+        }
       }
       record.payload = std::move(*decoded);
       record.encoding = PayloadEncoding::Base64;
@@ -998,10 +1040,22 @@ SchemaResult<std::string> encode_header_line(const Header &header) {
     if (!object) {
       return tl::unexpected(std::move(object.error()));
     }
-    return dump_line(*object);
+    auto line = dump_line(*object);
+    if (line.size() > kMaxPhysicalLineBytes) {
+      return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                  "encoded header exceeds the physical line "
+                                  "byte limit"));
+    }
+    return line;
+  } catch (const std::bad_alloc &) {
+    return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                "header encoding exhausted available memory"));
   } catch (const Json::exception &exception) {
     return tl::unexpected(
         error(SchemaErrorCode::InvalidUtf8, {}, exception.what()));
+  } catch (const std::exception &exception) {
+    return tl::unexpected(
+        error(SchemaErrorCode::InvalidField, {}, exception.what()));
   }
 }
 
@@ -1011,136 +1065,200 @@ SchemaResult<std::string> encode_record_line(const Record &record) {
     if (!object) {
       return tl::unexpected(std::move(object.error()));
     }
-    return dump_line(*object);
+    auto line = dump_line(*object);
+    if (line.size() > kMaxPhysicalLineBytes &&
+        (record.direction == Direction::Rx ||
+         record.direction == Direction::Tx) &&
+        is_strict_utf8(record.payload)) {
+      (*object)["encoding"] = "base64";
+      (*object)["content"] = encode_base64(record.payload);
+      line = dump_line(*object);
+    }
+    if (line.size() > kMaxPhysicalLineBytes) {
+      return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                  "encoded record exceeds the physical line "
+                                  "byte limit"));
+    }
+    return line;
+  } catch (const std::bad_alloc &) {
+    return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                "record encoding exhausted available memory"));
   } catch (const Json::exception &exception) {
     return tl::unexpected(
         error(SchemaErrorCode::InvalidUtf8, {}, exception.what()));
+  } catch (const std::exception &exception) {
+    return tl::unexpected(
+        error(SchemaErrorCode::InvalidField, {}, exception.what()));
   }
 }
 
 SchemaResult<std::string> encode_ndjson(const Header &header,
                                         std::span<const Record> records) {
-  auto encoded_header = encode_header_line(header);
-  if (!encoded_header) {
-    return tl::unexpected(std::move(encoded_header.error()));
-  }
-  std::string output = std::move(*encoded_header);
-  std::uint64_t last_seq = 0U;
-  for (const auto &record : records) {
-    if (record.seq <= last_seq) {
-      return tl::unexpected(
-          error(SchemaErrorCode::InvalidRecord, "seq",
-                "record sequences must be strictly increasing"));
+  try {
+    if (records.size() > kMaxNdjsonRecords) {
+      return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                  "NDJSON document exceeds its record limit"));
     }
-    auto encoded_record = encode_record_line(record);
-    if (!encoded_record) {
-      return tl::unexpected(std::move(encoded_record.error()));
+    auto encoded_header = encode_header_line(header);
+    if (!encoded_header) {
+      return tl::unexpected(std::move(encoded_header.error()));
     }
-    output += *encoded_record;
-    last_seq = record.seq;
+    if (encoded_header->size() > kMaxNdjsonDocumentBytes) {
+      return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                  "NDJSON document exceeds its byte limit"));
+    }
+    std::string output = std::move(*encoded_header);
+    std::uint64_t last_seq = 0U;
+    for (const auto &record : records) {
+      if (record.seq <= last_seq) {
+        return tl::unexpected(
+            error(SchemaErrorCode::InvalidRecord, "seq",
+                  "record sequences must be strictly increasing"));
+      }
+      auto encoded_record = encode_record_line(record);
+      if (!encoded_record) {
+        return tl::unexpected(std::move(encoded_record.error()));
+      }
+      if (encoded_record->size() > kMaxNdjsonDocumentBytes - output.size()) {
+        return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                    "NDJSON document exceeds its byte limit"));
+      }
+      output.append(*encoded_record);
+      last_seq = record.seq;
+    }
+    return output;
+  } catch (const std::bad_alloc &) {
+    return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                "NDJSON encoding exhausted available memory"));
+  } catch (const std::exception &exception) {
+    return tl::unexpected(
+        error(SchemaErrorCode::InvalidField, {}, exception.what()));
   }
-  return output;
 }
 
 SchemaResult<Header> decode_header_line(std::string_view line) {
-  auto object = parse_json_line(line);
-  if (!object) {
-    return tl::unexpected(std::move(object.error()));
+  try {
+    auto object = parse_json_line(line);
+    if (!object) {
+      return tl::unexpected(std::move(object.error()));
+    }
+    return decode_header_json(*object);
+  } catch (const std::bad_alloc &) {
+    return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                "header decoding exhausted available memory"));
+  } catch (const std::exception &exception) {
+    return tl::unexpected(
+        error(SchemaErrorCode::InvalidJson, {}, exception.what()));
   }
-  return decode_header_json(*object);
 }
 
 SchemaResult<Record> decode_record_line(std::string_view line) {
-  auto object = parse_json_line(line);
-  if (!object) {
-    return tl::unexpected(std::move(object.error()));
+  try {
+    auto object = parse_json_line(line);
+    if (!object) {
+      return tl::unexpected(std::move(object.error()));
+    }
+    return decode_record_json(*object);
+  } catch (const std::bad_alloc &) {
+    return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                "record decoding exhausted available memory"));
+  } catch (const std::exception &exception) {
+    return tl::unexpected(
+        error(SchemaErrorCode::InvalidJson, {}, exception.what()));
   }
-  return decode_record_json(*object);
 }
 
 SchemaResult<NdjsonDocument> decode_ndjson(std::string_view input) {
-  if (input.size() > kMaxNdjsonDocumentBytes) {
-    return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
-                                "NDJSON document exceeds its byte limit"));
-  }
-  NdjsonDocument result;
-  bool has_header = false;
-  std::uint64_t last_seq = 0U;
-  std::size_t line_number = 1U;
-  std::size_t offset = 0U;
-  while (offset < input.size()) {
-    const auto newline = input.find('\n', offset);
-    const bool unterminated = newline == std::string_view::npos;
-    if (unterminated) {
-      if (!has_header) {
-        return tl::unexpected(error(SchemaErrorCode::MissingHeader, {},
-                                    "no complete header line was found",
-                                    line_number));
+  try {
+    if (input.size() > kMaxNdjsonDocumentBytes) {
+      return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                  "NDJSON document exceeds its byte limit"));
+    }
+    NdjsonDocument result;
+    bool has_header = false;
+    std::uint64_t last_seq = 0U;
+    std::size_t line_number = 1U;
+    std::size_t offset = 0U;
+    while (offset < input.size()) {
+      const auto newline = input.find('\n', offset);
+      const bool unterminated = newline == std::string_view::npos;
+      if (unterminated) {
+        if (!has_header) {
+          return tl::unexpected(error(SchemaErrorCode::MissingHeader, {},
+                                      "no complete header line was found",
+                                      line_number));
+        }
+        result.incomplete_tail = true;
+        result.tail_error =
+            error(SchemaErrorCode::IncompleteTail, {},
+                  "incomplete final NDJSON line was ignored", line_number);
+        break;
       }
-      result.incomplete_tail = true;
-      result.tail_error =
-          error(SchemaErrorCode::IncompleteTail, {},
-                "incomplete final NDJSON line was ignored", line_number);
-      break;
-    }
-    const auto line = unterminated
-                          ? input.substr(offset)
-                          : input.substr(offset, newline - offset + 1U);
-    auto object = parse_json_line(line);
-    if (!object) {
-      object.error().line = line_number;
-      return tl::unexpected(std::move(object.error()));
-    }
-    auto type = line_type(*object);
-    if (!type) {
-      type.error().line = line_number;
-      return tl::unexpected(std::move(type.error()));
+      const auto line = unterminated
+                            ? input.substr(offset)
+                            : input.substr(offset, newline - offset + 1U);
+      auto object = parse_json_line(line);
+      if (!object) {
+        object.error().line = line_number;
+        return tl::unexpected(std::move(object.error()));
+      }
+      auto type = line_type(*object);
+      if (!type) {
+        type.error().line = line_number;
+        return tl::unexpected(std::move(type.error()));
+      }
+      if (!has_header) {
+        if (*type != "header") {
+          return tl::unexpected(
+              error(SchemaErrorCode::MissingHeader, "type",
+                    "the first complete line must be a header", line_number));
+        }
+        auto header = decode_header_json(*object);
+        if (!header) {
+          header.error().line = line_number;
+          return tl::unexpected(std::move(header.error()));
+        }
+        result.header = std::move(*header);
+        has_header = true;
+      } else {
+        if (*type == "header") {
+          return tl::unexpected(
+              error(SchemaErrorCode::UnexpectedHeader, "type",
+                    "a log may contain only one leading header", line_number));
+        }
+        if (result.records.size() >= kMaxNdjsonRecords) {
+          return tl::unexpected(
+              error(SchemaErrorCode::LimitExceeded, {},
+                    "NDJSON document exceeds its record limit", line_number));
+        }
+        auto record = decode_record_json(*object);
+        if (!record) {
+          record.error().line = line_number;
+          return tl::unexpected(std::move(record.error()));
+        }
+        if (record->seq <= last_seq) {
+          return tl::unexpected(error(
+              SchemaErrorCode::InvalidRecord, "seq",
+              "record sequences must be strictly increasing", line_number));
+        }
+        last_seq = record->seq;
+        result.records.push_back(std::move(*record));
+      }
+      offset = newline + 1U;
+      ++line_number;
     }
     if (!has_header) {
-      if (*type != "header") {
-        return tl::unexpected(error(SchemaErrorCode::MissingHeader, "type",
-                                    "the first complete line must be a header",
-                                    line_number));
-      }
-      auto header = decode_header_json(*object);
-      if (!header) {
-        header.error().line = line_number;
-        return tl::unexpected(std::move(header.error()));
-      }
-      result.header = std::move(*header);
-      has_header = true;
-    } else {
-      if (*type == "header") {
-        return tl::unexpected(error(SchemaErrorCode::UnexpectedHeader, "type",
-                                    "a log may contain only one leading header",
-                                    line_number));
-      }
-      if (result.records.size() >= kMaxNdjsonRecords) {
-        return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
-                                    "NDJSON document exceeds its record limit",
-                                    line_number));
-      }
-      auto record = decode_record_json(*object);
-      if (!record) {
-        record.error().line = line_number;
-        return tl::unexpected(std::move(record.error()));
-      }
-      if (record->seq <= last_seq) {
-        return tl::unexpected(
-            error(SchemaErrorCode::InvalidRecord, "seq",
-                  "record sequences must be strictly increasing", line_number));
-      }
-      last_seq = record->seq;
-      result.records.push_back(std::move(*record));
+      return tl::unexpected(error(SchemaErrorCode::MissingHeader, {},
+                                  "no complete header line was found"));
     }
-    offset = newline + 1U;
-    ++line_number;
+    return result;
+  } catch (const std::bad_alloc &) {
+    return tl::unexpected(error(SchemaErrorCode::LimitExceeded, {},
+                                "NDJSON decoding exhausted available memory"));
+  } catch (const std::exception &exception) {
+    return tl::unexpected(
+        error(SchemaErrorCode::InvalidJson, {}, exception.what()));
   }
-  if (!has_header) {
-    return tl::unexpected(error(SchemaErrorCode::MissingHeader, {},
-                                "no complete header line was found"));
-  }
-  return result;
 }
 
 bool BarrierTracker::mark_processed_through(std::uint64_t seq) noexcept {

@@ -8,16 +8,19 @@
 #include <deque>
 #include <dirent.h>
 #include <fcntl.h>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
 #include <variant>
@@ -28,6 +31,9 @@ namespace {
 constexpr std::string_view kLogPrefix = "lazycom-session-";
 constexpr std::string_view kLogSuffix = ".ndjson";
 constexpr std::string_view kLockName = ".lazycom-session.lock";
+constexpr std::size_t kMaxQueuedControlCommands = 256U;
+constexpr std::size_t kMaxPendingBarrierPromises = 256U;
+constexpr std::size_t kMaxDisableWaiters = 256U;
 
 class FileDescriptor {
 public:
@@ -159,6 +165,16 @@ struct DirectoryInventory {
   std::vector<Candidate> deletable;
 };
 
+struct DirectoryStamp {
+  std::uint64_t device{};
+  std::uint64_t inode{};
+  std::int64_t mtime_seconds{};
+  std::int64_t mtime_nanoseconds{};
+  std::int64_t ctime_seconds{};
+  std::int64_t ctime_nanoseconds{};
+  auto operator<=>(const DirectoryStamp &) const = default;
+};
+
 struct DirectoryCloser {
   void operator()(DIR *directory) const noexcept {
     if (directory != nullptr) {
@@ -166,6 +182,77 @@ struct DirectoryCloser {
     }
   }
 };
+
+[[nodiscard]] Result<FileDescriptor>
+open_or_create_log_directory(const std::filesystem::path &path) {
+  const auto native = path.native();
+  if (native.find('\0') != std::string::npos || !path.is_absolute() ||
+      path == path.root_path() || path.filename().empty()) {
+    return tl::make_unexpected(log_error("invalid session log directory path"));
+  }
+  const int root = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (root < 0) {
+    return tl::make_unexpected(
+        log_error("cannot open filesystem root for session logs", errno));
+  }
+  FileDescriptor current{root};
+  const auto relative = path.relative_path();
+  for (auto iterator = relative.begin(); iterator != relative.end();
+       ++iterator) {
+    const auto component = iterator->native();
+    if (component.empty() || component == "." || component == "..") {
+      return tl::make_unexpected(
+          log_error("invalid session log directory component"));
+    }
+    const bool final = std::next(iterator) == relative.end();
+    bool created = false;
+    int descriptor = ::openat(current.get(), component.c_str(),
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0 && errno == ENOENT) {
+      if (::mkdirat(current.get(), component.c_str(), S_IRWXU) != 0) {
+        return tl::make_unexpected(
+            log_error("cannot create session log directory", errno));
+      }
+      created = true;
+      if (::fchmodat(current.get(), component.c_str(), S_IRWXU,
+                     AT_SYMLINK_NOFOLLOW) != 0) {
+        return tl::make_unexpected(
+            log_error("cannot set session log directory mode 0700", errno));
+      }
+      descriptor = ::openat(current.get(), component.c_str(),
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    }
+    if (descriptor < 0) {
+      return tl::make_unexpected(
+          log_error("cannot open session log directory component", errno));
+    }
+    FileDescriptor next{descriptor};
+    if (created && ::fchmod(next.get(), S_IRWXU) != 0) {
+      return tl::make_unexpected(
+          log_error("cannot set session log directory mode 0700", errno));
+    }
+    struct stat status{};
+    if (::fstat(next.get(), &status) != 0 || !S_ISDIR(status.st_mode)) {
+      return tl::make_unexpected(
+          log_error("cannot inspect session log directory component", errno));
+    }
+    if (created &&
+        (status.st_uid != ::geteuid() || (status.st_mode & 07777) != S_IRWXU)) {
+      return tl::make_unexpected(log_error(
+          "new session log directory must be user-owned and mode 0700"));
+    }
+    if (final && (status.st_uid != ::geteuid() ||
+                  (status.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
+                  ::faccessat(next.get(), ".", W_OK | X_OK, AT_EACCESS) != 0)) {
+      return tl::make_unexpected(log_error(
+          "session log directory must be user-owned, private from writes, "
+          "writable, and searchable",
+          errno));
+    }
+    current = std::move(next);
+  }
+  return current;
+}
 
 [[nodiscard]] bool same_identity(const struct stat &status,
                                  const Candidate &candidate) noexcept {
@@ -202,31 +289,11 @@ public:
       return log_failure("invalid session log limits or header");
     }
 
-    const auto native = directory.native();
-    std::error_code path_error;
-    const bool directory_existed =
-        std::filesystem::exists(directory, path_error);
-    if (path_error) {
-      return log_failure("cannot inspect session log directory",
-                         path_error.value());
+    auto opened_directory = open_or_create_log_directory(directory);
+    if (!opened_directory) {
+      return tl::make_unexpected(opened_directory.error());
     }
-    if (!directory_existed) {
-      static_cast<void>(
-          std::filesystem::create_directories(directory, path_error));
-      if (path_error) {
-        return log_failure("cannot create session log directory",
-                           path_error.value());
-      }
-    }
-    if (!directory_existed && ::chmod(native.c_str(), S_IRWXU) != 0) {
-      return log_failure("cannot set session log directory mode 0700", errno);
-    }
-    const int directory_descriptor =
-        ::open(native.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (directory_descriptor < 0) {
-      return log_failure("cannot open session log directory", errno);
-    }
-    directory_fd_ = FileDescriptor{directory_descriptor};
+    directory_fd_ = std::move(*opened_directory);
     directory_path_ = directory;
 
     struct stat directory_status{};
@@ -237,6 +304,7 @@ public:
     }
     if (!S_ISDIR(directory_status.st_mode) ||
         directory_status.st_uid != ::geteuid() ||
+        (directory_status.st_mode & (S_IWGRP | S_IWOTH)) != 0 ||
         ::faccessat(directory_fd_.get(), ".", W_OK | X_OK, AT_EACCESS) != 0) {
       const int inspect_error = errno;
       reset_directory();
@@ -282,6 +350,25 @@ public:
       return log_failure("session log directory is locked", lock_error);
     }
 
+    const int watch_descriptor = ::inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (watch_descriptor < 0) {
+      const int watch_error = errno;
+      reset_directory();
+      return log_failure("cannot monitor session log directory", watch_error);
+    }
+    inventory_watch_fd_ = FileDescriptor{watch_descriptor};
+    const auto descriptor_path =
+        "/proc/self/fd/" + std::to_string(directory_fd_.get());
+    constexpr std::uint32_t watch_mask =
+        IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE |
+        IN_ATTRIB | IN_DELETE_SELF | IN_MOVE_SELF;
+    if (::inotify_add_watch(inventory_watch_fd_.get(), descriptor_path.c_str(),
+                            watch_mask) < 0) {
+      const int watch_error = errno;
+      reset_directory();
+      return log_failure("cannot watch session log directory", watch_error);
+    }
+
     quotas_ = quotas;
     started_at_ = std::string{started_at};
     header_ = std::string{encoded_header};
@@ -308,11 +395,16 @@ public:
     if (amount > quotas_.max_file_bytes - header_size) {
       return log_failure("one session record exceeds the file quota");
     }
+    auto refreshed = refresh_inventory();
+    if (!refreshed) {
+      return refreshed;
+    }
     if (amount > quotas_.max_file_bytes - active_size_) {
       auto closed = close_active();
       if (!closed) {
         return closed;
       }
+      inventory_cached_ = false;
       auto capacity = ensure_capacity(1U, header_size + amount);
       if (!capacity) {
         return capacity;
@@ -332,6 +424,9 @@ public:
       return written;
     }
     active_size_ += amount;
+    if (inventory_cached_) {
+      inventory_cache_.controlled_bytes += amount;
+    }
     return {};
   }
 
@@ -486,6 +581,7 @@ private:
       }
       const auto size =
           status.st_size < 0 ? 0U : static_cast<std::uint64_t>(status.st_size);
+      ++result.valid_files;
       if (size >
           std::numeric_limits<std::uint64_t>::max() - result.controlled_bytes) {
         result.controlled_bytes = std::numeric_limits<std::uint64_t>::max();
@@ -497,7 +593,6 @@ private:
         return tl::make_unexpected(candidate.error());
       }
       if (candidate->valid) {
-        ++result.valid_files;
         if (!candidate->active) {
           result.deletable.push_back(std::move(*candidate));
         }
@@ -518,30 +613,158 @@ private:
     return result;
   }
 
+  [[nodiscard]] Result<DirectoryStamp> directory_stamp() const {
+    struct stat status{};
+    if (::fstat(directory_fd_.get(), &status) != 0) {
+      return tl::make_unexpected(
+          log_error("cannot inspect session log directory state", errno));
+    }
+    return DirectoryStamp{static_cast<std::uint64_t>(status.st_dev),
+                          static_cast<std::uint64_t>(status.st_ino),
+                          static_cast<std::int64_t>(status.st_mtim.tv_sec),
+                          static_cast<std::int64_t>(status.st_mtim.tv_nsec),
+                          static_cast<std::int64_t>(status.st_ctim.tv_sec),
+                          static_cast<std::int64_t>(status.st_ctim.tv_nsec)};
+  }
+
+  [[nodiscard]] Result<bool> inventory_watch_changed() const {
+    bool changed = false;
+    alignas(struct inotify_event) std::array<char, 4096> events{};
+    while (true) {
+      const auto count =
+          ::read(inventory_watch_fd_.get(), events.data(), events.size());
+      if (count > 0) {
+        std::size_t offset = 0U;
+        const auto available = static_cast<std::size_t>(count);
+        while (offset <= available &&
+               available - offset >= sizeof(inotify_event)) {
+          const auto *event = reinterpret_cast<const inotify_event *>(
+              events.data() + static_cast<std::ptrdiff_t>(offset));
+          if ((event->mask & (IN_DELETE_SELF | IN_MOVE_SELF | IN_IGNORED)) !=
+              0U) {
+            return tl::make_unexpected(log_error(
+                "session log directory was moved, deleted, or unwatched"));
+          }
+          changed = true;
+          const auto event_size = sizeof(inotify_event) + event->len;
+          if (event_size > available - offset) {
+            return tl::make_unexpected(
+                log_error("invalid session log directory monitor event"));
+          }
+          offset += event_size;
+        }
+        changed = true;
+        continue;
+      }
+      if (count == 0 ||
+          (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
+        return changed;
+      }
+      if (errno == EINTR) {
+        continue;
+      }
+      return tl::make_unexpected(
+          log_error("cannot read session log directory monitor", errno));
+    }
+  }
+
+  [[nodiscard]] Status synchronize_active_file() {
+    if (active_fd_.get() < 0) {
+      return {};
+    }
+    struct stat opened{};
+    struct stat named{};
+    if (::fstat(active_fd_.get(), &opened) != 0 ||
+        ::fstatat(directory_fd_.get(), active_name_.c_str(), &named,
+                  AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(opened.st_mode) || !S_ISREG(named.st_mode) ||
+        opened.st_uid != ::geteuid() || named.st_uid != ::geteuid() ||
+        !exact_file_mode(opened) || !exact_file_mode(named) ||
+        opened.st_dev != named.st_dev || opened.st_ino != named.st_ino ||
+        opened.st_size < 0 || opened.st_size != named.st_size) {
+      return log_failure("active session log changed unexpectedly", errno);
+    }
+    const auto size = static_cast<std::uint64_t>(opened.st_size);
+    if (size < header_.size() || size > quotas_.max_file_bytes) {
+      return log_failure("active session log size is outside its quota");
+    }
+    active_size_ = size;
+    return {};
+  }
+
+  [[nodiscard]] Status refresh_inventory() {
+    auto before = directory_stamp();
+    if (!before) {
+      return tl::make_unexpected(before.error());
+    }
+    auto watch_changed = inventory_watch_changed();
+    if (!watch_changed) {
+      return tl::make_unexpected(watch_changed.error());
+    }
+    if (inventory_cached_ && *before == inventory_stamp_ && !*watch_changed) {
+      return {};
+    }
+    for (std::uint32_t attempt = 0U; attempt < 3U; ++attempt) {
+      auto observed = inventory();
+      if (!observed) {
+        return tl::make_unexpected(observed.error());
+      }
+      auto after = directory_stamp();
+      if (!after) {
+        return tl::make_unexpected(after.error());
+      }
+      watch_changed = inventory_watch_changed();
+      if (!watch_changed) {
+        return tl::make_unexpected(watch_changed.error());
+      }
+      if (*before == *after && !*watch_changed) {
+        auto synchronized = synchronize_active_file();
+        if (!synchronized) {
+          return synchronized;
+        }
+        inventory_cache_ = std::move(*observed);
+        inventory_stamp_ = *after;
+        inventory_cached_ = true;
+        return {};
+      }
+      before = std::move(after);
+    }
+    return log_failure("session log directory kept changing during inventory");
+  }
+
+  void update_inventory_stamp() noexcept {
+    auto stamp = directory_stamp();
+    if (!stamp) {
+      inventory_cached_ = false;
+      return;
+    }
+    inventory_stamp_ = *stamp;
+  }
+
   [[nodiscard]] Status ensure_capacity(std::size_t additional_files,
                                        std::uint64_t additional_bytes) {
-    auto observed = inventory();
-    if (!observed) {
-      return tl::make_unexpected(observed.error());
+    auto refreshed = refresh_inventory();
+    if (!refreshed) {
+      return refreshed;
     }
-    auto files = observed->valid_files;
-    auto bytes = observed->controlled_bytes;
+    auto &observed = inventory_cache_;
     std::size_t index = 0;
     const auto exceeds = [&] {
-      const bool file_limit = additional_files > quotas_.max_files ||
-                              files > quotas_.max_files - additional_files;
-      const bool byte_limit =
-          additional_bytes > quotas_.max_total_bytes ||
-          bytes > quotas_.max_total_bytes - additional_bytes;
+      const bool file_limit =
+          additional_files > quotas_.max_files ||
+          observed.valid_files > quotas_.max_files - additional_files;
+      const bool byte_limit = additional_bytes > quotas_.max_total_bytes ||
+                              observed.controlled_bytes >
+                                  quotas_.max_total_bytes - additional_bytes;
       return file_limit || byte_limit;
     };
     while (exceeds()) {
-      if (index >= observed->deletable.size()) {
+      if (index >= observed.deletable.size()) {
         return log_failure(
             "session log quota cannot be met without deleting an active, "
             "unknown, or damaged file");
       }
-      const auto &candidate = observed->deletable[index++];
+      const auto &candidate = observed.deletable[index++];
       struct stat current{};
       if (::fstatat(directory_fd_.get(), candidate.name.c_str(), &current,
                     AT_SYMLINK_NOFOLLOW) != 0 ||
@@ -552,9 +775,16 @@ private:
       if (::unlinkat(directory_fd_.get(), candidate.name.c_str(), 0) != 0) {
         return log_failure("cannot delete an old verified session log", errno);
       }
-      --files;
-      bytes = candidate.size > bytes ? 0U : bytes - candidate.size;
+      --observed.valid_files;
+      observed.controlled_bytes =
+          candidate.size > observed.controlled_bytes
+              ? 0U
+              : observed.controlled_bytes - candidate.size;
     }
+    observed.deletable.erase(observed.deletable.begin(),
+                             observed.deletable.begin() +
+                                 static_cast<std::ptrdiff_t>(index));
+    update_inventory_stamp();
     return {};
   }
 
@@ -582,16 +812,50 @@ private:
       }
       active_fd_ = FileDescriptor{descriptor};
       if (::fchmod(active_fd_.get(), S_IRUSR | S_IWUSR) != 0) {
-        return log_failure("cannot set session log mode 0600", errno);
+        const int mode_error = errno;
+        auto cleanup = abandon_active_file();
+        if (!cleanup) {
+          return cleanup;
+        }
+        return log_failure("cannot set session log mode 0600", mode_error);
       }
       auto written = write_all(active_fd_.get(), header_);
       if (!written) {
+        auto cleanup = abandon_active_file();
+        if (!cleanup) {
+          return cleanup;
+        }
         return written;
       }
       active_size_ = header_.size();
+      if (inventory_cached_) {
+        inventory_cache_.controlled_bytes += active_size_;
+        ++inventory_cache_.valid_files;
+        update_inventory_stamp();
+      }
       return {};
     }
     return log_failure("cannot allocate a unique session log filename");
+  }
+
+  [[nodiscard]] Status abandon_active_file() noexcept {
+    int unlink_result = -1;
+    if (!active_name_.empty()) {
+      do {
+        unlink_result =
+            ::unlinkat(directory_fd_.get(), active_name_.c_str(), 0);
+      } while (unlink_result != 0 && errno == EINTR);
+    }
+    const int unlink_error = errno;
+    active_fd_ = FileDescriptor{};
+    active_name_.clear();
+    active_size_ = 0U;
+    inventory_cached_ = false;
+    if (unlink_result != 0) {
+      return log_failure("cannot remove failed session log creation",
+                         unlink_error);
+    }
+    return {};
   }
 
   [[nodiscard]] Status close_active() noexcept {
@@ -616,15 +880,20 @@ private:
     if (lock_fd_.get() >= 0) {
       static_cast<void>(::flock(lock_fd_.get(), LOCK_UN));
     }
+    inventory_watch_fd_ = FileDescriptor{};
     lock_fd_ = FileDescriptor{};
     directory_fd_ = FileDescriptor{};
     directory_path_.clear();
     header_.clear();
     started_at_.clear();
+    inventory_cache_ = {};
+    inventory_stamp_ = {};
+    inventory_cached_ = false;
   }
 
   FileDescriptor directory_fd_;
   FileDescriptor lock_fd_;
+  FileDescriptor inventory_watch_fd_;
   FileDescriptor active_fd_;
   std::filesystem::path directory_path_;
   std::string active_name_;
@@ -632,6 +901,9 @@ private:
   std::string header_;
   SessionLogQuotas quotas_;
   std::uint64_t active_size_{};
+  DirectoryInventory inventory_cache_;
+  DirectoryStamp inventory_stamp_;
+  bool inventory_cached_{};
 };
 
 template <class T> [[nodiscard]] std::future<T> ready_future(T value) {
@@ -691,7 +963,7 @@ struct SessionWriter::Impl {
   };
   struct CloseItem {
     SessionLogState final_state{SessionLogState::Waiting};
-    std::promise<SessionCommandResult> promise;
+    std::vector<std::promise<SessionCommandResult>> promises;
   };
   struct BarrierItem {
     std::uint64_t target{};
@@ -705,7 +977,7 @@ struct SessionWriter::Impl {
 
   struct PendingBarrier {
     std::uint64_t target{};
-    std::promise<BarrierResult> promise;
+    std::vector<std::promise<BarrierResult>> promises;
   };
 
   Impl(SessionWriterOptions writer_options,
@@ -734,6 +1006,19 @@ struct SessionWriter::Impl {
     return command_result_locked();
   }
 
+  template <class T>
+  static void fulfill(std::promise<T> &promise, T value) noexcept {
+    try {
+      promise.set_value(std::move(value));
+    } catch (...) {
+    }
+  }
+
+  [[nodiscard]] SessionCommandResult failed_command_result() const noexcept {
+    return {SessionLogState::Error, processed.load(std::memory_order_acquire),
+            std::nullopt};
+  }
+
   void set_error(Error error) {
     {
       std::scoped_lock lock{mutex};
@@ -747,9 +1032,12 @@ struct SessionWriter::Impl {
 
   void complete_failed_barriers() {
     for (auto &barrier : pending_barriers) {
-      barrier.promise.set_value(failed_barrier(barrier.target, tracker));
+      for (auto &promise : barrier.promises) {
+        fulfill(promise, failed_barrier(barrier.target, tracker));
+      }
     }
     pending_barriers.clear();
+    pending_barrier_promises = 0U;
   }
 
   [[nodiscard]] bool flush_active() {
@@ -772,7 +1060,11 @@ struct SessionWriter::Impl {
     for (auto iterator = pending_barriers.begin();
          iterator != pending_barriers.end();) {
       if (iterator->target <= tracker.flushed_through_seq()) {
-        iterator->promise.set_value(tracker.check({iterator->target}));
+        const auto result = tracker.check({iterator->target});
+        for (auto &promise : iterator->promises) {
+          fulfill(promise, result);
+        }
+        pending_barrier_promises -= iterator->promises.size();
         iterator = pending_barriers.erase(iterator);
       } else {
         ++iterator;
@@ -795,7 +1087,7 @@ struct SessionWriter::Impl {
     }
   }
 
-  void handle(BatchItem item) {
+  void handle(BatchItem &item) {
     {
       std::scoped_lock lock{mutex};
       queued_record_count -= item.records.size();
@@ -848,7 +1140,7 @@ struct SessionWriter::Impl {
     }
   }
 
-  void handle(StartItem item) {
+  void handle(StartItem &item) {
     observe_overload();
     if (state.load(std::memory_order_acquire) != SessionLogState::Waiting) {
       SessionCommandResult result;
@@ -857,7 +1149,7 @@ struct SessionWriter::Impl {
         start_pending = false;
         result = command_result_locked();
       }
-      item.promise.set_value(std::move(result));
+      fulfill(item.promise, std::move(result));
       return;
     }
     auto encoded = encode_header_line(item.header);
@@ -868,7 +1160,7 @@ struct SessionWriter::Impl {
         std::scoped_lock lock{mutex};
         start_pending = false;
       }
-      item.promise.set_value(command_result());
+      fulfill(item.promise, command_result());
       return;
     }
     auto status = file_system->begin_session(
@@ -879,7 +1171,7 @@ struct SessionWriter::Impl {
         std::scoped_lock lock{mutex};
         start_pending = false;
       }
-      item.promise.set_value(command_result());
+      fulfill(item.promise, command_result());
       return;
     }
     worker_active = true;
@@ -904,10 +1196,10 @@ struct SessionWriter::Impl {
       static_cast<void>(file_system->close());
       worker_active = false;
     }
-    item.promise.set_value(command_result());
+    fulfill(item.promise, command_result());
   }
 
-  void handle(CloseItem item) {
+  void handle(CloseItem &item) {
     observe_overload();
     if (worker_active) {
       static_cast<void>(flush_active());
@@ -918,9 +1210,9 @@ struct SessionWriter::Impl {
       }
     }
     complete_failed_barriers();
+    std::vector<std::promise<SessionCommandResult>> disable_completions;
     {
       std::scoped_lock lock{mutex};
-      close_pending = false;
       active_file.clear();
       if (state.load(std::memory_order_acquire) != SessionLogState::Error) {
         state.store(item.final_state, std::memory_order_release);
@@ -928,30 +1220,59 @@ struct SessionWriter::Impl {
         terminal_error.reset();
         state.store(SessionLogState::Off, std::memory_order_release);
       }
+      if (item.final_state == SessionLogState::Off) {
+        disable_pending = false;
+        close_pending = false;
+        disable_completions.swap(disable_waiters);
+      } else {
+        close_pending = disable_pending;
+      }
     }
-    item.promise.set_value(command_result());
+    const auto result = command_result();
+    for (auto &promise : item.promises) {
+      fulfill(promise, result);
+    }
+    for (auto &promise : disable_completions) {
+      fulfill(promise, result);
+    }
   }
 
-  void handle(BarrierItem item) {
+  void handle(BarrierItem &item) {
     observe_overload();
     if (!worker_active ||
         state.load(std::memory_order_acquire) == SessionLogState::Error) {
-      item.promise.set_value(failed_barrier(item.target, tracker));
+      fulfill(item.promise, failed_barrier(item.target, tracker));
       return;
     }
     if (item.target <= tracker.processed_through_seq()) {
       static_cast<void>(flush_active());
       if (state.load(std::memory_order_acquire) == SessionLogState::Error) {
-        item.promise.set_value(failed_barrier(item.target, tracker));
+        fulfill(item.promise, failed_barrier(item.target, tracker));
       } else {
-        item.promise.set_value(tracker.check({item.target}));
+        fulfill(item.promise, tracker.check({item.target}));
       }
       return;
     }
-    pending_barriers.push_back({item.target, std::move(item.promise)});
+    if (pending_barrier_promises >= kMaxPendingBarrierPromises) {
+      fulfill(item.promise, failed_barrier(item.target, tracker));
+      return;
+    }
+    const auto matching = std::ranges::find_if(
+        pending_barriers, [&item](const PendingBarrier &barrier) {
+          return barrier.target == item.target;
+        });
+    if (matching != pending_barriers.end()) {
+      matching->promises.push_back(std::move(item.promise));
+    } else {
+      PendingBarrier pending;
+      pending.target = item.target;
+      pending.promises.push_back(std::move(item.promise));
+      pending_barriers.push_back(std::move(pending));
+    }
+    ++pending_barrier_promises;
   }
 
-  [[nodiscard]] bool handle(ShutdownItem item) {
+  [[nodiscard]] bool handle(ShutdownItem &item) {
     observe_overload();
     if (worker_active) {
       static_cast<void>(flush_active());
@@ -969,49 +1290,118 @@ struct SessionWriter::Impl {
         state.store(SessionLogState::Off, std::memory_order_release);
       }
     }
-    item.promise.set_value(command_result());
+    fulfill(item.promise, command_result());
     return true;
   }
 
-  void run() {
-    while (true) {
-      std::optional<Item> item;
-      {
-        std::unique_lock lock{mutex};
-        if (worker_active && bytes_since_flush != 0U) {
-          condition.wait_until(lock, next_flush,
-                               [this] { return !items.empty() || overloaded; });
-        } else {
-          condition.wait(lock, [this] { return !items.empty() || overloaded; });
-        }
-        if (!items.empty()) {
-          item.emplace(std::move(items.front()));
-          items.pop_front();
-        }
-      }
-      observe_overload();
-      if (!item) {
-        if (worker_active && bytes_since_flush != 0U &&
-            std::chrono::steady_clock::now() >= next_flush) {
-          static_cast<void>(flush_active());
-        }
-        continue;
-      }
-      bool stop = false;
+  void fail_worker(Item *current) noexcept {
+    state.store(SessionLogState::Error, std::memory_order_release);
+    static_cast<void>(file_system->close());
+    worker_active = false;
+    const auto command = failed_command_result();
+    const auto complete_item = [this, &command](Item &item) noexcept {
       std::visit(
-          [this, &stop](auto value) mutable {
-            using Value = decltype(value);
-            if constexpr (std::is_same_v<Value, ShutdownItem>) {
-              stop = handle(std::move(value));
-            } else {
-              handle(std::move(value));
+          [this, &command](auto &value) noexcept {
+            using Value = std::remove_cvref_t<decltype(value)>;
+            if constexpr (std::is_same_v<Value, StartItem>) {
+              fulfill(value.promise, command);
+            } else if constexpr (std::is_same_v<Value, CloseItem>) {
+              for (auto &promise : value.promises) {
+                fulfill(promise, command);
+              }
+            } else if constexpr (std::is_same_v<Value, BarrierItem>) {
+              fulfill(value.promise, failed_barrier(value.target, tracker));
+            } else if constexpr (std::is_same_v<Value, ShutdownItem>) {
+              fulfill(value.promise, command);
             }
           },
-          std::move(*item));
-      if (stop) {
-        return;
+          item);
+    };
+    if (current != nullptr) {
+      complete_item(*current);
+    }
+    std::scoped_lock lock{mutex};
+    worker_failed = true;
+    start_pending = false;
+    close_pending = false;
+    disable_pending = false;
+    active_file.clear();
+    for (auto &item : items) {
+      complete_item(item);
+    }
+    items.clear();
+    for (auto &barrier : pending_barriers) {
+      for (auto &promise : barrier.promises) {
+        fulfill(promise, failed_barrier(barrier.target, tracker));
       }
     }
+    pending_barriers.clear();
+    for (auto &promise : disable_waiters) {
+      fulfill(promise, command);
+    }
+    disable_waiters.clear();
+    queued_control_count = 0U;
+    pending_barrier_promises = 0U;
+    queued_record_count = 0U;
+    queued_byte_count = 0U;
+    condition.notify_all();
+  }
+
+  void run() noexcept {
+    std::optional<Item> item;
+    try {
+      while (true) {
+        item.reset();
+        {
+          std::unique_lock lock{mutex};
+          if (worker_active && bytes_since_flush != 0U) {
+            condition.wait_until(lock, next_flush, [this] {
+              return !items.empty() || overloaded;
+            });
+          } else {
+            condition.wait(lock,
+                           [this] { return !items.empty() || overloaded; });
+          }
+          if (!items.empty()) {
+            item.emplace(std::move(items.front()));
+            if (!std::holds_alternative<BatchItem>(*item)) {
+              --queued_control_count;
+            }
+            items.pop_front();
+          }
+        }
+        observe_overload();
+        if (!item) {
+          if (worker_active && bytes_since_flush != 0U &&
+              std::chrono::steady_clock::now() >= next_flush) {
+            static_cast<void>(flush_active());
+          }
+          continue;
+        }
+        bool stop = false;
+        std::visit(
+            [this, &stop](auto &value) {
+              using Value = std::remove_cvref_t<decltype(value)>;
+              if constexpr (std::is_same_v<Value, ShutdownItem>) {
+                stop = handle(value);
+              } else {
+                handle(value);
+              }
+            },
+            *item);
+        if (stop) {
+          break;
+        }
+        item.reset();
+      }
+    } catch (...) {
+      fail_worker(item ? &*item : nullptr);
+    }
+    {
+      std::scoped_lock lock{mutex};
+      stopped_ready = true;
+    }
+    condition.notify_all();
   }
 
   SessionWriterOptions options;
@@ -1020,6 +1410,7 @@ struct SessionWriter::Impl {
   std::condition_variable condition;
   std::deque<Item> items;
   std::vector<PendingBarrier> pending_barriers;
+  std::vector<std::promise<SessionCommandResult>> disable_waiters;
   std::atomic<SessionLogState> state{SessionLogState::Off};
   std::atomic<std::uint64_t> processed{};
   std::atomic<bool> overloaded{};
@@ -1029,13 +1420,18 @@ struct SessionWriter::Impl {
   std::filesystem::path active_file;
   std::size_t queued_record_count{};
   std::size_t queued_byte_count{};
+  std::size_t queued_control_count{};
+  std::size_t pending_barrier_promises{};
   std::size_t bytes_since_flush{};
   std::uint64_t last_enqueued_seq{};
   std::chrono::steady_clock::time_point next_flush{};
   bool worker_active{};
   bool stopping{};
+  bool worker_failed{};
   bool start_pending{};
   bool close_pending{};
+  bool disable_pending{};
+  bool stopped_ready{};
 };
 
 SessionWriter::SessionWriter(SessionWriterOptions options,
@@ -1074,19 +1470,40 @@ bool SessionWriter::enable() noexcept {
 }
 
 std::future<SessionCommandResult> SessionWriter::disable() {
+  std::promise<SessionCommandResult> promise;
+  auto future = promise.get_future();
   Impl::CloseItem item;
-  auto future = item.promise.get_future();
+  bool queued = false;
   {
     std::scoped_lock lock{impl_->mutex};
-    if (impl_->stopping) {
+    if (impl_->stopping || impl_->worker_failed) {
       return ready_future(impl_->command_result_locked());
     }
+    if (impl_->state.load(std::memory_order_acquire) == SessionLogState::Off &&
+        !impl_->disable_pending && !impl_->close_pending) {
+      return ready_future(impl_->command_result_locked());
+    }
+    if (impl_->disable_waiters.size() >= kMaxDisableWaiters ||
+        (!impl_->disable_pending &&
+         impl_->queued_control_count >= kMaxQueuedControlCommands)) {
+      auto result = impl_->command_result_locked();
+      result.error = log_error("session log control capacity is full");
+      return ready_future(std::move(result));
+    }
+    impl_->disable_waiters.push_back(std::move(promise));
     impl_->state.store(SessionLogState::Off, std::memory_order_release);
     impl_->close_pending = true;
-    item.final_state = SessionLogState::Off;
-    impl_->items.emplace_back(std::move(item));
+    if (!impl_->disable_pending) {
+      impl_->disable_pending = true;
+      item.final_state = SessionLogState::Off;
+      impl_->items.emplace_back(std::move(item));
+      ++impl_->queued_control_count;
+      queued = true;
+    }
   }
-  impl_->condition.notify_one();
+  if (queued) {
+    impl_->condition.notify_one();
+  }
   return future;
 }
 
@@ -1095,14 +1512,16 @@ std::future<SessionCommandResult> SessionWriter::start_session(Header header) {
   auto future = item.promise.get_future();
   {
     std::scoped_lock lock{impl_->mutex};
-    if (impl_->stopping ||
+    if (impl_->stopping || impl_->worker_failed ||
         impl_->state.load(std::memory_order_acquire) !=
             SessionLogState::Waiting ||
-        impl_->start_pending || impl_->close_pending) {
+        impl_->start_pending || impl_->close_pending ||
+        impl_->queued_control_count >= kMaxQueuedControlCommands) {
       return ready_future(impl_->command_result_locked());
     }
     impl_->start_pending = true;
     impl_->items.emplace_back(std::move(item));
+    ++impl_->queued_control_count;
   }
   impl_->condition.notify_one();
   return future;
@@ -1110,19 +1529,22 @@ std::future<SessionCommandResult> SessionWriter::start_session(Header header) {
 
 std::future<SessionCommandResult> SessionWriter::end_session() {
   Impl::CloseItem item;
-  auto future = item.promise.get_future();
+  item.promises.emplace_back();
+  auto future = item.promises.front().get_future();
   {
     std::scoped_lock lock{impl_->mutex};
-    if (impl_->stopping ||
+    if (impl_->stopping || impl_->worker_failed ||
         impl_->state.load(std::memory_order_acquire) !=
             SessionLogState::Recording ||
-        impl_->close_pending) {
+        impl_->close_pending ||
+        impl_->queued_control_count >= kMaxQueuedControlCommands) {
       return ready_future(impl_->command_result_locked());
     }
     impl_->state.store(SessionLogState::Waiting, std::memory_order_release);
     impl_->close_pending = true;
     item.final_state = SessionLogState::Waiting;
     impl_->items.emplace_back(std::move(item));
+    ++impl_->queued_control_count;
   }
   impl_->condition.notify_one();
   return future;
@@ -1178,13 +1600,15 @@ std::future<BarrierResult> SessionWriter::barrier(std::uint64_t target_seq) {
   auto future = item.promise.get_future();
   {
     std::scoped_lock lock{impl_->mutex};
-    if (impl_->stopping) {
+    if (impl_->stopping || impl_->worker_failed ||
+        impl_->queued_control_count >= kMaxQueuedControlCommands) {
       const auto processed = impl_->processed.load(std::memory_order_acquire);
       return ready_future(BarrierResult{BarrierState::WriterFailed, target_seq,
                                         processed, processed, processed,
                                         false});
     }
     impl_->items.emplace_back(std::move(item));
+    ++impl_->queued_control_count;
   }
   impl_->condition.notify_one();
   return future;
@@ -1195,14 +1619,26 @@ std::future<SessionCommandResult> SessionWriter::shutdown() {
   auto future = item.promise.get_future();
   {
     std::scoped_lock lock{impl_->mutex};
-    if (impl_->stopping) {
+    if (impl_->stopping || impl_->worker_failed) {
       return ready_future(impl_->command_result_locked());
     }
     impl_->stopping = true;
     impl_->items.emplace_back(std::move(item));
+    ++impl_->queued_control_count;
   }
   impl_->condition.notify_one();
   return future;
+}
+
+bool SessionWriter::wait_until_stopped(
+    const std::chrono::steady_clock::time_point deadline) const noexcept {
+  try {
+    std::unique_lock lock{impl_->mutex};
+    return impl_->condition.wait_until(lock, deadline,
+                                       [this] { return impl_->stopped_ready; });
+  } catch (...) {
+    return false;
+  }
 }
 
 SessionLogState SessionWriter::state() const noexcept {

@@ -586,8 +586,15 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 	 * descriptor is already locked by another process.
 	 */
 #ifdef HAVE_FLOCK
-	if (flock(port->fd, LOCK_EX | LOCK_NB) < 0)
-		RETURN_FAIL("flock() failed");
+	if (flock(port->fd, LOCK_EX | LOCK_NB) < 0) {
+		int error = errno;
+		close(port->fd);
+		port->fd = -1;
+		errno = error;
+		DEBUG_FAIL("flock() failed");
+		errno = error;
+		return SP_ERR_FAIL;
+	}
 #endif
 
 #ifdef TIOCEXCL
@@ -596,8 +603,15 @@ SP_API enum sp_return sp_open(struct sp_port *port, enum sp_mode flags)
 	 * lead to EINVAL or ENOTTY.
 	 * These errors aren't fatal and can be ignored.
 	 */
-	if (ioctl(port->fd, TIOCEXCL) < 0 && errno != EINVAL && errno != ENOTTY)
-		RETURN_FAIL("ioctl() failed");
+	if (ioctl(port->fd, TIOCEXCL) < 0 && errno != EINVAL && errno != ENOTTY) {
+		int error = errno;
+		close(port->fd);
+		port->fd = -1;
+		errno = error;
+		DEBUG_FAIL("ioctl() failed");
+		errno = error;
+		return SP_ERR_FAIL;
+	}
 #endif
 
 #endif
@@ -2601,9 +2615,8 @@ SP_API void sp_free_error_message(char *message)
 
 SP_API void sp_set_debug_handler(void (*handler)(const char *format, ...))
 {
-	TRACE("%p", handler);
-
 	sp_debug_handler = handler;
+	TRACE("%p", handler);
 
 	RETURN();
 }

@@ -322,6 +322,42 @@ TEST_CASE("atomic writer detects in-place changes after staging",
   REQUIRE(current->bytes == "modified");
 }
 
+TEST_CASE("atomic writer never replaces an unexpected newly-created target",
+          "[config][file]") {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "state.toml";
+  auto transaction =
+      lazycom::config::linux_atomic_file_system().begin_atomic_write(path, 1024,
+                                                                     {});
+  REQUIRE(transaction);
+  REQUIRE((*transaction)->stage("ours"));
+  write_test_file(path, "external");
+
+  REQUIRE_FALSE((*transaction)->commit());
+  const auto current = lazycom::config::read_safe_file(path, 1024);
+  REQUIRE(current);
+  REQUIRE(current->bytes == "external");
+}
+
+TEST_CASE("atomic writer directory lock is nonblocking and released with owner",
+          "[config][file]") {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "state.toml";
+  auto first = lazycom::config::linux_atomic_file_system().begin_atomic_write(
+      path, 1024U, {});
+  REQUIRE(first);
+
+  const auto contended =
+      lazycom::config::linux_atomic_file_system().begin_atomic_write(path,
+                                                                     1024U, {});
+  REQUIRE_FALSE(contended);
+  CHECK(contended.error().detail == "configuration directory is busy");
+
+  first->reset();
+  REQUIRE(lazycom::config::linux_atomic_file_system().begin_atomic_write(
+      path, 1024U, {}));
+}
+
 TEST_CASE("atomic writer enforces the caller file limit", "[config][file]") {
   const auto target = std::filesystem::path{"/unused/state.toml"};
   lazycom::test::FakeAtomicFileSystem file_system{

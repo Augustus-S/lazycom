@@ -656,7 +656,11 @@ void validate_quick_slot(const QuickSendSlot &slot, std::string_view base,
   }
   std::array<bool, 20> occupied{};
   if (slots != nullptr) {
-    for (std::size_t position = 0; position < slots->size(); ++position) {
+    if (slots->size() > candidate.slots.size()) {
+      add_error(result.errors, "slots", "must not contain more than 20 slots");
+    }
+    const auto slots_to_parse = std::min(slots->size(), candidate.slots.size());
+    for (std::size_t position = 0; position < slots_to_parse; ++position) {
       const auto base = "slots[" + std::to_string(position) + "]";
       const auto *slot_table = slots->get(position)->as_table();
       if (slot_table == nullptr) {
@@ -668,6 +672,7 @@ void validate_quick_slot(const QuickSendSlot &slot, std::string_view base,
                         base, result.warnings);
       const auto *index_node = slot_table->get("index");
       if (index_node == nullptr) {
+        // A table without an index represents an intentionally empty slot.
         continue;
       }
       const auto index_value = index_node->value<std::int64_t>();
@@ -754,7 +759,15 @@ void validate_quick_slot(const QuickSendSlot &slot, std::string_view base,
 
 template <class ResultType, class Parser>
 [[nodiscard]] ResultType parse_document(std::string_view document,
+                                        std::size_t maximum_bytes,
                                         Parser parser) {
+  if (document.size() > maximum_bytes) {
+    ResultType result;
+    result.read_only = true;
+    add_error(result.errors, "$document",
+              "TOML document exceeds its maximum size");
+    return result;
+  }
   try {
     auto table = toml::parse(document);
     return parser(std::move(table), std::string{document});
@@ -1102,15 +1115,18 @@ validate_state_snapshot(const StateSnapshot &snapshot) {
 }
 
 ConfigLoadResult parse_config_toml(std::string_view document) {
-  return parse_document<ConfigLoadResult>(document, parse_config_table);
+  return parse_document<ConfigLoadResult>(document, kConfigMaximumBytes,
+                                          parse_config_table);
 }
 
 QuickSendLoadResult parse_quick_send_toml(std::string_view document) {
-  return parse_document<QuickSendLoadResult>(document, parse_quick_send_table);
+  return parse_document<QuickSendLoadResult>(document, kQuickSendMaximumBytes,
+                                             parse_quick_send_table);
 }
 
 StateLoadResult parse_state_toml(std::string_view document) {
-  return parse_document<StateLoadResult>(document, parse_state_table);
+  return parse_document<StateLoadResult>(document, kStateMaximumBytes,
+                                         parse_state_table);
 }
 
 ConfigLoadResult load_config_toml(const std::filesystem::path &path) {

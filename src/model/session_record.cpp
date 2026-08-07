@@ -25,8 +25,7 @@ saturating_multiply(const std::size_t value,
 }
 
 [[nodiscard]] bool stable_error_code(const std::string &value) noexcept {
-  if (!value.starts_with("LC-") || value.size() < 11U ||
-      value.size() > 32U) {
+  if (!value.starts_with("LC-") || value.size() < 11U || value.size() > 32U) {
     return false;
   }
   const auto separator = value.find('-', 3U);
@@ -47,14 +46,34 @@ saturating_multiply(const std::size_t value,
   return true;
 }
 
+[[nodiscard]] bool
+valid_direction(const logging::Direction direction) noexcept {
+  switch (direction) {
+  case logging::Direction::Rx:
+  case logging::Direction::Tx:
+  case logging::Direction::Sys:
+  case logging::Direction::Err:
+    return true;
+  }
+  return false;
+}
+
+[[nodiscard]] bool valid_input_mode(const logging::InputMode mode) noexcept {
+  switch (mode) {
+  case logging::InputMode::Text:
+  case logging::InputMode::Hex:
+    return true;
+  }
+  return false;
+}
+
 } // namespace
 
 SessionRecord::SessionRecord(const std::uint64_t seq, RecordDraft draft)
     : seq_(seq), direction_(draft.direction), time_(std::move(draft.time)),
       payload_(std::move(draft.payload)), input_mode_(draft.input_mode),
       message_(logging::sanitize_message(draft.message)),
-      code_(std::move(draft.code)),
-      operation_id_(draft.operation_id) {}
+      code_(std::move(draft.code)), operation_id_(draft.operation_id) {}
 
 std::size_t SessionRecord::logical_bytes() const noexcept {
   auto result = sizeof(SessionRecord);
@@ -93,8 +112,8 @@ SessionRecordBatch::SessionRecordBatch(const SessionId session_id,
   auto seq = first_seq;
   for (auto &draft : drafts) {
     records_.push_back(SessionRecord{seq, std::move(draft)});
-    logical_bytes_ = saturating_add(logical_bytes_,
-                                    records_.back().logical_bytes());
+    logical_bytes_ =
+        saturating_add(logical_bytes_, records_.back().logical_bytes());
     ++seq;
   }
 }
@@ -108,7 +127,9 @@ std::uint64_t SessionRecordBatch::last_seq() const noexcept {
 }
 
 bool valid_record_draft(const RecordDraft &draft) noexcept {
-  if (!logging::is_valid_utc(draft.time.time_utc)) {
+  if (!logging::is_valid_utc(draft.time.time_utc) ||
+      !valid_direction(draft.direction) ||
+      (draft.input_mode && !valid_input_mode(*draft.input_mode))) {
     return false;
   }
   const bool payload_direction = draft.direction == logging::Direction::Rx ||
@@ -130,9 +151,8 @@ bool valid_record_draft(const RecordDraft &draft) noexcept {
 std::size_t
 estimate_batch_metadata(const std::span<const RecordDraft> drafts) noexcept {
   auto result = sizeof(SessionRecordBatch);
-  if (drafts.size() >
-      (std::numeric_limits<std::size_t>::max() - result) /
-          sizeof(SessionRecord)) {
+  if (drafts.size() > (std::numeric_limits<std::size_t>::max() - result) /
+                          sizeof(SessionRecord)) {
     return std::numeric_limits<std::size_t>::max();
   }
   result += drafts.size() * sizeof(SessionRecord);
@@ -144,8 +164,7 @@ estimate_batch_metadata(const std::span<const RecordDraft> drafts) noexcept {
       const auto maximum_output =
           std::min(logging::kMaxMessageBytes,
                    saturating_multiply(draft.message.size(), 4U));
-      result = saturating_add(
-          result, saturating_multiply(maximum_output, 2U));
+      result = saturating_add(result, saturating_multiply(maximum_output, 2U));
     }
     if (draft.code) {
       result = saturating_add(result, draft.code->capacity());

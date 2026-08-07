@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -21,6 +22,7 @@
 #include <limits>
 #include <optional>
 #include <ranges>
+#include <span>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -195,9 +197,19 @@ const Color shortcut_text = Color::RGB(255U, 255U, 255U);
     return std::string{value};
   }
   if (max_size <= 3U) {
-    return std::string{value.substr(value.size() - max_size)};
+    std::size_t begin = value.size() - max_size;
+    while (begin < value.size() &&
+           (static_cast<unsigned char>(value[begin]) & 0xC0U) == 0x80U) {
+      ++begin;
+    }
+    return std::string{value.substr(begin)};
   }
-  return "..." + std::string{value.substr(value.size() - (max_size - 3U))};
+  std::size_t begin = value.size() - (max_size - 3U);
+  while (begin < value.size() &&
+         (static_cast<unsigned char>(value[begin]) & 0xC0U) == 0x80U) {
+    ++begin;
+  }
+  return "..." + std::string{value.substr(begin)};
 }
 
 [[nodiscard]] char parity_letter(const config::Parity parity) noexcept {
@@ -297,7 +309,93 @@ const Color shortcut_text = Color::RGB(255U, 255U, 255U);
          logging::sanitize_message(error.detail);
 }
 
+[[nodiscard]] bool continuation_byte(const char value) noexcept {
+  return (static_cast<unsigned char>(value) & 0xC0U) == 0x80U;
+}
+
+[[nodiscard]] std::size_t
+utf8_boundary_at_or_before(const std::string_view value,
+                           std::size_t position) noexcept {
+  position = std::min(position, value.size());
+  while (position != 0U && position < value.size() &&
+         continuation_byte(value[position])) {
+    --position;
+  }
+  return position;
+}
+
+[[nodiscard]] bool strict_utf8(const std::string_view value) noexcept {
+  return logging::is_strict_utf8(
+      std::as_bytes(std::span{value.data(), value.size()}));
+}
+
+constexpr std::size_t kSearchMaximumBytes = 4096U;
+constexpr std::size_t kCommandMaximumBytes = 64U;
+constexpr std::size_t kNumericMaximumBytes = 20U;
+constexpr std::size_t kPathMaximumBytes = 4096U;
+constexpr std::size_t kGeneralModalMaximumBytes = 4096U;
+
 } // namespace
+
+bool edit_utf8_text(std::string &value, std::size_t &cursor,
+                    const Utf8EditAction action,
+                    const std::string_view insertion,
+                    const std::size_t maximum_bytes) {
+  cursor = utf8_boundary_at_or_before(value, cursor);
+  switch (action) {
+  case Utf8EditAction::Insert:
+    if (insertion.empty() || !strict_utf8(insertion) ||
+        insertion.size() >
+            maximum_bytes - std::min(value.size(), maximum_bytes)) {
+      return false;
+    }
+    value.insert(cursor, insertion);
+    cursor += insertion.size();
+    return true;
+  case Utf8EditAction::Backspace: {
+    if (cursor == 0U) {
+      return false;
+    }
+    std::size_t previous = cursor - 1U;
+    while (previous != 0U && continuation_byte(value[previous])) {
+      --previous;
+    }
+    value.erase(previous, cursor - previous);
+    cursor = previous;
+    return true;
+  }
+  case Utf8EditAction::Delete: {
+    if (cursor >= value.size()) {
+      return false;
+    }
+    std::size_t next = cursor + 1U;
+    while (next < value.size() && continuation_byte(value[next])) {
+      ++next;
+    }
+    value.erase(cursor, next - cursor);
+    return true;
+  }
+  case Utf8EditAction::MoveLeft:
+    if (cursor == 0U) {
+      return false;
+    }
+    --cursor;
+    while (cursor != 0U && continuation_byte(value[cursor])) {
+      --cursor;
+    }
+    return true;
+  case Utf8EditAction::MoveRight:
+    if (cursor >= value.size()) {
+      return false;
+    }
+    ++cursor;
+    while (cursor < value.size() && continuation_byte(value[cursor])) {
+      ++cursor;
+    }
+    return true;
+  }
+  return false;
+}
 
 RoutedAction route_key(const RouteInput &input) noexcept {
   if (key_is(input.key, "F1")) {
@@ -602,6 +700,7 @@ struct Tui::Impl {
   std::string receive_vim_pending;
   std::string selected_text;
   std::string ui_notice;
+  std::atomic_bool custom_event_pending{};
 
   Impl() {
     InputOption option;
@@ -628,9 +727,20 @@ struct Tui::Impl {
     draft_input = Input(&draft_input_value, "", std::move(option));
   }
 
+  void post_custom_event() noexcept {
+    if (custom_event_pending.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    try {
+      screen.PostEvent(Event::Custom);
+    } catch (...) {
+      custom_event_pending.store(false, std::memory_order_release);
+    }
+  }
+
   static void wake(void *context) noexcept {
     if (context != nullptr) {
-      static_cast<ScreenInteractive *>(context)->PostEvent(Event::Custom);
+      static_cast<Impl *>(context)->post_custom_event();
     }
   }
 
@@ -850,11 +960,32 @@ struct Tui::Impl {
     modal_kind = std::move(kind);
     modal_title = std::move(title);
     edit_value = std::move(value);
+    const auto maximum = modal_input_limit();
+    if (edit_value.size() > maximum) {
+      edit_value.resize(utf8_boundary_at_or_before(edit_value, maximum));
+    }
     edit_cursor = edit_value.size();
     selected_device = 0U;
     modal_options.clear();
     modal_parent.clear();
     mode = RouteMode::Modal;
+  }
+
+  [[nodiscard]] std::size_t modal_input_limit() const noexcept {
+    if (modal_kind == "E" || modal_kind == "f") {
+      return kCommandMaximumBytes;
+    }
+    if (modal_kind == "G-files" || modal_kind == "G-total" ||
+        modal_kind == "G-file") {
+      return kNumericMaximumBytes;
+    }
+    if (modal_kind == "G-dir") {
+      return kPathMaximumBytes;
+    }
+    if (modal_kind == "F") {
+      return config::kQuickSendMaximumBytes;
+    }
+    return kGeneralModalMaximumBytes;
   }
 
   void open_choice(std::string kind, std::string title,
@@ -1385,8 +1516,24 @@ struct Tui::Impl {
     } else if (modal_kind == "E") {
       if (edit_value == "scan") {
         application->request_scan();
-      } else if (edit_value == "connect" || edit_value == "disconnect") {
-        application->connection_control();
+      } else if (edit_value == "connect") {
+        if (application->snapshot().connection !=
+            app::ConnectionState::Disconnected) {
+          result = tl::unexpected(make_error(
+              ErrorCode::ValidationInvalidValue, Operation::ValidateConfig,
+              "connect requires a disconnected link"));
+        } else {
+          application->connect();
+        }
+      } else if (edit_value == "disconnect") {
+        if (application->snapshot().connection ==
+            app::ConnectionState::Disconnected) {
+          result = tl::unexpected(make_error(
+              ErrorCode::ValidationInvalidValue, Operation::ValidateConfig,
+              "disconnect requires an active link"));
+        } else {
+          application->disconnect();
+        }
       } else if (edit_value == "help") {
         close_overlay();
         open_help();
@@ -1421,32 +1568,28 @@ struct Tui::Impl {
     }
   }
 
-  void edit_text(const Event &event) {
-    std::string value = edit_value;
-    edit_cursor = std::min(edit_cursor, value.size());
+  void edit_text(const Event &event, const std::size_t maximum_bytes) {
+    edit_cursor = utf8_boundary_at_or_before(edit_value, edit_cursor);
     if (event == Event::Backspace) {
-      if (edit_cursor != 0U) {
-        value.erase(edit_cursor - 1U, 1U);
-        --edit_cursor;
-      }
+      static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
+                                       Utf8EditAction::Backspace, {},
+                                       maximum_bytes));
     } else if (event == Event::Delete) {
-      if (edit_cursor < value.size()) {
-        value.erase(edit_cursor, 1U);
-      }
+      static_cast<void>(edit_utf8_text(
+          edit_value, edit_cursor, Utf8EditAction::Delete, {}, maximum_bytes));
     } else if (event == Event::ArrowLeft) {
-      if (edit_cursor != 0U) {
-        --edit_cursor;
-      }
+      static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
+                                       Utf8EditAction::MoveLeft, {},
+                                       maximum_bytes));
     } else if (event == Event::ArrowRight) {
-      if (edit_cursor < value.size()) {
-        ++edit_cursor;
-      }
+      static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
+                                       Utf8EditAction::MoveRight, {},
+                                       maximum_bytes));
     } else if (event.is_character()) {
-      const auto text = event.character();
-      value.insert(edit_cursor, text);
-      edit_cursor += text.size();
+      static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
+                                       Utf8EditAction::Insert,
+                                       event.character(), maximum_bytes));
     }
-    edit_value = std::move(value);
   }
 
   void scroll(RoutedAction action) {
@@ -1482,8 +1625,14 @@ struct Tui::Impl {
 
   bool handle(Event event) {
     if (event == Event::Custom) {
+      custom_event_pending.store(false, std::memory_order_release);
       const auto old_count = receive_visible_indices().size();
       application->tick();
+      if (application->snapshot().fatal_stopping) {
+        exit_ok = false;
+        screen.Exit();
+        return true;
+      }
       show_alert_if_needed();
       if (mode == RouteMode::Modal && modal_kind == "P") {
         const auto &devices = application->snapshot().devices;
@@ -1683,7 +1832,7 @@ struct Tui::Impl {
           ++selected_device;
         }
       } else if (modal_options.empty()) {
-        edit_text(event);
+        edit_text(event, modal_input_limit());
       }
       return true;
     }
@@ -1718,7 +1867,7 @@ struct Tui::Impl {
         }
       } else if (search_focus == SearchFocus::Query) {
         edit_value = search_query;
-        edit_text(event);
+        edit_text(event, kSearchMaximumBytes);
         search_query = edit_value;
       }
       return true;
@@ -1839,7 +1988,7 @@ struct Tui::Impl {
       copy_selection();
       break;
     case RoutedAction::Redraw:
-      screen.PostEvent(Event::Custom);
+      post_custom_event();
       break;
     case RoutedAction::ScrollUp:
     case RoutedAction::ScrollDown:
@@ -2332,7 +2481,7 @@ struct Tui::Impl {
     if (mode == RouteMode::Search) {
       auto query =
           text(std::string{search_focus == SearchFocus::Query ? "> " : "  "} +
-               "Query: " + search_query);
+               "Query: " + logging::sanitize_message(search_query));
       auto direction = text(
           std::string{search_focus == SearchFocus::Direction ? "> " : "  "} +
           "Direction: " + std::string{search_direction_text()});
@@ -2354,9 +2503,10 @@ struct Tui::Impl {
     if (mode == RouteMode::Modal) {
       Elements body;
       if (modal_options.empty()) {
-        body.push_back(
-            paragraph(edit_value.empty() ? "[Input please.]" : edit_value) |
-            inverted);
+        body.push_back(paragraph(edit_value.empty()
+                                     ? "[Input please.]"
+                                     : logging::sanitize_message(edit_value)) |
+                       inverted);
       } else {
         if (modal_kind == "P" && application->snapshot().scanning) {
           body.push_back(text("Scanning...") | color(theme::gold));
@@ -2365,7 +2515,7 @@ struct Tui::Impl {
         const auto end = std::min(modal_options.size(), begin + 18U);
         for (std::size_t index = begin; index < end; ++index) {
           auto item = text((index == selected_device ? "> " : "  ") +
-                           modal_options[index]);
+                           logging::sanitize_message(modal_options[index]));
           if (modal_kind == "P" &&
               index < application->snapshot().devices.size() &&
               application->snapshot().devices[index].permission.access ==
@@ -2405,7 +2555,7 @@ Tui::Tui() : impl_(std::make_unique<Impl>()) {}
 Tui::~Tui() = default;
 
 int Tui::run() {
-  auto created = app::Application::create_default(&Impl::wake, &impl_->screen);
+  auto created = app::Application::create_default(&Impl::wake, impl_.get());
   if (!created) {
     throw std::runtime_error(status_error(created.error()));
   }
@@ -2422,16 +2572,21 @@ int Tui::run() {
   impl_->screen.SelectionChange(
       [this] { impl_->selected_text = impl_->screen.GetSelection(); });
   std::jthread ticker([this](const std::stop_token stop) {
-    while (!stop.stop_requested()) {
-      std::this_thread::sleep_for(25ms);
-      if (!stop.stop_requested()) {
-        impl_->screen.PostEvent(Event::Custom);
+    try {
+      while (!stop.stop_requested()) {
+        std::this_thread::sleep_for(25ms);
+        if (!stop.stop_requested()) {
+          impl_->post_custom_event();
+        }
       }
+    } catch (...) {
+      // A failed ticker must not escape the thread and call std::terminate.
     }
   });
   impl_->screen.Loop(std::move(component));
   ticker.request_stop();
-  if (!impl_->application->snapshot().shutting_down) {
+  if (!impl_->application->snapshot().shutting_down ||
+      impl_->application->snapshot().fatal_stopping) {
     impl_->exit_ok = impl_->application->shutdown();
   }
   return impl_->exit_ok ? 0 : 1;

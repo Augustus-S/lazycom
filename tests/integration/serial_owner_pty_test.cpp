@@ -126,8 +126,8 @@ TEST_CASE("real PTY owner exchanges bytes and remains idle without spinning",
   const auto after_idle = service->wait_count();
   REQUIRE(after_idle - before_idle <= 2U);
 
-  constexpr std::array<std::byte, 4> inbound{
-      std::byte{0x00}, std::byte{0x41}, std::byte{0x80}, std::byte{0xff}};
+  constexpr std::array<std::byte, 4> inbound{std::byte{0x00}, std::byte{0x41},
+                                             std::byte{0x80}, std::byte{0xff}};
   REQUIRE(::write(pty.master.get(), inbound.data(), inbound.size()) ==
           static_cast<ssize_t>(inbound.size()));
   std::optional<SerialDataEvent> received;
@@ -139,21 +139,22 @@ TEST_CASE("real PTY owner exchanges bytes and remains idle without spinning",
     }
     return received.has_value();
   }));
-  REQUIRE(received->bytes == std::vector<std::byte>(inbound.begin(), inbound.end()));
+  REQUIRE(received->bytes ==
+          std::vector<std::byte>(inbound.begin(), inbound.end()));
 
-  const std::vector<std::byte> outbound{
-      std::byte{0xfe}, std::byte{0x42}, std::byte{0x00}, std::byte{0x7f}};
-  REQUIRE(service->submit_tx(
-      {{OperationId{2}, ConnectionGeneration{1}, *connected->session_id,
-        std::nullopt},
-       outbound}));
+  const std::vector<std::byte> outbound{std::byte{0xfe}, std::byte{0x42},
+                                        std::byte{0x00}, std::byte{0x7f}};
+  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
+                               *connected->session_id, std::nullopt},
+                              outbound}));
   std::array<std::byte, 4> peer_received{};
   REQUIRE(wait_until([&] {
     const auto amount =
         ::read(pty.master.get(), peer_received.data(), peer_received.size());
     return amount == static_cast<ssize_t>(peer_received.size());
   }));
-  REQUIRE(std::equal(peer_received.begin(), peer_received.end(), outbound.begin()));
+  REQUIRE(
+      std::equal(peer_received.begin(), peer_received.end(), outbound.begin()));
 
   REQUIRE(service->request_disconnect(
       {OperationId{3}, ConnectionGeneration{1}, connected->session_id}));
@@ -198,7 +199,8 @@ TEST_CASE("real PTY queued connection can be cancelled",
     }));
     REQUIRE(std::any_of(completions.begin(), completions.end(),
                         [](const SerialCompletion &value) {
-                          return std::holds_alternative<ConnectCompletion>(value) &&
+                          return std::holds_alternative<ConnectCompletion>(
+                                     value) &&
                                  std::get<ConnectCompletion>(value).outcome ==
                                      OperationOutcome::Cancelled;
                         }));
@@ -216,11 +218,13 @@ TEST_CASE("real PTY hangup closes the owner session",
   REQUIRE(connected->session_id);
 
   pty.master.reset();
-  REQUIRE(wait_until([&] { return !service->connection_snapshot().connected; }));
+  REQUIRE(wait_until([&] {
+    const auto snapshot = service->connection_snapshot();
+    return !snapshot.connected && !snapshot.disconnecting;
+  }));
   const auto events = service->drain_data(16U);
-  REQUIRE(std::any_of(events.begin(), events.end(),
-                      [](const SerialDataEvent &event) {
-                        return event.kind == SerialDataKind::Cleanup &&
-                               event.error.has_value();
-                      }));
+  REQUIRE(std::any_of(
+      events.begin(), events.end(), [](const SerialDataEvent &event) {
+        return event.kind == SerialDataKind::Cleanup && event.error.has_value();
+      }));
 }

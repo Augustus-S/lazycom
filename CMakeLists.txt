@@ -144,6 +144,23 @@ target_link_libraries(lazycom
     ftxui::component
 )
 
+foreach(lazycom_target IN ITEMS
+    lazycom_base
+    lazycom_core
+    lazycom_config
+    lazycom_logging
+    lazycom_data_path
+    lazycom_scheduler
+    lazycom_diagnostics
+    lazycom_serial
+    lazycom_app
+    lazycom_ui
+    lazycom
+)
+  target_link_libraries(${lazycom_target} PRIVATE lazycom_release_hardening)
+endforeach()
+target_link_libraries(lazycom PRIVATE lazycom_release_link_hardening)
+
 if(BUILD_TESTING AND LAZYCOM_BUILD_TESTS)
   add_subdirectory(tests)
 endif()

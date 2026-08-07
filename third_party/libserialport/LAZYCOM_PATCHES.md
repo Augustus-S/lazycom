@@ -28,3 +28,14 @@ treats that specific result as an unavailable RTS/DTR state and tolerates it
 when applying RTS/DTR levels, while preserving termios configuration and all
 other ioctl errors. This makes `sp_open()` and no-flow-control configuration
 usable for PTY integration tests without relaxing behavior for real adapters.
+
+The POSIX `sp_open()` path now closes and invalidates its newly opened file
+descriptor when either `flock(LOCK_EX | LOCK_NB)` or `ioctl(TIOCEXCL)` fails.
+The original failure `errno` is preserved for `sp_last_error_code()` and the
+descriptor is never left owned by a port for which `sp_open()` returned an
+error.
+
+`sp_set_debug_handler()` installs the replacement before tracing the setter
+call. LazyCom can therefore install its errno-preserving silent handler before
+any serial operation without one final message reaching stderr when
+`LIBSERIALPORT_DEBUG` is set.

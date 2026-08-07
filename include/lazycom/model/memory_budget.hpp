@@ -12,6 +12,9 @@
 namespace lazycom::model {
 
 inline constexpr std::size_t kManagedMemoryLimit = 128U * 1024U * 1024U;
+// Conservatively covers SharedPayload, its vector object/allocation metadata,
+// and the separate shared_ptr control block allocation.
+inline constexpr std::size_t kSharedPayloadFixedBudgetBytes = 128U;
 
 enum class BudgetCategory : std::uint8_t {
   UiRecords,
@@ -33,8 +36,8 @@ struct BudgetLimits {
 
   [[nodiscard]] static constexpr BudgetLimits defaults() noexcept {
     constexpr std::size_t mib = 1024U * 1024U;
-    return BudgetLimits{{48U * mib, 16U * mib, 8U * mib, 8U * mib,
-                         16U * mib, 8U * mib, 16U * mib, 8U * mib}};
+    return BudgetLimits{{48U * mib, 16U * mib, 8U * mib, 8U * mib, 16U * mib,
+                         8U * mib, 16U * mib, 8U * mib}};
   }
 };
 
@@ -76,8 +79,7 @@ private:
 
 class GlobalMemoryBudget {
 public:
-  explicit GlobalMemoryBudget(
-      BudgetLimits limits = BudgetLimits::defaults());
+  explicit GlobalMemoryBudget(BudgetLimits limits = BudgetLimits::defaults());
 
   [[nodiscard]] std::optional<BudgetReservation>
   try_reserve(BudgetCategory category, std::size_t bytes) noexcept;
@@ -102,15 +104,18 @@ public:
   }
 
 private:
-  friend SharedPayloadPtr
-  make_shared_payload(GlobalMemoryBudget &, BudgetCategory,
-                      std::span<const std::byte>);
+  friend SharedPayloadPtr make_shared_payload(GlobalMemoryBudget &,
+                                              BudgetCategory,
+                                              std::span<const std::byte>);
   SharedPayload(std::span<const std::byte> bytes,
                 BudgetReservation reservation);
 
   std::vector<std::byte> bytes_;
   BudgetReservation reservation_;
 };
+
+static_assert(kSharedPayloadFixedBudgetBytes >=
+              sizeof(SharedPayload) + 4U * sizeof(void *));
 
 // The reservation is acquired before payload or shared ownership allocation.
 [[nodiscard]] SharedPayloadPtr

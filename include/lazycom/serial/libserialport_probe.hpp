@@ -14,4 +14,4 @@ struct LibserialportVersion {
 [[nodiscard]] LibserialportVersion libserialport_version() noexcept;
 [[nodiscard]] bool libserialport_version_supported() noexcept;
 
-}  // namespace lazycom::serial
+} // namespace lazycom::serial

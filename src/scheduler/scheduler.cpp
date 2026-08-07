@@ -1,77 +1,13 @@
 #include <lazycom/scheduler/scheduler.hpp>
 
-#include <algorithm>
+#include <lazycom/encoding/tx.hpp>
+
 #include <limits>
+#include <type_traits>
 #include <utility>
 
 namespace lazycom::scheduler {
 namespace {
-
-[[nodiscard]] bool is_hex_digit(const char value) noexcept {
-  return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') ||
-         (value >= 'A' && value <= 'F');
-}
-
-[[nodiscard]] unsigned int hex_value(const char value) noexcept {
-  if (value >= '0' && value <= '9') {
-    return static_cast<unsigned int>(value - '0');
-  }
-  if (value >= 'a' && value <= 'f') {
-    return static_cast<unsigned int>(value - 'a') + 10U;
-  }
-  return static_cast<unsigned int>(value - 'A') + 10U;
-}
-
-[[nodiscard]] bool is_hex_space(const char value) noexcept {
-  return value == ' ' || value == '\t' || value == '\r' || value == '\n';
-}
-
-[[nodiscard]] bool is_valid_utf8(const std::string_view text) noexcept {
-  std::size_t index = 0;
-  while (index < text.size()) {
-    const auto first = static_cast<unsigned char>(text[index]);
-    if (first <= 0x7FU) {
-      ++index;
-      continue;
-    }
-
-    std::size_t continuation_count = 0;
-    std::uint32_t code_point = 0;
-    std::uint32_t minimum = 0;
-    if ((first & 0xE0U) == 0xC0U) {
-      continuation_count = 1;
-      code_point = first & 0x1FU;
-      minimum = 0x80U;
-    } else if ((first & 0xF0U) == 0xE0U) {
-      continuation_count = 2;
-      code_point = first & 0x0FU;
-      minimum = 0x800U;
-    } else if ((first & 0xF8U) == 0xF0U) {
-      continuation_count = 3;
-      code_point = first & 0x07U;
-      minimum = 0x10000U;
-    } else {
-      return false;
-    }
-    if (continuation_count > text.size() - index - 1U) {
-      return false;
-    }
-    for (std::size_t offset = 1; offset <= continuation_count; ++offset) {
-      const auto continuation =
-          static_cast<unsigned char>(text[index + offset]);
-      if ((continuation & 0xC0U) != 0x80U) {
-        return false;
-      }
-      code_point = (code_point << 6U) | (continuation & 0x3FU);
-    }
-    if (code_point < minimum || code_point > 0x10FFFFU ||
-        (code_point >= 0xD800U && code_point <= 0xDFFFU)) {
-      return false;
-    }
-    index += continuation_count + 1U;
-  }
-  return true;
-}
 
 [[nodiscard]] std::optional<config::Newline>
 resolve_newline(const config::Newline policy,
@@ -148,6 +84,30 @@ valid_newline_policy(const config::Newline newline) noexcept {
   return right > maximum - left ? maximum : left + right;
 }
 
+[[nodiscard]] PayloadParseStatus
+parse_status(const encoding::TxParseErrorCode code) noexcept {
+  switch (code) {
+  case encoding::TxParseErrorCode::InvalidUtf8:
+    return PayloadParseStatus::InvalidText;
+  case encoding::TxParseErrorCode::InvalidHex:
+    return PayloadParseStatus::InvalidHex;
+  case encoding::TxParseErrorCode::LimitExceeded:
+    return PayloadParseStatus::TooLarge;
+  }
+  return PayloadParseStatus::InvalidMode;
+}
+
+[[nodiscard]] bool try_add_duration(const Scheduler::TimePoint start,
+                                    const Scheduler::Clock::duration duration,
+                                    Scheduler::TimePoint &result) noexcept {
+  if (duration < Scheduler::Clock::duration::zero() ||
+      start > Scheduler::TimePoint::max() - duration) {
+    return false;
+  }
+  result = start + duration;
+  return true;
+}
+
 } // namespace
 
 PayloadParseResult parse_payload(const config::SendMode mode,
@@ -166,57 +126,24 @@ PayloadParseResult parse_payload(const config::SendMode mode,
   }
   const auto suffix_size = newline_size(*effective_newline);
 
+  const auto maximum = config::kMaximumPayloadBytes - suffix_size;
+  encoding::ParsedTxBytes parsed;
   if (mode == config::SendMode::Txt) {
-    if (!is_valid_utf8(content)) {
+    // Preserve scheduler's invalid-text-before-size error precedence.
+    if (!encoding::is_strict_utf8(content)) {
       result.status = PayloadParseStatus::InvalidText;
       return result;
     }
-    if (content.size() > config::kMaximumPayloadBytes - suffix_size) {
-      result.status = PayloadParseStatus::TooLarge;
-      return result;
-    }
-    result.bytes.reserve(content.size() + suffix_size);
-    for (const char value : content) {
-      result.bytes.push_back(static_cast<std::byte>(value));
-    }
+    parsed = encoding::parse_text(content, maximum);
   } else {
-    std::size_t index = 0;
-    result.bytes.reserve(
-        std::min(content.size() / 2U, config::kMaximumPayloadBytes));
-    while (true) {
-      while (index < content.size() && is_hex_space(content[index])) {
-        ++index;
-      }
-      if (index == content.size()) {
-        break;
-      }
-      if (index + 1U < content.size() && content[index] == '0' &&
-          (content[index + 1U] == 'x' || content[index + 1U] == 'X')) {
-        index += 2U;
-      }
-      if (index + 1U >= content.size() || !is_hex_digit(content[index]) ||
-          !is_hex_digit(content[index + 1U])) {
-        result.bytes.clear();
-        result.status = PayloadParseStatus::InvalidHex;
-        return result;
-      }
-      if (result.bytes.size() >= config::kMaximumPayloadBytes - suffix_size) {
-        result.bytes.clear();
-        result.status = PayloadParseStatus::TooLarge;
-        return result;
-      }
-      const auto value =
-          (hex_value(content[index]) << 4U) | hex_value(content[index + 1U]);
-      result.bytes.push_back(static_cast<std::byte>(value));
-      index += 2U;
-      if (index < content.size() && !is_hex_space(content[index])) {
-        result.bytes.clear();
-        result.status = PayloadParseStatus::InvalidHex;
-        return result;
-      }
-    }
+    parsed = encoding::parse_hex(content, maximum);
+  }
+  if (!parsed) {
+    result.status = parse_status(parsed.error().code);
+    return result;
   }
 
+  result.bytes = std::move(*parsed);
   append_newline(result.bytes, *effective_newline);
   return result;
 }
@@ -265,8 +192,12 @@ make_quick_send_execution(const config::QuickSendSnapshot &slots,
   return result;
 }
 
-Scheduler::Scheduler(const TaskGeneration last_issued) noexcept
-    : generations_(last_issued) {}
+Scheduler::Scheduler(const TaskGeneration last_issued,
+                     const std::uint64_t first_request_sequence) noexcept
+    : generations_(last_issued),
+      first_request_sequence_(
+          first_request_sequence == 0U ? 1U : first_request_sequence),
+      next_sequence_(first_request_sequence_) {}
 
 bool Scheduler::valid_execution(
     const QuickSendExecution &execution) const noexcept {
@@ -279,31 +210,36 @@ bool Scheduler::valid_execution(
          execution.bytes.size() <= config::kMaximumPayloadBytes;
 }
 
-std::optional<TaskGeneration> Scheduler::activate(TaskRequest request,
-                                                  const TimePoint now) {
+TaskStartResult Scheduler::activate(TaskRequest request, const TimePoint now) {
+  std::optional<TimePoint> deadline;
+  if (request.interval_ms != 0U) {
+    const auto period = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::milliseconds{request.interval_ms});
+    TimePoint candidate;
+    if (period <= Clock::duration::zero() ||
+        !try_add_duration(now, period, candidate)) {
+      return {TaskStartStatus::DeadlineOverflow, std::nullopt, std::nullopt};
+    }
+    deadline = candidate;
+  }
   auto execution =
       std::make_shared<const QuickSendExecution>(std::move(request.execution));
   TaskGeneration issued;
   if (generations_.issue(issued) == IdIncrementResult::Overflow) {
-    return std::nullopt;
+    return {TaskStartStatus::GenerationOverflow, std::nullopt, std::nullopt};
   }
   state_ = SchedulerState::Running;
   generation_ = issued;
   execution_ = std::move(execution);
   interval_ms_ = request.interval_ms;
-  next_deadline_.reset();
-  if (interval_ms_ != 0U) {
-    const auto period = std::chrono::milliseconds{interval_ms_};
-    if (now <= Scheduler::TimePoint::max() - period) {
-      next_deadline_ = now + period;
-    }
-  }
+  next_deadline_ = deadline;
   outstanding_.reset();
-  next_sequence_ = 1U;
+  automatic_stop_request_.reset();
+  next_sequence_ = first_request_sequence_;
   sent_count_ = 0U;
   missed_count_ = 0U;
   trigger_pending_ = true;
-  return issued;
+  return {TaskStartStatus::Started, issued, std::nullopt};
 }
 
 TaskStartResult Scheduler::start(TaskRequest request, const TimePoint now,
@@ -328,11 +264,7 @@ TaskStartResult Scheduler::start(TaskRequest request, const TimePoint now,
             invalidated.generation_to_stop};
   }
 
-  const auto generation = activate(std::move(request), now);
-  if (!generation) {
-    return {TaskStartStatus::GenerationOverflow, std::nullopt, std::nullopt};
-  }
-  return {TaskStartStatus::Started, generation, std::nullopt};
+  return activate(std::move(request), now);
 }
 
 TaskInvalidationResult
@@ -349,6 +281,7 @@ Scheduler::invalidate(const bool discard_replacement) noexcept {
   state_ = SchedulerState::Stopping;
   trigger_pending_ = false;
   next_deadline_.reset();
+  automatic_stop_request_.reset();
   return {TaskInvalidationStatus::StopRequested, generation_};
 }
 
@@ -377,6 +310,7 @@ Scheduler::confirm_stopped(const TaskGeneration generation,
   interval_ms_ = 0U;
   next_deadline_.reset();
   outstanding_.reset();
+  automatic_stop_request_.reset();
   trigger_pending_ = false;
   sent_count_ = 0U;
   missed_count_ = 0U;
@@ -387,10 +321,14 @@ Scheduler::confirm_stopped(const TaskGeneration generation,
   auto replacement = std::move(*pending_replacement_);
   pending_replacement_.reset();
   const auto started = activate(std::move(replacement), now);
-  if (!started) {
+  if (started.status == TaskStartStatus::GenerationOverflow) {
     return {StopConfirmationStatus::GenerationOverflow, std::nullopt};
   }
-  return {StopConfirmationStatus::ReplacementStarted, started};
+  if (started.status == TaskStartStatus::DeadlineOverflow) {
+    return {StopConfirmationStatus::DeadlineOverflow, std::nullopt};
+  }
+  return {StopConfirmationStatus::ReplacementStarted,
+          started.started_generation};
 }
 
 void Scheduler::add_missed(const std::uint64_t count) noexcept {
@@ -403,19 +341,39 @@ void Scheduler::on_deadline(const TimePoint now) noexcept {
     return;
   }
 
-  const auto period = std::chrono::milliseconds{interval_ms_};
-  const auto elapsed = now - *next_deadline_;
-  const auto elapsed_periods = elapsed / period;
-  const auto due_count = static_cast<std::uint64_t>(elapsed_periods) + 1U;
+  using DurationRep = Clock::duration::rep;
+  using UnsignedRep = std::make_unsigned_t<DurationRep>;
+  static_assert(std::is_integral_v<DurationRep>);
+  static_assert(std::numeric_limits<UnsignedRep>::digits <=
+                std::numeric_limits<std::uint64_t>::digits);
 
-  const auto phase = elapsed % period;
+  const auto period = std::chrono::duration_cast<Clock::duration>(
+      std::chrono::milliseconds{interval_ms_});
+  const auto period_ticks = static_cast<UnsignedRep>(period.count());
+  const auto now_ticks =
+      static_cast<UnsignedRep>(now.time_since_epoch().count());
+  const auto deadline_ticks =
+      static_cast<UnsignedRep>(next_deadline_->time_since_epoch().count());
+  const auto elapsed_ticks = now_ticks - deadline_ticks;
+  const auto elapsed_periods =
+      static_cast<std::uint64_t>(elapsed_ticks / period_ticks);
+  const auto due_count =
+      elapsed_periods == std::numeric_limits<std::uint64_t>::max()
+          ? elapsed_periods
+          : elapsed_periods + 1U;
+
+  const auto phase_ticks = elapsed_ticks % period_ticks;
+  const auto until_next_ticks =
+      phase_ticks == 0U ? period_ticks : period_ticks - phase_ticks;
   const auto until_next =
-      phase == Clock::duration::zero() ? period : period - phase;
-  if (now <= TimePoint::max() - until_next) {
-    next_deadline_ = now + until_next;
-  } else {
-    next_deadline_.reset();
+      Clock::duration{static_cast<DurationRep>(until_next_ticks)};
+  TimePoint next;
+  if (!try_add_duration(now, until_next, next)) {
+    add_missed(due_count);
+    begin_automatic_stop(AutomaticStopReason::DeadlineOverflow);
+    return;
   }
+  next_deadline_ = next;
 
   if (trigger_pending_ || outstanding_) {
     add_missed(due_count);
@@ -425,15 +383,24 @@ void Scheduler::on_deadline(const TimePoint now) noexcept {
   add_missed(due_count - 1U);
 }
 
+void Scheduler::begin_automatic_stop(
+    const AutomaticStopReason reason) noexcept {
+  if (state_ != SchedulerState::Running || !generation_) {
+    return;
+  }
+  state_ = SchedulerState::Stopping;
+  trigger_pending_ = false;
+  next_deadline_.reset();
+  automatic_stop_request_ = AutomaticStopRequest{*generation_, reason};
+}
+
 std::optional<ScheduledSend> Scheduler::emit_pending() {
   if (state_ != SchedulerState::Running || !generation_ || !execution_ ||
       !trigger_pending_ || outstanding_) {
     return std::nullopt;
   }
   if (next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
-    trigger_pending_ = false;
-    state_ = SchedulerState::Stopping;
-    next_deadline_.reset();
+    begin_automatic_stop(AutomaticStopReason::SequenceOverflow);
     return std::nullopt;
   }
   const ScheduledRequestToken token{*generation_, next_sequence_};
@@ -473,6 +440,11 @@ Scheduler::on_tx_boundary(const TimePoint now, const TxBoundary &boundary) {
 
 std::optional<Scheduler::TimePoint> Scheduler::next_deadline() const noexcept {
   return state_ == SchedulerState::Running ? next_deadline_ : std::nullopt;
+}
+
+std::optional<AutomaticStopRequest>
+Scheduler::take_automatic_stop_request() noexcept {
+  return std::exchange(automatic_stop_request_, std::nullopt);
 }
 
 SchedulerSnapshot Scheduler::snapshot() const noexcept {

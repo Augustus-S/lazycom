@@ -79,6 +79,22 @@ TEST_CASE("strict UTF-8 payload including NUL and ESC remains byte exact",
   REQUIRE(decoded->encoding == lazycom::logging::PayloadEncoding::Utf8);
 }
 
+TEST_CASE("one MiB of NUL uses bounded reversible base64",
+          "[logging][schema]") {
+  const std::vector<std::byte> payload(lazycom::logging::kMaxPayloadBytes,
+                                       std::byte{0x00});
+  const auto encoded = lazycom::logging::encode_record_line(
+      payload_record(1U, Direction::Rx, payload));
+  REQUIRE(encoded);
+  REQUIRE(encoded->size() <= lazycom::logging::kMaxPhysicalLineBytes);
+  REQUIRE(encoded->find("\"encoding\":\"base64\"") != std::string::npos);
+
+  const auto decoded = lazycom::logging::decode_record_line(*encoded);
+  REQUIRE(decoded);
+  REQUIRE(decoded->encoding == lazycom::logging::PayloadEncoding::Base64);
+  REQUIRE(decoded->payload == payload);
+}
+
 TEST_CASE("all octets use base64 when the byte stream is not strict UTF-8",
           "[logging][schema]") {
   std::vector<std::byte> payload;
@@ -264,6 +280,55 @@ TEST_CASE("untrusted NDJSON limits apply before payload decoding",
       lazycom::logging::decode_ndjson(oversized_document);
   REQUIRE_FALSE(document_result);
   REQUIRE(document_result.error().code ==
+          lazycom::logging::SchemaErrorCode::LimitExceeded);
+}
+
+TEST_CASE("JSON nesting and structural complexity are bounded",
+          "[logging][schema]") {
+  std::string deeply_nested =
+      R"({"type":"record","seq":1,"time_utc":"2026-07-22T04:30:03Z","elapsed_ns":0,"direction":"SYS","message":"safe","future":)";
+  deeply_nested.append(20U, '[');
+  deeply_nested += '0';
+  deeply_nested.append(20U, ']');
+  deeply_nested += '}';
+  const auto deep = lazycom::logging::decode_record_line(deeply_nested);
+  REQUIRE_FALSE(deep);
+  REQUIRE(deep.error().code ==
+          lazycom::logging::SchemaErrorCode::LimitExceeded);
+
+  std::string wide =
+      R"({"type":"record","seq":1,"time_utc":"2026-07-22T04:30:03Z","elapsed_ns":0,"direction":"SYS","message":"safe")";
+  for (std::size_t index = 0U; index < 300U; ++index) {
+    wide += ",\"future_" + std::to_string(index) + "\":0";
+  }
+  wide += '}';
+  const auto complex = lazycom::logging::decode_record_line(wide);
+  REQUIRE_FALSE(complex);
+  REQUIRE(complex.error().code ==
+          lazycom::logging::SchemaErrorCode::LimitExceeded);
+}
+
+TEST_CASE("NDJSON encoder enforces record and accumulated byte limits",
+          "[logging][schema]") {
+  std::vector<Record> too_many(lazycom::logging::kMaxNdjsonRecords + 1U);
+  const auto count_result =
+      lazycom::logging::encode_ndjson(valid_header(), too_many);
+  REQUIRE_FALSE(count_result);
+  REQUIRE(count_result.error().code ==
+          lazycom::logging::SchemaErrorCode::LimitExceeded);
+
+  std::vector<Record> records;
+  records.reserve(13U);
+  for (std::uint64_t seq = 1U; seq <= 13U; ++seq) {
+    records.push_back(payload_record(
+        seq, Direction::Rx,
+        std::vector<std::byte>(lazycom::logging::kMaxPayloadBytes,
+                               std::byte{0x00})));
+  }
+  const auto byte_result =
+      lazycom::logging::encode_ndjson(valid_header(), records);
+  REQUIRE_FALSE(byte_result);
+  REQUIRE(byte_result.error().code ==
           lazycom::logging::SchemaErrorCode::LimitExceeded);
 }
 

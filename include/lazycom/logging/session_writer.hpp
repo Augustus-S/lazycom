@@ -102,6 +102,8 @@ public:
   // Every returned future completes, including writer error and shutdown.
   [[nodiscard]] std::future<BarrierResult> barrier(std::uint64_t target_seq);
   [[nodiscard]] std::future<SessionCommandResult> shutdown();
+  [[nodiscard]] bool wait_until_stopped(
+      std::chrono::steady_clock::time_point deadline) const noexcept;
 
   [[nodiscard]] SessionLogState state() const noexcept;
   [[nodiscard]] std::uint64_t processed_through_seq() const noexcept;

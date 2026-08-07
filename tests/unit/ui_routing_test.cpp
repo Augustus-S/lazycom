@@ -2,12 +2,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+using lazycom::ui::edit_utf8_text;
 using lazycom::ui::parse_receive_vim_command;
 using lazycom::ui::ReceiveVimAction;
 using lazycom::ui::route_key;
 using lazycom::ui::RoutedAction;
 using lazycom::ui::RouteInput;
 using lazycom::ui::RouteMode;
+using lazycom::ui::Utf8EditAction;
 
 TEST_CASE("F1 is the only unconditional application route") {
   REQUIRE(route_key({RouteMode::Modal, "F1", false, false, false}) ==
@@ -119,4 +121,23 @@ TEST_CASE("search direction and destructive confirmation are contextual") {
           RoutedAction::SelectPrevious);
   REQUIRE(route_key({RouteMode::Confirm, "Enter", true, false, false}) ==
           RoutedAction::Apply);
+}
+
+TEST_CASE("bounded text editing moves and deletes on UTF-8 boundaries") {
+  std::string value = "A\xE4\xB8\xAD\xF0\x9F\x99\x82";
+  std::size_t cursor = value.size();
+  REQUIRE(edit_utf8_text(value, cursor, Utf8EditAction::MoveLeft, {}, 16U));
+  CHECK(cursor == 4U);
+  REQUIRE(edit_utf8_text(value, cursor, Utf8EditAction::Backspace, {}, 16U));
+  CHECK(value == "A\xF0\x9F\x99\x82");
+  CHECK(cursor == 1U);
+  REQUIRE(edit_utf8_text(value, cursor, Utf8EditAction::Delete, {}, 16U));
+  CHECK(value == "A");
+
+  REQUIRE(edit_utf8_text(value, cursor, Utf8EditAction::Insert, "\xE4\xB8\xAD",
+                         4U));
+  CHECK(value == "A\xE4\xB8\xAD");
+  CHECK_FALSE(edit_utf8_text(value, cursor, Utf8EditAction::Insert, "x", 4U));
+  CHECK_FALSE(
+      edit_utf8_text(value, cursor, Utf8EditAction::Insert, "\xE4\xB8", 16U));
 }

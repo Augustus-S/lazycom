@@ -1,15 +1,37 @@
 #include <lazycom/framing/rx_framer.hpp>
 
+#include <chrono>
 #include <stdexcept>
 #include <utility>
 
 namespace lazycom::framing {
+namespace {
+
+[[nodiscard]] bool
+idle_gap_elapsed(const ObservationClock::time_point now,
+                 const ObservationClock::time_point last_observed,
+                 const std::chrono::milliseconds idle_gap) noexcept {
+  if (now < last_observed) {
+    return false;
+  }
+  const auto gap =
+      std::chrono::duration_cast<ObservationClock::duration>(idle_gap);
+  if (last_observed > ObservationClock::time_point::max() - gap) {
+    return false;
+  }
+  return now >= last_observed + gap;
+}
+
+} // namespace
 
 RxFramer::RxFramer(const RxFramerConfig config) : config_(config) {
-  if (config_.idle_gap.count() < 0 || config_.max_frame_bytes == 0U) {
+  const auto maximum_idle_gap =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          ObservationClock::duration::max());
+  if (config_.idle_gap.count() < 0 || config_.idle_gap > maximum_idle_gap ||
+      config_.max_frame_bytes == 0U) {
     throw std::invalid_argument{"invalid RX framer configuration"};
   }
-  bytes_.reserve(config_.max_frame_bytes);
 }
 
 void RxFramer::emit(std::vector<RxFrame> &output) {
@@ -17,10 +39,8 @@ void RxFramer::emit(std::vector<RxFrame> &output) {
     pending_cr_ = false;
     return;
   }
-  output.push_back(
-      RxFrame{std::move(bytes_), first_byte_observed_at_});
-  bytes_.clear();
-  bytes_.reserve(config_.max_frame_bytes);
+  output.push_back(RxFrame{std::move(bytes_), first_byte_observed_at_});
+  bytes_ = std::vector<std::byte>{};
   pending_cr_ = false;
 }
 
@@ -30,11 +50,7 @@ void RxFramer::consume(const std::byte byte,
   if (pending_cr_) {
     if (byte == std::byte{0x0A}) {
       bytes_.push_back(byte);
-      if (bytes_.size() == config_.max_frame_bytes) {
-        emit(output);
-      } else {
-        emit(output);
-      }
+      emit(output);
       return;
     }
     emit(output);
@@ -66,7 +82,7 @@ RxFramer::push(const std::span<const std::byte> bytes,
   }
 
   if (has_last_read_ && !bytes_.empty() &&
-      observed_at - last_read_observed_at_ >= config_.idle_gap) {
+      idle_gap_elapsed(observed_at, last_read_observed_at_, config_.idle_gap)) {
     emit(output);
   }
   for (const auto byte : bytes) {
@@ -77,11 +93,10 @@ RxFramer::push(const std::span<const std::byte> bytes,
   return output;
 }
 
-std::vector<RxFrame>
-RxFramer::on_idle(const ObservationClock::time_point now) {
+std::vector<RxFrame> RxFramer::on_idle(const ObservationClock::time_point now) {
   std::vector<RxFrame> output;
   if (has_last_read_ && !bytes_.empty() &&
-      now - last_read_observed_at_ >= config_.idle_gap) {
+      idle_gap_elapsed(now, last_read_observed_at_, config_.idle_gap)) {
     emit(output);
   }
   return output;

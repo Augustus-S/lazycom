@@ -1,4 +1,3 @@
-#include <lazycom/app/completion.hpp>
 #include <lazycom/app/state.hpp>
 
 #include <algorithm>
@@ -14,15 +13,6 @@ namespace {
   return id.value != 0;
 }
 [[nodiscard]] bool valid(const SessionId id) noexcept { return id.value != 0; }
-
-[[nodiscard]] bool overlay_can_cover(const OverlayKind next,
-                                     const OverlayKind active) noexcept {
-  if (next == OverlayKind::Help) {
-    return active == OverlayKind::Search || active == OverlayKind::Modal ||
-           active == OverlayKind::Confirm || active == OverlayKind::ErrorDialog;
-  }
-  return next == OverlayKind::CommandPalette && active == OverlayKind::Search;
-}
 
 } // namespace
 
@@ -131,7 +121,8 @@ StateChange ConnectionStateMachine::begin_disconnect(
     return StateChange::IgnoredStale;
   }
   if ((state_ != ConnectionState::Connected &&
-       state_ != ConnectionState::Error) ||
+       state_ != ConnectionState::Error &&
+       !(state_ == ConnectionState::Disconnecting && session_id_)) ||
       !valid(command.operation_id)) {
     return StateChange::InvalidTransition;
   }
@@ -185,7 +176,10 @@ bool ConnectionStateMachine::accepts(
     return false;
   }
   if (event.origin == SessionEventOrigin::Normal) {
-    return state_ == ConnectionState::Connected;
+    // The owner cleanup marker is the disconnect boundary. Normal events
+    // ordered before it remain part of this session while disconnecting.
+    return state_ == ConnectionState::Connected ||
+           state_ == ConnectionState::Disconnecting;
   }
   return state_ == ConnectionState::Disconnecting;
 }
@@ -197,63 +191,6 @@ InteractionStateMachine::enter(const InteractionState state) noexcept {
   }
   state_ = state;
   return StateChange::Applied;
-}
-
-const OverlayFrame *OverlayStack::active() const noexcept {
-  return empty() ? nullptr : &frames_[size_ - 1];
-}
-
-StateChange OverlayStack::open(const OverlayFrame &frame) noexcept {
-  if (frame.kind == OverlayKind::None) {
-    return StateChange::InvalidTransition;
-  }
-  if (!empty() && !overlay_can_cover(frame.kind, active()->kind)) {
-    return StateChange::InvalidTransition;
-  }
-  if (size_ == capacity) {
-    return StateChange::CapacityExceeded;
-  }
-  frames_[size_] = frame;
-  ++size_;
-  return StateChange::Applied;
-}
-
-OverlayCloseResult
-OverlayStack::toggle_help(const OverlayFrame &frame) noexcept {
-  if (frame.kind != OverlayKind::Help) {
-    return {};
-  }
-  if (!empty() && active()->kind == OverlayKind::Help) {
-    return close_top();
-  }
-  const auto change = open(frame);
-  return {change, frame.interaction};
-}
-
-StateChange OverlayStack::update_active(const OverlayFrame &frame) noexcept {
-  if (empty() || frame.kind != frames_[size_ - 1].kind ||
-      frame.kind == OverlayKind::None) {
-    return StateChange::InvalidTransition;
-  }
-  frames_[size_ - 1] = frame;
-  return StateChange::Applied;
-}
-
-OverlayCloseResult OverlayStack::close_top() noexcept {
-  if (empty()) {
-    return {};
-  }
-  const auto closed = frames_[size_ - 1];
-  --size_;
-
-  InteractionState restored = closed.interaction;
-  if (!empty()) {
-    restored = frames_[size_ - 1].interaction;
-  } else if (closed.kind == OverlayKind::Modal ||
-             closed.kind == OverlayKind::Confirm) {
-    restored = InteractionState::Normal;
-  }
-  return {StateChange::Applied, restored};
 }
 
 bool LogStateMachine::transition_allowed(const LogState from,
@@ -376,166 +313,6 @@ StateChange MainThreadFatalGuard::enter_fatal_stopping_from(
   }
   state_ = ProcessLifecycle::FatalStopping;
   return StateChange::Applied;
-}
-
-std::size_t CompletionTracker::reserved_count() const noexcept {
-  const auto count = [](const std::vector<Slot> &slots) {
-    return static_cast<std::size_t>(
-        std::count_if(slots.begin(), slots.end(), [](const Slot &slot) {
-          return slot.state != SlotState::Free;
-        }));
-  };
-  return count(normal_slots_) + count(tx_slots_) + count(control_slots_);
-}
-
-std::size_t CompletionTracker::completed_count() const noexcept {
-  const auto count = [](const std::vector<Slot> &slots) {
-    return static_cast<std::size_t>(
-        std::count_if(slots.begin(), slots.end(), [](const Slot &slot) {
-          return slot.state == SlotState::Completed;
-        }));
-  };
-  return count(normal_slots_) + count(tx_slots_) + count(control_slots_);
-}
-
-std::size_t CompletionTracker::capacity(
-    const OperationClass operation_class) const noexcept {
-  return slots(operation_class).size();
-}
-
-std::size_t CompletionTracker::capacity() const noexcept {
-  return normal_slots_.size() + tx_slots_.size() + control_slots_.size();
-}
-
-std::vector<CompletionTracker::Slot> &
-CompletionTracker::slots(const OperationClass operation_class) noexcept {
-  switch (operation_class) {
-  case OperationClass::Normal:
-    return normal_slots_;
-  case OperationClass::Tx:
-    return tx_slots_;
-  case OperationClass::Control:
-    return control_slots_;
-  }
-  return normal_slots_;
-}
-
-const std::vector<CompletionTracker::Slot> &
-CompletionTracker::slots(const OperationClass operation_class) const noexcept {
-  switch (operation_class) {
-  case OperationClass::Normal:
-    return normal_slots_;
-  case OperationClass::Tx:
-    return tx_slots_;
-  case OperationClass::Control:
-    return control_slots_;
-  }
-  return normal_slots_;
-}
-
-CompletionTracker::Slot *
-CompletionTracker::find(const OperationId operation) noexcept {
-  for (const auto operation_class :
-       {OperationClass::Normal, OperationClass::Tx, OperationClass::Control}) {
-    auto &class_slots = slots(operation_class);
-    const auto found = std::find_if(class_slots.begin(), class_slots.end(),
-                                    [operation](const Slot &slot) {
-                                      return slot.state != SlotState::Free &&
-                                             slot.operation_id == operation;
-                                    });
-    if (found != class_slots.end()) {
-      return &*found;
-    }
-  }
-  return nullptr;
-}
-
-const CompletionTracker::Slot *
-CompletionTracker::find(const OperationId operation) const noexcept {
-  for (const auto operation_class :
-       {OperationClass::Normal, OperationClass::Tx, OperationClass::Control}) {
-    const auto &class_slots = slots(operation_class);
-    const auto found = std::find_if(class_slots.begin(), class_slots.end(),
-                                    [operation](const Slot &slot) {
-                                      return slot.state != SlotState::Free &&
-                                             slot.operation_id == operation;
-                                    });
-    if (found != class_slots.end()) {
-      return &*found;
-    }
-  }
-  return nullptr;
-}
-
-ReserveCompletionResult
-CompletionTracker::reserve(const OperationId operation,
-                           const OperationClass operation_class,
-                           const CompletionKind expected_kind) noexcept {
-  if (!valid(operation)) {
-    return ReserveCompletionResult::InvalidOperation;
-  }
-  if (find(operation) != nullptr) {
-    return ReserveCompletionResult::Duplicate;
-  }
-  auto &class_slots = slots(operation_class);
-  const auto free_slot = std::find_if(
-      class_slots.begin(), class_slots.end(),
-      [](const Slot &slot) { return slot.state == SlotState::Free; });
-  if (free_slot == class_slots.end()) {
-    return ReserveCompletionResult::Full;
-  }
-  free_slot->operation_id = operation;
-  free_slot->expected_kind = expected_kind;
-  free_slot->state = SlotState::Reserved;
-  free_slot->completion.reset();
-  return ReserveCompletionResult::Reserved;
-}
-
-bool CompletionTracker::cancel_reservation(
-    const OperationId operation) noexcept {
-  auto *const slot = find(operation);
-  if (slot == nullptr || slot->state != SlotState::Reserved) {
-    return false;
-  }
-  *slot = Slot{};
-  return true;
-}
-
-CompleteOperationResult
-CompletionTracker::complete(const CompletionEvent &event) noexcept {
-  auto *const slot = find(operation_id(event));
-  if (slot == nullptr) {
-    return CompleteOperationResult::UnknownIgnored;
-  }
-  if (slot->expected_kind != completion_kind(event)) {
-    return CompleteOperationResult::UnexpectedKind;
-  }
-  if (slot->state == SlotState::Completed) {
-    return CompleteOperationResult::DuplicateIgnored;
-  }
-  slot->completion = event;
-  slot->state = SlotState::Completed;
-  return CompleteOperationResult::Completed;
-}
-
-const CompletionEvent *
-CompletionTracker::peek(const OperationId operation) const noexcept {
-  const auto *const slot = find(operation);
-  if (slot == nullptr || slot->state != SlotState::Completed) {
-    return nullptr;
-  }
-  return &*slot->completion;
-}
-
-std::optional<CompletionEvent>
-CompletionTracker::consume(const OperationId operation) noexcept {
-  auto *const slot = find(operation);
-  if (slot == nullptr || slot->state != SlotState::Completed) {
-    return std::nullopt;
-  }
-  auto event = std::move(slot->completion);
-  *slot = Slot{};
-  return event;
 }
 
 } // namespace lazycom::app

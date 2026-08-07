@@ -64,6 +64,14 @@
         "LAZYCOM_ENABLE_ASAN": "ON",
         "LAZYCOM_ENABLE_UBSAN": "ON"
       }
+    },
+    {
+      "name": "gcc-tsan",
+      "inherits": "gcc-debug",
+      "binaryDir": "${sourceDir}/build/gcc-tsan",
+      "cacheVariables": {
+        "LAZYCOM_ENABLE_TSAN": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -71,7 +79,8 @@
     { "name": "clang-debug", "configurePreset": "clang-debug" },
     { "name": "gcc-release", "configurePreset": "gcc-release" },
     { "name": "gcc-debug-no-diagnostics", "configurePreset": "gcc-debug-no-diagnostics" },
-    { "name": "gcc-asan-ubsan", "configurePreset": "gcc-asan-ubsan" }
+    { "name": "gcc-asan-ubsan", "configurePreset": "gcc-asan-ubsan" },
+    { "name": "gcc-tsan", "configurePreset": "gcc-tsan" }
   ],
   "testPresets": [
     {
@@ -97,6 +106,11 @@
     {
       "name": "gcc-asan-ubsan",
       "configurePreset": "gcc-asan-ubsan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "gcc-tsan",
+      "configurePreset": "gcc-tsan",
       "output": { "outputOnFailure": true }
     }
   ]

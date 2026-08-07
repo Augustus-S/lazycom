@@ -150,6 +150,19 @@ TEST_CASE("Linux session backend accepts writable user-owned directories",
             .state == lazycom::logging::SessionLogState::Recording);
 }
 
+TEST_CASE("Linux session backend rejects group-writable final directories",
+          "[integration][logging][file]") {
+  TemporaryDirectory temporary;
+  const auto log_directory = temporary.path() / "logs";
+  REQUIRE(std::filesystem::create_directory(log_directory));
+  REQUIRE(::chmod(log_directory.c_str(), S_IRWXU | S_IWGRP) == 0);
+  lazycom::logging::SessionWriter writer{options_for(log_directory)};
+  REQUIRE(writer.enable());
+  REQUIRE(writer.start_session(lazycom::test::LogHeaderBuilder{}.build())
+              .get()
+              .state == lazycom::logging::SessionLogState::Error);
+}
+
 TEST_CASE("Linux session backend rotates and deletes only verified logs",
           "[integration][logging][quota]") {
   TemporaryDirectory temporary;
@@ -228,6 +241,73 @@ TEST_CASE("damaged controlled logs count toward quota and are not deleted",
   REQUIRE(writer.start_session(header).get().state ==
           lazycom::logging::SessionLogState::Error);
   REQUIRE(std::filesystem::exists(damaged));
+  REQUIRE(std::filesystem::file_size(damaged) == 4096U);
+}
+
+TEST_CASE("damaged and empty controlled logs consume the max-files quota",
+          "[integration][logging][quota]") {
+  TemporaryDirectory temporary;
+  const auto log_directory = temporary.path() / "logs";
+  REQUIRE(std::filesystem::create_directory(log_directory));
+  REQUIRE(::chmod(log_directory.c_str(), S_IRWXU) == 0);
+  const auto damaged = log_directory / "lazycom-session-damaged.ndjson";
+  const auto empty = log_directory / "lazycom-session-empty.ndjson";
+  {
+    std::ofstream output{damaged, std::ios::binary};
+    REQUIRE(output);
+    output << "not NDJSON\n";
+  }
+  {
+    std::ofstream output{empty, std::ios::binary};
+    REQUIRE(output);
+  }
+  REQUIRE(::chmod(damaged.c_str(), S_IRUSR | S_IWUSR) == 0);
+  REQUIRE(::chmod(empty.c_str(), S_IRUSR | S_IWUSR) == 0);
+
+  auto options = options_for(log_directory);
+  options.quotas.max_files = 1U;
+  options.quotas.max_total_bytes = 1024U * 1024U;
+  options.quotas.max_file_bytes = 1024U * 1024U;
+  lazycom::logging::SessionWriter writer{options};
+  REQUIRE(writer.enable());
+  REQUIRE(writer.start_session(lazycom::test::LogHeaderBuilder{}.build())
+              .get()
+              .state == lazycom::logging::SessionLogState::Error);
+}
+
+TEST_CASE("quota cache rescans after an external directory change",
+          "[integration][logging][quota]") {
+  TemporaryDirectory temporary;
+  const auto log_directory = temporary.path() / "logs";
+  const auto header = lazycom::test::LogHeaderBuilder{}.build();
+  auto record =
+      lazycom::test::LogRecordBuilder{1U, lazycom::logging::Direction::Rx,
+                                      lazycom::test::bytes("payload")}
+          .build();
+  const auto header_line = lazycom::logging::encode_header_line(header);
+  const auto record_line = lazycom::logging::encode_record_line(record);
+  REQUIRE(header_line);
+  REQUIRE(record_line);
+  auto options = options_for(log_directory);
+  options.quotas.max_file_bytes = header_line->size() + record_line->size();
+  options.quotas.max_total_bytes = options.quotas.max_file_bytes + 4095U;
+
+  lazycom::logging::SessionWriter writer{options};
+  REQUIRE(writer.enable());
+  REQUIRE(writer.start_session(header).get().state ==
+          lazycom::logging::SessionLogState::Recording);
+  const auto damaged = log_directory / "lazycom-session-external.ndjson";
+  {
+    std::ofstream output{damaged, std::ios::binary};
+    REQUIRE(output);
+    output << std::string(4096U, 'x');
+  }
+  REQUIRE(::chmod(damaged.c_str(), S_IRUSR | S_IWUSR) == 0);
+
+  REQUIRE(writer.try_enqueue({record}) ==
+          lazycom::logging::EnqueueResult::Accepted);
+  REQUIRE(writer.barrier(1U).get().state ==
+          lazycom::logging::BarrierState::WriterFailed);
   REQUIRE(std::filesystem::file_size(damaged) == 4096U);
 }
 

@@ -81,6 +81,7 @@ using SerialCompletion = std::variant<ConnectCompletion, TxCompletion,
 enum class SerialDataKind : std::uint8_t {
   Rx,
   Tx,
+  Error,
   Cleanup,
 };
 

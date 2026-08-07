@@ -77,30 +77,39 @@ struct PersistenceWorker::Impl {
                                       SafeFileIdentity expected_identity,
                                       bool read_only) {
     if (read_only) {
-      return {SaveSubmitState::ReadOnly, {},
-              persistence_error(
-                  "configuration is read-only after an unsafe or invalid load")};
+      return {
+          SaveSubmitState::ReadOnly,
+          {},
+          persistence_error(
+              "configuration is read-only after an unsafe or invalid load")};
     }
     if (!serialized) {
       return {SaveSubmitState::Invalid, {}, serialized.error()};
     }
     if (!expected_filename(file, path(file))) {
-      return {SaveSubmitState::Invalid, {},
+      return {SaveSubmitState::Invalid,
+              {},
               persistence_error("persistence target has an unexpected path")};
     }
 
-    Request request{file, path(file), std::move(*serialized), maximum_bytes,
-                    std::move(expected_identity), {}};
+    Request request{file,
+                    path(file),
+                    std::move(*serialized),
+                    maximum_bytes,
+                    std::move(expected_identity),
+                    {}};
     auto future = request.promise.get_future();
     {
       std::scoped_lock lock{mutex};
       if (stopping) {
-        return {SaveSubmitState::Stopping, {},
+        return {SaveSubmitState::Stopping,
+                {},
                 persistence_error("persistence worker is stopping")};
       }
       const auto index = file_index(file);
       if (active[index]) {
-        return {SaveSubmitState::Busy, {},
+        return {SaveSubmitState::Busy,
+                {},
                 persistence_error(
                     "a save for this configuration file is already active")};
       }
@@ -111,7 +120,7 @@ struct PersistenceWorker::Impl {
     return {SaveSubmitState::Accepted, std::move(future), std::nullopt};
   }
 
-  void run() {
+  void run_body() {
     while (true) {
       std::optional<Request> request;
       {
@@ -134,8 +143,8 @@ struct PersistenceWorker::Impl {
             request->expected_identity, file_system);
       } catch (const std::exception &exception) {
         outcome = {CommitState::NotCommitted,
-                   make_error(ErrorCode::ConfigIoFailed,
-                              Operation::SaveConfig, exception.what())};
+                   make_error(ErrorCode::ConfigIoFailed, Operation::SaveConfig,
+                              exception.what())};
       } catch (...) {
         outcome = {CommitState::NotCommitted,
                    persistence_error("persistence worker save failed")};
@@ -149,6 +158,20 @@ struct PersistenceWorker::Impl {
     }
   }
 
+  void run() noexcept {
+    try {
+      run_body();
+    } catch (...) {
+      // The process-level coordinator treats a missing save completion as a
+      // fatal shutdown condition. The lifecycle signal must still be reliable.
+    }
+    {
+      std::scoped_lock lock{mutex};
+      stopped_ready = true;
+    }
+    condition.notify_all();
+  }
+
   PersistencePaths paths;
   AtomicFileSystem &file_system;
   mutable std::mutex mutex;
@@ -156,6 +179,7 @@ struct PersistenceWorker::Impl {
   std::deque<Request> requests;
   std::array<bool, 3> active{};
   bool stopping{};
+  bool stopped_ready{};
   std::jthread worker;
 };
 
@@ -173,14 +197,14 @@ SaveSubmission PersistenceWorker::save_config(
                        kConfigMaximumBytes, expected_identity, read_only);
 }
 
-SaveSubmission PersistenceWorker::save_quick_send(
-    const QuickSendSnapshot &snapshot,
-    const SafeFileIdentity &expected_identity,
-    std::string_view preserved_document, bool read_only) {
-  return impl_->submit(
-      PersistenceFile::QuickSend,
-      serialize_quick_send_toml(snapshot, preserved_document),
-      kQuickSendMaximumBytes, expected_identity, read_only);
+SaveSubmission
+PersistenceWorker::save_quick_send(const QuickSendSnapshot &snapshot,
+                                   const SafeFileIdentity &expected_identity,
+                                   std::string_view preserved_document,
+                                   bool read_only) {
+  return impl_->submit(PersistenceFile::QuickSend,
+                       serialize_quick_send_toml(snapshot, preserved_document),
+                       kQuickSendMaximumBytes, expected_identity, read_only);
 }
 
 SaveSubmission PersistenceWorker::save_state(
@@ -191,7 +215,7 @@ SaveSubmission PersistenceWorker::save_state(
                        kStateMaximumBytes, expected_identity, read_only);
 }
 
-void PersistenceWorker::shutdown() {
+void PersistenceWorker::request_stop() noexcept {
   if (!impl_) {
     return;
   }
@@ -200,6 +224,24 @@ void PersistenceWorker::shutdown() {
     impl_->stopping = true;
   }
   impl_->condition.notify_one();
+}
+
+bool PersistenceWorker::wait_until_stopped(
+    const std::chrono::steady_clock::time_point deadline) const noexcept {
+  if (!impl_) {
+    return true;
+  }
+  try {
+    std::unique_lock lock{impl_->mutex};
+    return impl_->condition.wait_until(lock, deadline,
+                                       [this] { return impl_->stopped_ready; });
+  } catch (...) {
+    return false;
+  }
+}
+
+void PersistenceWorker::shutdown() {
+  request_stop();
   if (impl_->worker.joinable()) {
     impl_->worker.join();
   }

@@ -22,6 +22,8 @@ enum class ErrorCode : std::uint32_t {
   SerialPortBusy = 0x020002,
   SerialDeviceGone = 0x020003,
   SerialUnsupported = 0x020004,
+  SerialOperationTimedOut = 0x020005,
+  SerialOperationCancelled = 0x020006,
   ConfigParseFailed = 0x030001,
   ConfigSchemaInvalid = 0x030002,
   ConfigUnsafeFile = 0x030003,

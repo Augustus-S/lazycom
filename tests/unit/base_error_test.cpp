@@ -21,6 +21,9 @@ TEST_CASE("published error codes retain unique numeric values and identifiers",
       lazycom::ErrorCode::SerialPermissionDenied,
       lazycom::ErrorCode::SerialPortBusy,
       lazycom::ErrorCode::SerialDeviceGone,
+      lazycom::ErrorCode::SerialUnsupported,
+      lazycom::ErrorCode::SerialOperationTimedOut,
+      lazycom::ErrorCode::SerialOperationCancelled,
       lazycom::ErrorCode::ConfigParseFailed,
       lazycom::ErrorCode::ConfigSchemaInvalid,
       lazycom::ErrorCode::ConfigUnsafeFile,
@@ -39,6 +42,14 @@ TEST_CASE("published error codes retain unique numeric values and identifiers",
   }
   REQUIRE(values.size() == codes.size());
   REQUIRE(identifiers.size() == codes.size());
+}
+
+TEST_CASE("serial operation terminal errors have stable identifiers",
+          "[base][serial]") {
+  CHECK(lazycom::error_descriptor(lazycom::ErrorCode::SerialOperationTimedOut)
+            .identifier == "LC-SER-2005");
+  CHECK(lazycom::error_descriptor(lazycom::ErrorCode::SerialOperationCancelled)
+            .identifier == "LC-SER-2006");
 }
 
 TEST_CASE("error captures operation context", "[base]") {

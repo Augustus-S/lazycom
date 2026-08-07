@@ -6,8 +6,11 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/eventfd.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include <dirent.h>
 
 #include <array>
 #include <atomic>
@@ -16,7 +19,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -98,6 +103,24 @@ void drain_eventfd(int fd) {
          static_cast<ssize_t>(sizeof(value))) {
   }
   REQUIRE(errno == EAGAIN);
+}
+
+[[nodiscard]] std::size_t count_open_fds() {
+  DIR *const directory = ::opendir("/proc/self/fd");
+  if (directory == nullptr) {
+    throw std::runtime_error("cannot inspect /proc/self/fd");
+  }
+  std::size_t count = 0U;
+  while (const dirent *const entry = ::readdir(directory)) {
+    const std::string_view name{entry->d_name};
+    if (name != "." && name != "..") {
+      ++count;
+    }
+  }
+  if (::closedir(directory) != 0) {
+    throw std::runtime_error("cannot close /proc/self/fd");
+  }
+  return count;
 }
 
 } // namespace
@@ -278,4 +301,33 @@ TEST_CASE("serial permission probe reports effective access",
     CHECK(denied->access == lazycom::serial::DeviceAccess::PermissionDenied);
     REQUIRE(::chmod(slave_path.data(), S_IRUSR | S_IWUSR) == 0);
   }
+}
+
+TEST_CASE("busy libserialport open does not leak its temporary fd",
+          "[integration][serial][linux]") {
+  UniqueFd master{::posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
+  REQUIRE(master.get() >= 0);
+  REQUIRE(::grantpt(master.get()) == 0);
+  REQUIRE(::unlockpt(master.get()) == 0);
+
+  std::array<char, 256> slave_path{};
+  REQUIRE(::ptsname_r(master.get(), slave_path.data(), slave_path.size()) == 0);
+  UniqueFd lock_holder{
+      ::open(slave_path.data(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
+  REQUIRE(lock_holder.get() >= 0);
+  REQUIRE(::flock(lock_holder.get(), LOCK_EX | LOCK_NB) == 0);
+
+  sp_port *raw_port = nullptr;
+  REQUIRE(sp_get_port_by_name(slave_path.data(), &raw_port) == SP_OK);
+  PortGuard port{raw_port};
+  const auto before = count_open_fds();
+  for (std::size_t attempt = 0U; attempt < 16U; ++attempt) {
+    REQUIRE(sp_open(port.get(), SP_MODE_READ_WRITE) == SP_ERR_FAIL);
+    const int open_error = sp_last_error_code();
+    REQUIRE((open_error == EAGAIN || open_error == EWOULDBLOCK));
+    int failed_handle = 0;
+    REQUIRE(sp_get_port_handle(port.get(), &failed_handle) == SP_OK);
+    REQUIRE(failed_handle == -1);
+  }
+  REQUIRE(count_open_fds() == before);
 }

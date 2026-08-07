@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <random>
 #include <span>
@@ -45,8 +46,7 @@ join(const std::vector<lazycom::framing::RxFrame> &frames) {
 
 void append(std::vector<lazycom::framing::RxFrame> &destination,
             std::vector<lazycom::framing::RxFrame> source) {
-  destination.insert(destination.end(),
-                     std::make_move_iterator(source.begin()),
+  destination.insert(destination.end(), std::make_move_iterator(source.begin()),
                      std::make_move_iterator(source.end()));
 }
 
@@ -60,8 +60,8 @@ public:
   push(const lazycom::model::SinkEnvelope &envelope,
        const std::size_t) override {
     ++calls;
-    const auto result = script.empty() ? QueuePushResult::Accepted
-                                       : script.front();
+    const auto result =
+        script.empty() ? QueuePushResult::Accepted : script.front();
     if (!script.empty()) {
       script.pop_front();
     }
@@ -146,8 +146,9 @@ TEST_CASE("all input chunk boundaries preserve the exact RX stream",
           start = boundary + 1U;
         }
       }
-      append(frames, framer.push(std::span<const std::byte>{input}.subspan(start),
-                                 now + 20ms));
+      append(frames,
+             framer.push(std::span<const std::byte>{input}.subspan(start),
+                         now + 20ms));
       append(frames, framer.flush());
       REQUIRE(join(frames) == input);
       REQUIRE(std::ranges::all_of(frames, [maximum](const auto &frame) {
@@ -157,14 +158,51 @@ TEST_CASE("all input chunk boundaries preserve the exact RX stream",
   }
 }
 
+TEST_CASE("RX delimiter floods retain only small frame capacities",
+          "[data-path][framing]") {
+  constexpr std::size_t maximum = 65'536U;
+  std::string input;
+  input.reserve(4096U);
+  for (std::size_t index = 0U; index < 2048U; ++index) {
+    input.append("\r\n");
+  }
+
+  lazycom::framing::RxFramer framer{{50ms, maximum}};
+  const auto frames = framer.push(bytes(input), ObservationClock::time_point{});
+  REQUIRE(frames.size() == 2048U);
+  std::size_t total_capacity = 0U;
+  for (const auto &frame : frames) {
+    REQUIRE(frame.bytes == bytes("\r\n"));
+    REQUIRE(frame.bytes.capacity() < maximum);
+    total_capacity += frame.bytes.capacity();
+  }
+  REQUIRE(total_capacity < maximum);
+}
+
+TEST_CASE("RX idle checks are safe across extreme observation times",
+          "[data-path][framing]") {
+  lazycom::framing::RxFramer framer{{50ms, 64U}};
+  REQUIRE(
+      framer.push(bytes("old"), ObservationClock::time_point::min()).empty());
+  const auto frames =
+      framer.push(bytes("new"), ObservationClock::time_point::max());
+  REQUIRE(frames.size() == 1U);
+  REQUIRE(frames[0].bytes == bytes("old"));
+  REQUIRE(framer.flush()[0].bytes == bytes("new"));
+
+  REQUIRE(
+      framer.push(bytes("tail"), ObservationClock::time_point::max()).empty());
+  REQUIRE(framer.on_idle(ObservationClock::time_point::min()).empty());
+  REQUIRE(framer.flush()[0].bytes == bytes("tail"));
+}
+
 TEST_CASE("random RX streams reconstruct without loss",
           "[data-path][framing][property]") {
   std::mt19937 generator{0x4C415A59U};
   const auto now = ObservationClock::time_point{};
   for (std::size_t iteration = 0U; iteration < 200U; ++iteration) {
     const auto length = static_cast<std::size_t>(generator() % 1024U);
-    const auto maximum =
-        static_cast<std::size_t>(generator() % 64U) + 1U;
+    const auto maximum = static_cast<std::size_t>(generator() % 64U) + 1U;
     std::vector<std::byte> input(length);
     for (auto &byte : input) {
       byte = static_cast<std::byte>(generator() % 256U);
@@ -174,11 +212,11 @@ TEST_CASE("random RX streams reconstruct without loss",
     std::size_t offset = 0U;
     while (offset < input.size()) {
       const auto available = input.size() - offset;
-      const auto count = std::min(
-          available, static_cast<std::size_t>(generator() % 31U) + 1U);
-      append(frames,
-             framer.push(std::span<const std::byte>{input}.subspan(offset, count),
-                         now + std::chrono::milliseconds{offset}));
+      const auto count =
+          std::min(available, static_cast<std::size_t>(generator() % 31U) + 1U);
+      append(frames, framer.push(std::span<const std::byte>{input}.subspan(
+                                     offset, count),
+                                 now + std::chrono::milliseconds{offset}));
       offset += count;
     }
     append(frames, framer.flush());
@@ -200,9 +238,7 @@ TEST_CASE("safe display covers every octet and incremental UTF-8",
   REQUIRE(lazycom::encoding::render_hex(all).size() == 256U * 3U - 1U);
 
   lazycom::encoding::SafeUtf8Display display;
-  REQUIRE(display.append(
-              std::array{std::byte{0xE2}, std::byte{0x82}})
-              .empty());
+  REQUIRE(display.append(std::array{std::byte{0xE2}, std::byte{0x82}}).empty());
   REQUIRE(display.has_incomplete_sequence());
   REQUIRE(display.append(std::array{std::byte{0xAC}}) == "\xE2\x82\xAC");
   REQUIRE(display.finish_frame().empty());
@@ -213,17 +249,15 @@ TEST_CASE("safe display covers every octet and incremental UTF-8",
 
   lazycom::encoding::SafeUtf8Display invalid_continuation;
   REQUIRE(invalid_continuation.append(
-              std::array{std::byte{0xE2}, std::byte{'A'}}) ==
-          "\\xE2A");
+              std::array{std::byte{0xE2}, std::byte{'A'}}) == "\\xE2A");
   REQUIRE(invalid_continuation.finish_frame().empty());
 
-  const auto bidi = std::array{std::byte{0xE2}, std::byte{0x80},
-                               std::byte{0xAE}};
+  const auto bidi =
+      std::array{std::byte{0xE2}, std::byte{0x80}, std::byte{0xAE}};
   REQUIRE(lazycom::encoding::render_text(bidi) == "\\u{202E}");
   REQUIRE(lazycom::encoding::render_text(bytes("\\")) == "\\\\");
-  REQUIRE(lazycom::encoding::render(bytes("A"),
-                                    lazycom::encoding::DisplayMode::Mixed) ==
-          "A | 41");
+  REQUIRE(lazycom::encoding::render(
+              bytes("A"), lazycom::encoding::DisplayMode::Mixed) == "A | 41");
 }
 
 TEST_CASE("TXT and HEX parsers reject partial or malformed input",
@@ -231,14 +265,13 @@ TEST_CASE("TXT and HEX parsers reject partial or malformed input",
   const auto text = lazycom::encoding::parse_text("ready\r\n");
   REQUIRE(text);
   REQUIRE(*text == bytes("ready\r\n"));
-  REQUIRE_FALSE(lazycom::encoding::parse_text(
-      std::string_view{"\xC0\xAF", 2U}));
+  REQUIRE_FALSE(
+      lazycom::encoding::parse_text(std::string_view{"\xC0\xAF", 2U}));
 
   const auto hex = lazycom::encoding::parse_hex("0x00 FF\t7e\r\nA5");
   REQUIRE(hex);
-  REQUIRE(*hex ==
-          std::vector<std::byte>{std::byte{0x00}, std::byte{0xFF},
-                                 std::byte{0x7E}, std::byte{0xA5}});
+  REQUIRE(*hex == std::vector<std::byte>{std::byte{0x00}, std::byte{0xFF},
+                                         std::byte{0x7E}, std::byte{0xA5}});
   REQUIRE_FALSE(lazycom::encoding::parse_hex("00 1 02"));
   REQUIRE_FALSE(lazycom::encoding::parse_hex("0011"));
 }
@@ -250,36 +283,82 @@ TEST_CASE("shared payload budget is charged once and released once",
     const auto payload = lazycom::model::make_shared_payload(
         budget, BudgetCategory::RxIngress, bytes("payload"));
     REQUIRE(payload);
-    REQUIRE(budget.used(BudgetCategory::RxIngress) == 7U);
+    const auto charged = lazycom::model::kSharedPayloadFixedBudgetBytes + 7U;
+    REQUIRE(payload->budget_bytes() == charged);
+    REQUIRE(budget.used(BudgetCategory::RxIngress) == charged);
     {
       const auto first_sink = payload;
       const auto second_sink = payload;
       REQUIRE(first_sink == second_sink);
-      REQUIRE(budget.used(BudgetCategory::RxIngress) == 7U);
+      REQUIRE(budget.used(BudgetCategory::RxIngress) == charged);
     }
   }
   REQUIRE(budget.used(BudgetCategory::RxIngress) == 0U);
   REQUIRE(budget.total_used() == 0U);
 }
 
+TEST_CASE("empty and small shared payloads include fixed allocation overhead",
+          "[data-path][budget]") {
+  lazycom::model::GlobalMemoryBudget budget;
+  {
+    const auto empty = lazycom::model::make_shared_payload(
+        budget, BudgetCategory::Tx, std::span<const std::byte>{});
+    REQUIRE(empty);
+    REQUIRE(empty->bytes().empty());
+    REQUIRE(empty->budget_bytes() ==
+            lazycom::model::kSharedPayloadFixedBudgetBytes);
+
+    const auto small = lazycom::model::make_shared_payload(
+        budget, BudgetCategory::Tx, bytes("x"));
+    REQUIRE(small);
+    REQUIRE(small->budget_bytes() ==
+            lazycom::model::kSharedPayloadFixedBudgetBytes + 1U);
+    REQUIRE(budget.used(BudgetCategory::Tx) ==
+            lazycom::model::kSharedPayloadFixedBudgetBytes * 2U + 1U);
+  }
+  REQUIRE(budget.used(BudgetCategory::Tx) == 0U);
+}
+
 TEST_CASE("budget rejects before construction and returns all reservations",
           "[data-path][budget]") {
   auto limits = lazycom::model::BudgetLimits::defaults();
-  limits.category[static_cast<std::size_t>(BudgetCategory::RxIngress)] = 3U;
+  const auto limit = lazycom::model::kSharedPayloadFixedBudgetBytes + 3U;
+  limits.category[static_cast<std::size_t>(BudgetCategory::RxIngress)] = limit;
   lazycom::model::GlobalMemoryBudget budget{limits};
   REQUIRE_FALSE(lazycom::model::make_shared_payload(
       budget, BudgetCategory::RxIngress, bytes("four")));
   REQUIRE(budget.total_used() == 0U);
   {
-    auto reservation = budget.try_reserve(BudgetCategory::RxIngress, 3U);
+    auto reservation = budget.try_reserve(BudgetCategory::RxIngress, limit);
     REQUIRE(reservation);
     REQUIRE_FALSE(budget.try_reserve(BudgetCategory::RxIngress, 1U));
   }
   REQUIRE(budget.total_used() == 0U);
 }
 
-TEST_CASE("immutable batch returns metadata budget after every sink releases it",
-          "[data-path][budget]") {
+TEST_CASE("record draft validation rejects out-of-range enums",
+          "[data-path][model]") {
+  lazycom::model::GlobalMemoryBudget budget;
+  const auto payload = lazycom::model::make_shared_payload(
+      budget, BudgetCategory::RxIngress, bytes("x"));
+
+  auto draft = rx_draft(payload);
+  draft.direction = static_cast<Direction>(std::numeric_limits<int>::max());
+  REQUIRE_FALSE(lazycom::model::valid_record_draft(draft));
+
+  draft = rx_draft(payload);
+  draft.direction = Direction::Tx;
+  draft.input_mode =
+      static_cast<lazycom::logging::InputMode>(std::numeric_limits<int>::max());
+  REQUIRE_FALSE(lazycom::model::valid_record_draft(draft));
+
+  draft.input_mode = lazycom::logging::InputMode::Text;
+  REQUIRE(lazycom::model::valid_record_draft(draft));
+}
+
+TEST_CASE(
+    "immutable batch returns metadata budget after every sink releases it",
+    "[data-path][budget]") {
   lazycom::model::GlobalMemoryBudget budget;
   const auto payload = lazycom::model::make_shared_payload(
       budget, BudgetCategory::RxIngress, bytes("x"));
@@ -287,9 +366,8 @@ TEST_CASE("immutable batch returns metadata budget after every sink releases it"
   ScriptedSink log;
   lazycom::model::SessionSequencer sequencer{lazycom::SessionId{1U}, budget,
                                              &ui, &log};
-  auto result = sequencer.submit(lazycom::SessionId{1U},
-                                 SessionEventOrigin::Normal,
-                                 {rx_draft(payload)});
+  auto result = sequencer.submit(
+      lazycom::SessionId{1U}, SessionEventOrigin::Normal, {rx_draft(payload)});
   REQUIRE(result.status == lazycom::model::SequenceStatus::Accepted);
   REQUIRE(budget.used(BudgetCategory::OwnerScratch) > 0U);
   result = {};
@@ -310,15 +388,14 @@ TEST_CASE("sequencer validates identity and isolates full sinks with gaps",
   lazycom::model::SessionSequencer sequencer{lazycom::SessionId{7U}, budget,
                                              &ui, &log};
 
-  auto wrong = sequencer.submit(lazycom::SessionId{8U},
-                                SessionEventOrigin::Normal,
-                                {rx_draft(payload)});
+  auto wrong = sequencer.submit(
+      lazycom::SessionId{8U}, SessionEventOrigin::Normal, {rx_draft(payload)});
   REQUIRE(wrong.status == lazycom::model::SequenceStatus::WrongSession);
   REQUIRE(sequencer.next_seq() == 1U);
 
-  const auto first = sequencer.submit(lazycom::SessionId{7U},
-                                      SessionEventOrigin::Normal,
-                                      {rx_draft(payload), rx_draft(payload)});
+  const auto first =
+      sequencer.submit(lazycom::SessionId{7U}, SessionEventOrigin::Normal,
+                       {rx_draft(payload), rx_draft(payload)});
   REQUIRE(first.status == lazycom::model::SequenceStatus::Accepted);
   REQUIRE(first.first_seq == 1U);
   REQUIRE(first.last_seq == 2U);
@@ -327,22 +404,22 @@ TEST_CASE("sequencer validates identity and isolates full sinks with gaps",
   REQUIRE(first.log.result == QueuePushResult::Accepted);
   REQUIRE(log.accepted.size() == 1U);
 
-  const auto second = sequencer.submit(lazycom::SessionId{7U},
-                                       SessionEventOrigin::Normal,
-                                       {rx_draft(payload)});
+  const auto second = sequencer.submit(
+      lazycom::SessionId{7U}, SessionEventOrigin::Normal, {rx_draft(payload)});
   REQUIRE(second.first_seq == 3U);
   REQUIRE(second.ui.result == QueuePushResult::Accepted);
   REQUIRE(second.ui.gap == lazycom::model::SequenceGap{1U, 2U});
-  REQUIRE(ui.accepted[0].gap_before ==
-          lazycom::model::SequenceGap{1U, 2U});
+  REQUIRE(ui.accepted[0].gap_before == lazycom::model::SequenceGap{1U, 2U});
   REQUIRE(log.calls == 2U);
 
   REQUIRE(sequencer.begin_cleanup(lazycom::SessionId{7U}));
-  REQUIRE(sequencer.submit(lazycom::SessionId{7U},
-                           SessionEventOrigin::Normal, {rx_draft(payload)})
+  REQUIRE(sequencer
+              .submit(lazycom::SessionId{7U}, SessionEventOrigin::Normal,
+                      {rx_draft(payload)})
               .status == lazycom::model::SequenceStatus::InvalidOrigin);
-  REQUIRE(sequencer.submit(lazycom::SessionId{7U},
-                           SessionEventOrigin::Cleanup, {rx_draft(payload)})
+  REQUIRE(sequencer
+              .submit(lazycom::SessionId{7U}, SessionEventOrigin::Cleanup,
+                      {rx_draft(payload)})
               .first_seq == 4U);
 }
 
@@ -356,17 +433,16 @@ TEST_CASE("UI sink evicts oldest batches and preserves a sequence gap",
   lazycom::model::SessionSequencer sequencer{lazycom::SessionId{9U}, budget,
                                              &ui, &log};
   for (std::size_t index = 0U; index < 3U; ++index) {
-    REQUIRE(sequencer.submit(lazycom::SessionId{9U},
-                             SessionEventOrigin::Normal,
-                             {rx_draft(payload)})
+    REQUIRE(sequencer
+                .submit(lazycom::SessionId{9U}, SessionEventOrigin::Normal,
+                        {rx_draft(payload)})
                 .ui.result == QueuePushResult::Accepted);
   }
   REQUIRE(ui.record_count() == 2U);
   const auto first_visible = ui.try_pop();
   REQUIRE(first_visible);
   REQUIRE(first_visible->batch->first_seq() == 2U);
-  REQUIRE(first_visible->gap_before ==
-          lazycom::model::SequenceGap{1U, 1U});
+  REQUIRE(first_visible->gap_before == lazycom::model::SequenceGap{1U, 1U});
   REQUIRE(log.calls == 3U);
 }
 
@@ -376,33 +452,38 @@ TEST_CASE("TX terminal helper records only accepted prefix then termination",
   const auto payload = lazycom::model::make_shared_payload(
       budget, BudgetCategory::Tx, bytes("abcdef"));
   lazycom::model::TxOperation operation{
-      lazycom::OperationId{42U}, lazycom::ConnectionGeneration{2U},
-      lazycom::SessionId{7U}, payload, lazycom::logging::InputMode::Text,
+      lazycom::OperationId{42U},
+      lazycom::ConnectionGeneration{2U},
+      lazycom::SessionId{7U},
+      payload,
+      lazycom::logging::InputMode::Text,
       std::chrono::steady_clock::time_point{} + 1s};
 
   REQUIRE(operation.accept(2U, {"2026-07-26T00:00:01Z", 10U}));
   REQUIRE(operation.accept(1U, {"2026-07-26T00:00:02Z", 20U}));
   REQUIRE_FALSE(operation.accept(4U, {"ignored", 0U}));
   const auto records = operation.terminal_records(
-      lazycom::model::TxTermination::TimedOut,
-      {"2026-07-26T00:00:03Z", 30U}, "LC-SER-2004", "deadline exceeded");
+      lazycom::model::TxTermination::TimedOut, {"2026-07-26T00:00:03Z", 30U},
+      "LC-SER-2004", "deadline exceeded");
   REQUIRE(records);
   REQUIRE(records->size() == 2U);
   REQUIRE((*records)[0].direction == Direction::Tx);
-  REQUIRE(std::ranges::equal(
-      (*records)[0].payload.bytes(), payload->bytes().first(3U)));
+  REQUIRE(std::ranges::equal((*records)[0].payload.bytes(),
+                             payload->bytes().first(3U)));
   REQUIRE((*records)[0].time.elapsed_ns == 20U);
   REQUIRE((*records)[1].direction == Direction::Err);
   REQUIRE((*records)[1].operation_id == lazycom::OperationId{42U});
   REQUIRE((*records)[1].message.find("operation_id=42") != std::string::npos);
 
   lazycom::model::TxOperation untouched{
-      lazycom::OperationId{43U}, lazycom::ConnectionGeneration{2U},
-      lazycom::SessionId{7U}, payload, lazycom::logging::InputMode::Hex,
+      lazycom::OperationId{43U},
+      lazycom::ConnectionGeneration{2U},
+      lazycom::SessionId{7U},
+      payload,
+      lazycom::logging::InputMode::Hex,
       std::chrono::steady_clock::time_point{}};
   const auto failed = untouched.terminal_records(
-      lazycom::model::TxTermination::Failed,
-      {"2026-07-26T00:00:03Z", 30U});
+      lazycom::model::TxTermination::Failed, {"2026-07-26T00:00:03Z", 30U});
   REQUIRE(failed);
   REQUIRE(failed->size() == 1U);
   REQUIRE((*failed)[0].direction == Direction::Err);

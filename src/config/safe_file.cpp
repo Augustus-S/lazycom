@@ -10,7 +10,9 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <system_error>
 #include <unistd.h>
@@ -18,6 +20,8 @@
 
 namespace lazycom::config {
 namespace {
+
+constexpr std::string_view kTransactionLockName = ".lazycom-config.lock";
 
 class FileDescriptor {
 public:
@@ -81,6 +85,8 @@ has_directory_permissions(const struct stat &status) noexcept {
 [[nodiscard]] bool has_file_permissions(const struct stat &status) noexcept {
   return (status.st_mode & 07777) == (S_IRUSR | S_IWUSR);
 }
+
+[[nodiscard]] int fsync_retry(int descriptor) noexcept;
 
 [[nodiscard]] Result<FileDescriptor>
 open_private_directory(const std::filesystem::path &path, Operation operation,
@@ -156,6 +162,11 @@ open_or_create_private_directory(const std::filesystem::path &path,
         return failure<FileDescriptor>(
             operation, "cannot set configuration directory mode 0700", errno);
       }
+      if (fsync_retry(current.get()) != 0) {
+        return failure<FileDescriptor>(
+            operation, "cannot fsync parent of new configuration directory",
+            errno);
+      }
       descriptor = ::openat(current.get(), component.c_str(),
                             O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     }
@@ -216,6 +227,48 @@ open_or_create_private_directory(const std::filesystem::path &path,
     return status_failure("atomic write target permissions must be 0600");
   }
   return {};
+}
+
+[[nodiscard]] Result<FileDescriptor>
+lock_configuration_directory(int directory_fd) {
+  const std::string name{kTransactionLockName};
+  bool created = false;
+  int descriptor = ::openat(directory_fd, name.c_str(),
+                            O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                            S_IRUSR | S_IWUSR);
+  if (descriptor >= 0) {
+    created = true;
+  } else if (errno == EEXIST) {
+    descriptor =
+        ::openat(directory_fd, name.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+  }
+  if (descriptor < 0) {
+    return failure<FileDescriptor>(Operation::SaveConfig,
+                                   "cannot open configuration transaction lock",
+                                   errno);
+  }
+  FileDescriptor lock{descriptor};
+  if (created && ::fchmod(lock.get(), S_IRUSR | S_IWUSR) != 0) {
+    const int mode_error = errno;
+    static_cast<void>(::unlinkat(directory_fd, name.c_str(), 0));
+    return failure<FileDescriptor>(Operation::SaveConfig,
+                                   "cannot set transaction lock mode 0600",
+                                   mode_error);
+  }
+  struct stat status{};
+  if (::fstat(lock.get(), &status) != 0 || !S_ISREG(status.st_mode) ||
+      status.st_uid != ::geteuid() || !has_file_permissions(status)) {
+    const int inspect_error = errno;
+    return failure<FileDescriptor>(
+        Operation::SaveConfig,
+        "configuration transaction lock must be owned and mode 0600",
+        inspect_error);
+  }
+  if (::flock(lock.get(), LOCK_EX | LOCK_NB) != 0) {
+    return failure<FileDescriptor>(Operation::SaveConfig,
+                                   "configuration directory is busy", errno);
+  }
+  return lock;
 }
 
 class Sha256 {
@@ -473,6 +526,20 @@ validate_expected_target(int directory_fd, const std::string &name,
   return result;
 }
 
+[[nodiscard]] int rename_noreplace(int directory_fd, const std::string &source,
+                                   const std::string &target) noexcept {
+#ifdef SYS_renameat2
+  return static_cast<int>(::syscall(SYS_renameat2, directory_fd, source.c_str(),
+                                    directory_fd, target.c_str(), 1U));
+#else
+  static_cast<void>(directory_fd);
+  static_cast<void>(source);
+  static_cast<void>(target);
+  errno = ENOTSUP;
+  return -1;
+#endif
+}
+
 [[nodiscard]] std::string temporary_name(const std::string &target) {
   static std::atomic<std::uint64_t> sequence{0};
   const auto id = sequence.fetch_add(1, std::memory_order_relaxed);
@@ -505,11 +572,11 @@ validate_expected_target(int directory_fd, const std::string &name,
 
 class LinuxAtomicWriteTransaction final : public AtomicWriteTransaction {
 public:
-  LinuxAtomicWriteTransaction(FileDescriptor directory, std::string target,
-                              std::size_t maximum_bytes,
+  LinuxAtomicWriteTransaction(FileDescriptor directory, FileDescriptor lock,
+                              std::string target, std::size_t maximum_bytes,
                               SafeFileIdentity expected_identity)
-      : directory_{std::move(directory)}, target_{std::move(target)},
-        maximum_bytes_{maximum_bytes},
+      : directory_{std::move(directory)}, lock_{std::move(lock)},
+        target_{std::move(target)}, maximum_bytes_{maximum_bytes},
         expected_identity_{std::move(expected_identity)} {}
 
   ~LinuxAtomicWriteTransaction() override {
@@ -584,8 +651,12 @@ public:
     if (!final_identity_status) {
       return final_identity_status;
     }
-    if (::renameat(directory_.get(), temporary_.c_str(), directory_.get(),
-                   target_.c_str()) != 0) {
+    const int rename_result =
+        expected_identity_.exists
+            ? ::renameat(directory_.get(), temporary_.c_str(), directory_.get(),
+                         target_.c_str())
+            : rename_noreplace(directory_.get(), temporary_, target_);
+    if (rename_result != 0) {
       return status_failure("cannot rename atomic write temporary", errno);
     }
     temporary_.clear();
@@ -688,6 +759,7 @@ private:
   }
 
   FileDescriptor directory_;
+  FileDescriptor lock_;
   std::string target_;
   std::string temporary_;
   FileDescriptor temporary_fd_;
@@ -711,10 +783,19 @@ public:
           Operation::SaveConfig,
           "atomic write target must be an absolute file path");
     }
+    if (target.filename() == kTransactionLockName) {
+      return failure<std::unique_ptr<AtomicWriteTransaction>>(
+          Operation::SaveConfig,
+          "atomic write target conflicts with the transaction lock");
+    }
     auto directory = open_or_create_private_directory(target.parent_path(),
                                                       Operation::SaveConfig);
     if (!directory) {
       return tl::make_unexpected(directory.error());
+    }
+    auto lock = lock_configuration_directory(directory->get());
+    if (!lock) {
+      return tl::make_unexpected(lock.error());
     }
     const auto name = target.filename().string();
     const auto identity_status = validate_expected_target(
@@ -723,7 +804,8 @@ public:
       return tl::make_unexpected(identity_status.error());
     }
     return std::make_unique<LinuxAtomicWriteTransaction>(
-        std::move(*directory), name, maximum_bytes, expected_identity);
+        std::move(*directory), std::move(*lock), name, maximum_bytes,
+        expected_identity);
   }
 };
 

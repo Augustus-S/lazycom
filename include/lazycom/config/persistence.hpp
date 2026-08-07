@@ -4,6 +4,7 @@
 #include <lazycom/config/schema.hpp>
 
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <future>
 #include <memory>
@@ -55,8 +56,7 @@ public:
   [[nodiscard]] SaveSubmission
   save_config(const ConfigSnapshot &snapshot,
               const SafeFileIdentity &expected_identity,
-              std::string_view preserved_document = {},
-              bool read_only = false);
+              std::string_view preserved_document = {}, bool read_only = false);
   [[nodiscard]] SaveSubmission
   save_quick_send(const QuickSendSnapshot &snapshot,
                   const SafeFileIdentity &expected_identity,
@@ -65,10 +65,13 @@ public:
   [[nodiscard]] SaveSubmission
   save_state(const StateSnapshot &snapshot,
              const SafeFileIdentity &expected_identity,
-             std::string_view preserved_document = {},
-             bool read_only = false);
+             std::string_view preserved_document = {}, bool read_only = false);
 
-  // Drains accepted saves in FIFO order and joins the single worker.
+  // Stops accepting saves. Accepted saves are drained in FIFO order.
+  void request_stop() noexcept;
+  [[nodiscard]] bool wait_until_stopped(
+      std::chrono::steady_clock::time_point deadline) const noexcept;
+  // Requests stop and joins after the worker reaches its return point.
   void shutdown();
   [[nodiscard]] bool active(PersistenceFile file) const noexcept;
 

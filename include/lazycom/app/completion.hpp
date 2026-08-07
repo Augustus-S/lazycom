@@ -2,12 +2,9 @@
 
 #include <lazycom/app/state.hpp>
 
-#include <cstddef>
 #include <cstdint>
-#include <optional>
 #include <type_traits>
 #include <variant>
-#include <vector>
 
 namespace lazycom::app {
 
@@ -95,74 +92,5 @@ completion_kind(const CompletionEvent &event) noexcept {
       },
       event);
 }
-
-struct CompletionCapacities {
-  std::size_t normal{};
-  std::size_t tx{};
-  std::size_t control{};
-};
-
-enum class ReserveCompletionResult : std::uint8_t {
-  Reserved,
-  Duplicate,
-  Full,
-  InvalidOperation,
-};
-
-enum class CompleteOperationResult : std::uint8_t {
-  Completed,
-  DuplicateIgnored,
-  UnknownIgnored,
-  UnexpectedKind,
-};
-
-class CompletionTracker {
-public:
-  explicit CompletionTracker(const CompletionCapacities capacities)
-      : normal_slots_(capacities.normal), tx_slots_(capacities.tx),
-        control_slots_(capacities.control) {}
-
-  [[nodiscard]] std::size_t
-  capacity(OperationClass operation_class) const noexcept;
-  [[nodiscard]] std::size_t capacity() const noexcept;
-  [[nodiscard]] std::size_t reserved_count() const noexcept;
-  [[nodiscard]] std::size_t completed_count() const noexcept;
-
-  [[nodiscard]] ReserveCompletionResult
-  reserve(OperationId operation, OperationClass operation_class,
-          CompletionKind expected_kind) noexcept;
-  [[nodiscard]] bool cancel_reservation(OperationId operation) noexcept;
-  [[nodiscard]] CompleteOperationResult
-  complete(const CompletionEvent &event) noexcept;
-  [[nodiscard]] const CompletionEvent *
-  peek(OperationId operation) const noexcept;
-  [[nodiscard]] std::optional<CompletionEvent>
-  consume(OperationId operation) noexcept;
-
-private:
-  enum class SlotState : std::uint8_t {
-    Free,
-    Reserved,
-    Completed,
-  };
-
-  struct Slot {
-    OperationId operation_id{};
-    CompletionKind expected_kind{CompletionKind::Connect};
-    SlotState state{SlotState::Free};
-    std::optional<CompletionEvent> completion;
-  };
-
-  [[nodiscard]] Slot *find(OperationId operation) noexcept;
-  [[nodiscard]] const Slot *find(OperationId operation) const noexcept;
-  [[nodiscard]] std::vector<Slot> &
-  slots(OperationClass operation_class) noexcept;
-  [[nodiscard]] const std::vector<Slot> &
-  slots(OperationClass operation_class) const noexcept;
-
-  std::vector<Slot> normal_slots_;
-  std::vector<Slot> tx_slots_;
-  std::vector<Slot> control_slots_;
-};
 
 } // namespace lazycom::app

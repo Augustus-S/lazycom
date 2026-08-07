@@ -84,6 +84,14 @@ TEST_CASE("payload failures always have zero output", "[scheduler]") {
       parse_payload(SendMode::Txt, maximum, Newline::Lf, Newline::None);
   REQUIRE(too_large.status == PayloadParseStatus::TooLarge);
   REQUIRE(too_large.bytes.empty());
+
+  std::string oversized_invalid(lazycom::config::kMaximumPayloadBytes + 1U,
+                                'x');
+  oversized_invalid.back() = static_cast<char>(0xFF);
+  const auto invalid_before_size = parse_payload(
+      SendMode::Txt, oversized_invalid, Newline::None, Newline::None);
+  REQUIRE(invalid_before_size.status == PayloadParseStatus::InvalidText);
+  REQUIRE(invalid_before_size.bytes.empty());
 }
 
 TEST_CASE("every newline policy resolves to its exact byte suffix",
@@ -310,4 +318,68 @@ TEST_CASE("generation overflow rejects activation without wrapping",
   REQUIRE(scheduler.start(request(10U), at(0)).status ==
           TaskStartStatus::GenerationOverflow);
   REQUIRE(scheduler.snapshot().state == SchedulerState::Idle);
+}
+
+TEST_CASE("unrepresentable scheduler deadlines fail or request a stop",
+          "[scheduler]") {
+  Scheduler scheduler;
+  const auto rejected =
+      scheduler.start(request(10U), Scheduler::TimePoint::max());
+  REQUIRE(rejected.status == TaskStartStatus::DeadlineOverflow);
+  REQUIRE(scheduler.snapshot().state == SchedulerState::Idle);
+
+  const auto period = std::chrono::duration_cast<Scheduler::Clock::duration>(
+      std::chrono::milliseconds{10});
+  const auto started =
+      scheduler.start(request(10U), Scheduler::TimePoint::max() - period);
+  REQUIRE(started.status == TaskStartStatus::Started);
+  REQUIRE(scheduler.next_deadline() == Scheduler::TimePoint::max());
+
+  scheduler.on_deadline(Scheduler::TimePoint::max());
+  REQUIRE(scheduler.snapshot().state == SchedulerState::Stopping);
+  const auto stop = scheduler.take_automatic_stop_request();
+  REQUIRE(stop);
+  REQUIRE(stop->generation == started.started_generation);
+  REQUIRE(stop->reason == AutomaticStopReason::DeadlineOverflow);
+  REQUIRE_FALSE(scheduler.take_automatic_stop_request());
+  REQUIRE(scheduler
+              .confirm_stopped(*started.started_generation,
+                               Scheduler::TimePoint::max())
+              .status == StopConfirmationStatus::Stopped);
+  REQUIRE(scheduler.snapshot().state == SchedulerState::Idle);
+}
+
+TEST_CASE("deadline accounting is safe across the full clock range",
+          "[scheduler]") {
+  Scheduler scheduler;
+  const auto started =
+      scheduler.start(request(10U), Scheduler::TimePoint::min());
+  REQUIRE(started.status == TaskStartStatus::Started);
+
+  scheduler.on_deadline(Scheduler::TimePoint::max());
+  const auto snapshot = scheduler.snapshot();
+  REQUIRE(snapshot.state == SchedulerState::Stopping);
+  REQUIRE(snapshot.missed_count > 0U);
+  const auto stop = scheduler.take_automatic_stop_request();
+  REQUIRE(stop);
+  REQUIRE(stop->reason == AutomaticStopReason::DeadlineOverflow);
+}
+
+TEST_CASE("request sequence exhaustion emits an explicit stop request",
+          "[scheduler]") {
+  Scheduler scheduler{TaskGeneration{},
+                      std::numeric_limits<std::uint64_t>::max()};
+  const auto started = scheduler.start(request(10U), at(0));
+  REQUIRE(started.status == TaskStartStatus::Started);
+  REQUIRE_FALSE(scheduler.on_tx_boundary(at(0)));
+  REQUIRE(scheduler.snapshot().state == SchedulerState::Stopping);
+
+  const auto stop = scheduler.take_automatic_stop_request();
+  REQUIRE(stop);
+  REQUIRE(stop->generation == started.started_generation);
+  REQUIRE(stop->reason == AutomaticStopReason::SequenceOverflow);
+  REQUIRE_FALSE(scheduler.accepts(*started.started_generation));
+  REQUIRE(
+      scheduler.confirm_stopped(*started.started_generation, at(1)).status ==
+      StopConfirmationStatus::Stopped);
 }

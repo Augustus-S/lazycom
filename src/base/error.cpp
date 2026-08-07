@@ -23,6 +23,11 @@ constexpr std::array registry{
                        {"LC-SER-2003", "serial", "Serial device disappeared"}},
     ErrorRegistryEntry{ErrorCode::SerialUnsupported,
                        {"LC-SER-2004", "serial", "Serial setting unsupported"}},
+    ErrorRegistryEntry{ErrorCode::SerialOperationTimedOut,
+                       {"LC-SER-2005", "serial", "Serial operation timed out"}},
+    ErrorRegistryEntry{
+        ErrorCode::SerialOperationCancelled,
+        {"LC-SER-2006", "serial", "Serial operation was cancelled"}},
     ErrorRegistryEntry{ErrorCode::ConfigParseFailed,
                        {"LC-CFG-3001", "config", "Configuration parse failed"}},
     ErrorRegistryEntry{

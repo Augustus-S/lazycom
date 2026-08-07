@@ -46,9 +46,8 @@ TEST_CASE("disconnect keeps its session until matching completion", "[state]") {
                                   SessionId{20}}) == StateChange::Applied);
 
   REQUIRE(state.session_id() == SessionId{20});
-  REQUIRE_FALSE(
-      state.accepts({ConnectionGeneration{1}, SessionId{20},
-                     SessionEventOrigin::Normal, SessionEventKind::Rx}));
+  REQUIRE(state.accepts({ConnectionGeneration{1}, SessionId{20},
+                         SessionEventOrigin::Normal, SessionEventKind::Rx}));
   REQUIRE(
       state.accepts({ConnectionGeneration{1}, SessionId{20},
                      SessionEventOrigin::Cleanup, SessionEventKind::System}));
@@ -117,7 +116,16 @@ TEST_CASE("cancelled connect retains a racing successful session until cleanup",
                      SessionEventOrigin::Cleanup, SessionEventKind::System}));
 
   REQUIRE(state.disconnect_completed(
+              {OperationId{2}, ConnectionGeneration{1}, std::nullopt,
+               OperationOutcome::Succeeded}) == StateChange::InvalidTransition);
+  REQUIRE(state.begin_disconnect({OperationId{3}, ConnectionGeneration{1},
+                                  SessionId{30}}) == StateChange::Applied);
+  REQUIRE(state.cleanup_operation() == OperationId{3});
+  REQUIRE(state.disconnect_completed(
               {OperationId{2}, ConnectionGeneration{1}, SessionId{30},
+               OperationOutcome::Succeeded}) == StateChange::IgnoredStale);
+  REQUIRE(state.disconnect_completed(
+              {OperationId{3}, ConnectionGeneration{1}, SessionId{30},
                OperationOutcome::Succeeded}) == StateChange::Applied);
   REQUIRE(state.state() == ConnectionState::Disconnected);
 }
@@ -139,60 +147,6 @@ TEST_CASE("cancelled connect failure still waits for matching cleanup",
   REQUIRE(state.disconnect_completed(
               {OperationId{11}, ConnectionGeneration{4}, std::nullopt,
                OperationOutcome::Succeeded}) == StateChange::Applied);
-}
-
-TEST_CASE("overlay help and command palette restore complete source",
-          "[state]") {
-  OverlayStack overlays;
-  const OverlayFrame search{OverlayKind::Search,
-                            7,
-                            {11, 12, 13, 14},
-                            InteractionState::ReceiveBrowse};
-  const OverlayFrame help{
-      OverlayKind::Help, 1, {}, InteractionState::ReceiveBrowse};
-  const OverlayFrame palette{OverlayKind::CommandPalette,
-                             3,
-                             {4, 5, 6, 7},
-                             InteractionState::ReceiveBrowse};
-
-  REQUIRE(overlays.open(search) == StateChange::Applied);
-  REQUIRE(overlays.open(help) == StateChange::Applied);
-  REQUIRE(overlays.close_top().interaction == InteractionState::ReceiveBrowse);
-  REQUIRE(*overlays.active() == search);
-  REQUIRE(overlays.open(palette) == StateChange::Applied);
-  REQUIRE(overlays.close_top().change == StateChange::Applied);
-  REQUIRE(*overlays.active() == search);
-  REQUIRE(overlays.close_top().interaction == InteractionState::ReceiveBrowse);
-  REQUIRE(overlays.empty());
-
-  REQUIRE(overlays.open(
-              {OverlayKind::Confirm, 0, {}, InteractionState::SendEdit}) ==
-          StateChange::Applied);
-  REQUIRE(overlays.close_top().interaction == InteractionState::Normal);
-}
-
-TEST_CASE("overlay source matrix preserves modal guards and toggles help",
-          "[state]") {
-  OverlayStack overlays;
-  const OverlayFrame modal{
-      OverlayKind::Modal, 4, {1, 2, 3, 4}, InteractionState::SendEdit};
-  const OverlayFrame help{OverlayKind::Help, 0, {}, InteractionState::SendEdit};
-  const OverlayFrame palette{
-      OverlayKind::CommandPalette, 0, {}, InteractionState::Normal};
-
-  REQUIRE(overlays.open(modal) == StateChange::Applied);
-  REQUIRE(overlays.open(palette) == StateChange::InvalidTransition);
-  REQUIRE(overlays.toggle_help(help).change == StateChange::Applied);
-  REQUIRE(overlays.active()->kind == OverlayKind::Help);
-  const auto restored = overlays.toggle_help(help);
-  REQUIRE(restored.change == StateChange::Applied);
-  REQUIRE(restored.interaction == InteractionState::SendEdit);
-  REQUIRE(*overlays.active() == modal);
-
-  REQUIRE(overlays.close_top().change == StateChange::Applied);
-  REQUIRE(overlays.open(palette) == StateChange::Applied);
-  REQUIRE(overlays.open(palette) == StateChange::InvalidTransition);
-  REQUIRE(overlays.open(help) == StateChange::InvalidTransition);
 }
 
 TEST_CASE("interaction and logging states are independent strict machines",

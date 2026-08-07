@@ -9,6 +9,18 @@ option(LAZYCOM_ENABLE_COVERAGE "Enable coverage instrumentation" OFF)
 option(LAZYCOM_ENABLE_LTO "Enable interprocedural optimization" OFF)
 option(LAZYCOM_WARNINGS_AS_ERRORS "Treat project warnings as errors" OFF)
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13)
+    message(FATAL_ERROR "LazyCom requires GCC 13 or newer")
+  endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 18)
+    message(FATAL_ERROR "LazyCom requires Clang 18 or newer")
+  endif()
+else()
+  message(FATAL_ERROR "LazyCom requires GCC 13+ or Clang 18+")
+endif()
+
 if(LAZYCOM_ENABLE_TSAN AND (LAZYCOM_ENABLE_ASAN OR LAZYCOM_ENABLE_UBSAN))
   message(FATAL_ERROR "TSan must be configured separately from ASan/UBSan")
 endif()
@@ -17,8 +29,42 @@ if(LAZYCOM_ENABLE_COVERAGE AND LAZYCOM_ENABLE_LTO)
   message(FATAL_ERROR "Coverage and LTO cannot be enabled together")
 endif()
 
+include(CheckCXXSourceCompiles)
+if(DEFINED CMAKE_TRY_COMPILE_TARGET_TYPE)
+  set(lazycom_saved_try_compile_target_type "${CMAKE_TRY_COMPILE_TARGET_TYPE}")
+endif()
+set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+check_cxx_source_compiles([[
+  #include <cstddef>
+  #include <filesystem>
+  #include <span>
+  #include <stop_token>
+  #include <thread>
+
+  int main() {
+    std::byte value{};
+    const std::span<const std::byte> bytes{&value, 1U};
+    std::stop_source stop;
+    std::jthread worker{[](std::stop_token) {}};
+    const std::filesystem::path path{"."};
+    return bytes.empty() || stop.stop_requested() || path.empty();
+  }
+]] LAZYCOM_HAS_REQUIRED_CXX20)
+if(DEFINED lazycom_saved_try_compile_target_type)
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE "${lazycom_saved_try_compile_target_type}")
+else()
+  unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
+endif()
+if(NOT LAZYCOM_HAS_REQUIRED_CXX20)
+  message(FATAL_ERROR
+    "The C++20 library must provide jthread, stop_token, span, byte, and filesystem"
+  )
+endif()
+
 add_library(lazycom_project_options INTERFACE)
 target_compile_features(lazycom_project_options INTERFACE cxx_std_20)
+add_library(lazycom_release_hardening INTERFACE)
+add_library(lazycom_release_link_hardening INTERFACE)
 
 if(LAZYCOM_ENABLE_ASAN)
   target_compile_options(lazycom_project_options INTERFACE -fsanitize=address -fno-omit-frame-pointer)
@@ -49,6 +95,83 @@ if(LAZYCOM_ENABLE_LTO)
   set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 endif()
 
+set(LAZYCOM_LIBSERIALPORT_RELEASE_CFLAGS "")
+set(LAZYCOM_LIBSERIALPORT_RELEASE_LDFLAGS "")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  include(CheckCCompilerFlag)
+  include(CheckCXXCompilerFlag)
+  include(CheckLinkerFlag)
+
+  check_cxx_compiler_flag("-fPIE" LAZYCOM_CXX_HAS_FPIE)
+  check_linker_flag(CXX "-pie" LAZYCOM_CXX_LINKER_HAS_PIE)
+  if(LAZYCOM_CXX_HAS_FPIE AND LAZYCOM_CXX_LINKER_HAS_PIE)
+    target_compile_options(lazycom_release_hardening INTERFACE
+      "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-fPIE>"
+    )
+    target_link_options(lazycom_release_link_hardening INTERFACE
+      "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-pie>"
+    )
+  endif()
+
+  check_cxx_compiler_flag("-fstack-protector-strong"
+                          LAZYCOM_CXX_HAS_STACK_PROTECTOR_STRONG)
+  if(LAZYCOM_CXX_HAS_STACK_PROTECTOR_STRONG)
+    target_compile_options(lazycom_release_hardening INTERFACE
+      "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-fstack-protector-strong>"
+    )
+  endif()
+
+  check_cxx_compiler_flag("-D_FORTIFY_SOURCE=3" LAZYCOM_CXX_HAS_FORTIFY_SOURCE_3)
+  if(LAZYCOM_CXX_HAS_FORTIFY_SOURCE_3)
+    target_compile_options(lazycom_release_hardening INTERFACE
+      "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-D_FORTIFY_SOURCE=3>"
+    )
+  endif()
+
+  foreach(lazycom_linker_option IN ITEMS relro now noexecstack)
+    string(TOUPPER "${lazycom_linker_option}" lazycom_linker_option_upper)
+    check_linker_flag(CXX "LINKER:-z,${lazycom_linker_option}"
+      "LAZYCOM_CXX_LINKER_HAS_${lazycom_linker_option_upper}"
+    )
+    if(LAZYCOM_CXX_LINKER_HAS_${lazycom_linker_option_upper})
+      target_link_options(lazycom_release_link_hardening INTERFACE
+        "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:LINKER:-z,${lazycom_linker_option}>"
+      )
+    endif()
+  endforeach()
+
+  check_c_compiler_flag("-O2" LAZYCOM_C_HAS_OPTIMIZATION)
+  if(LAZYCOM_C_HAS_OPTIMIZATION)
+    list(APPEND LAZYCOM_LIBSERIALPORT_RELEASE_CFLAGS -O2)
+  endif()
+
+  check_c_compiler_flag("-fstack-protector-strong"
+                        LAZYCOM_C_HAS_STACK_PROTECTOR_STRONG)
+  if(LAZYCOM_C_HAS_STACK_PROTECTOR_STRONG)
+    list(APPEND LAZYCOM_LIBSERIALPORT_RELEASE_CFLAGS
+      -fstack-protector-strong
+    )
+  endif()
+
+  check_c_compiler_flag("-D_FORTIFY_SOURCE=3" LAZYCOM_C_HAS_FORTIFY_SOURCE_3)
+  if(LAZYCOM_C_HAS_OPTIMIZATION AND LAZYCOM_C_HAS_FORTIFY_SOURCE_3)
+    list(APPEND LAZYCOM_LIBSERIALPORT_RELEASE_CFLAGS -D_FORTIFY_SOURCE=3)
+  endif()
+
+  foreach(lazycom_linker_option IN ITEMS relro now noexecstack)
+    string(TOUPPER "${lazycom_linker_option}" lazycom_linker_option_upper)
+    check_linker_flag(C "LINKER:-z,${lazycom_linker_option}"
+      "LAZYCOM_C_LINKER_HAS_${lazycom_linker_option_upper}"
+    )
+    if(LAZYCOM_C_LINKER_HAS_${lazycom_linker_option_upper})
+      list(APPEND LAZYCOM_LIBSERIALPORT_RELEASE_LDFLAGS
+        "-Wl,-z,${lazycom_linker_option}"
+      )
+    endif()
+  endforeach()
+endif()
+
 add_library(lazycom_project_warnings INTERFACE)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(lazycom_project_warnings INTERFACE
@@ -64,6 +187,6 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   )
 endif()
 
-if(LAZYCOM_WARNINGS_AS_ERRORS)
+if(LAZYCOM_WARNINGS_AS_ERRORS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(lazycom_project_warnings INTERFACE -Werror)
 endif()

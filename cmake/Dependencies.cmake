@@ -43,13 +43,62 @@ else()
   set(LAZYCOM_LIBSERIALPORT_PREFIX "${CMAKE_BINARY_DIR}/_deps/libserialport")
   set(LAZYCOM_LIBSERIALPORT_LIBRARY "${LAZYCOM_LIBSERIALPORT_PREFIX}/lib/libserialport.so")
 
+  set(lazycom_libserialport_cflags "")
+  set(lazycom_libserialport_ldflags "")
+  if(LAZYCOM_ENABLE_ASAN)
+    list(APPEND lazycom_libserialport_cflags
+      -fsanitize=address -fno-omit-frame-pointer
+    )
+    list(APPEND lazycom_libserialport_ldflags -fsanitize=address)
+  endif()
+  if(LAZYCOM_ENABLE_UBSAN)
+    list(APPEND lazycom_libserialport_cflags
+      -fsanitize=undefined -fno-omit-frame-pointer
+    )
+    list(APPEND lazycom_libserialport_ldflags -fsanitize=undefined)
+  endif()
+  if(LAZYCOM_ENABLE_TSAN)
+    list(APPEND lazycom_libserialport_cflags
+      -fsanitize=thread -fno-omit-frame-pointer
+    )
+    list(APPEND lazycom_libserialport_ldflags -fsanitize=thread)
+  endif()
+  if(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+    list(APPEND lazycom_libserialport_cflags
+      ${LAZYCOM_LIBSERIALPORT_RELEASE_CFLAGS}
+    )
+    list(APPEND lazycom_libserialport_ldflags
+      ${LAZYCOM_LIBSERIALPORT_RELEASE_LDFLAGS}
+    )
+  endif()
+
+  set(lazycom_libserialport_environment "CC=${CMAKE_C_COMPILER}")
+  if(lazycom_libserialport_cflags)
+    list(REMOVE_DUPLICATES lazycom_libserialport_cflags)
+    string(JOIN " " lazycom_libserialport_cflags_string
+      ${lazycom_libserialport_cflags}
+    )
+    list(APPEND lazycom_libserialport_environment
+      "CFLAGS=${lazycom_libserialport_cflags_string}"
+    )
+  endif()
+  if(lazycom_libserialport_ldflags)
+    list(REMOVE_DUPLICATES lazycom_libserialport_ldflags)
+    string(JOIN " " lazycom_libserialport_ldflags_string
+      ${lazycom_libserialport_ldflags}
+    )
+    list(APPEND lazycom_libserialport_environment
+      "LDFLAGS=${lazycom_libserialport_ldflags_string}"
+    )
+  endif()
+
   ExternalProject_Add(lazycom_libserialport_external
     SOURCE_DIR "${PROJECT_SOURCE_DIR}/third_party/libserialport"
     BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/libserialport-build"
     DOWNLOAD_COMMAND ""
     UPDATE_COMMAND ""
     CONFIGURE_COMMAND
-      "${CMAKE_COMMAND}" -E env "CC=${CMAKE_C_COMPILER}"
+      "${CMAKE_COMMAND}" -E env ${lazycom_libserialport_environment}
       "${PROJECT_SOURCE_DIR}/third_party/libserialport/configure"
       "--prefix=${LAZYCOM_LIBSERIALPORT_PREFIX}"
       "--libdir=${LAZYCOM_LIBSERIALPORT_PREFIX}/lib"

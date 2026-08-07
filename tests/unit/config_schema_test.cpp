@@ -398,6 +398,26 @@ index = 2
   REQUIRE(has_path(result.errors, "slots[1].index"));
 }
 
+TEST_CASE("quick-send accepts empty slots and contains at most twenty entries",
+          "[config]") {
+  const auto missing = lazycom::config::parse_quick_send_toml(R"toml(
+version = 1
+[[slots]]
+content = "missing index"
+)toml");
+  REQUIRE(missing.accepted);
+  REQUIRE(missing.errors.empty());
+  REQUIRE_FALSE(missing.snapshot.slots[0].has_value());
+
+  std::string oversized = "version = 1\n";
+  for (std::size_t index = 1U; index <= 21U; ++index) {
+    oversized += "[[slots]]\nindex = " + std::to_string(index) + "\n";
+  }
+  const auto too_many = lazycom::config::parse_quick_send_toml(oversized);
+  REQUIRE_FALSE(too_many.accepted);
+  REQUIRE(has_path(too_many.errors, "slots"));
+}
+
 TEST_CASE("quick-send programmatic validation enforces UTF-8 and byte limits",
           "[config]") {
   lazycom::config::QuickSendSnapshot snapshot;
@@ -441,6 +461,20 @@ TEST_CASE("serialization refuses documents beyond their next-load limit",
   slot.content.assign(lazycom::config::kMaximumPayloadBytes, '\0');
   quick_send.slots[0] = std::move(slot);
   REQUIRE_FALSE(lazycom::config::serialize_quick_send_toml(quick_send));
+}
+
+TEST_CASE("public TOML parsers reject oversized documents before parsing",
+          "[config]") {
+  const std::string config(lazycom::config::kConfigMaximumBytes + 1U, 'x');
+  const std::string quick_send(lazycom::config::kQuickSendMaximumBytes + 1U,
+                               'x');
+  const std::string state(lazycom::config::kStateMaximumBytes + 1U, 'x');
+  REQUIRE(
+      has_path(lazycom::config::parse_config_toml(config).errors, "$document"));
+  REQUIRE(has_path(lazycom::config::parse_quick_send_toml(quick_send).errors,
+                   "$document"));
+  REQUIRE(
+      has_path(lazycom::config::parse_state_toml(state).errors, "$document"));
 }
 
 TEST_CASE("quick-send unknown keys survive a rewrite", "[config]") {

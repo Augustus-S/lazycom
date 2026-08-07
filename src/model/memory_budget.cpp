@@ -91,8 +91,8 @@ GlobalMemoryBudget::try_reserve(const BudgetCategory category,
   return BudgetReservation{state_, category, bytes};
 }
 
-std::size_t GlobalMemoryBudget::used(const BudgetCategory category) const
-    noexcept {
+std::size_t
+GlobalMemoryBudget::used(const BudgetCategory category) const noexcept {
   const auto category_index = index(category);
   if (category_index >= budget_category_count) {
     return 0U;
@@ -110,18 +110,22 @@ const BudgetLimits &GlobalMemoryBudget::limits() const noexcept {
 
 SharedPayload::SharedPayload(const std::span<const std::byte> bytes,
                              BudgetReservation reservation)
-    : bytes_(bytes.begin(), bytes.end()),
-      reservation_(std::move(reservation)) {}
+    : bytes_(bytes.begin(), bytes.end()), reservation_(std::move(reservation)) {
+}
 
 SharedPayloadPtr make_shared_payload(GlobalMemoryBudget &budget,
                                      const BudgetCategory category,
                                      const std::span<const std::byte> bytes) {
-  auto reservation = budget.try_reserve(category, bytes.size());
+  if (bytes.size() > std::numeric_limits<std::size_t>::max() -
+                         kSharedPayloadFixedBudgetBytes) {
+    return {};
+  }
+  const auto budget_bytes = bytes.size() + kSharedPayloadFixedBudgetBytes;
+  auto reservation = budget.try_reserve(category, budget_bytes);
   if (!reservation) {
     return {};
   }
-  return SharedPayloadPtr{
-      new SharedPayload{bytes, std::move(*reservation)}};
+  return SharedPayloadPtr{new SharedPayload{bytes, std::move(*reservation)}};
 }
 
 ByteSlice::ByteSlice(SharedPayloadPtr payload) : payload_(std::move(payload)) {

@@ -56,7 +56,10 @@ struct DeviceScanner::Impl {
   }
 
   void request_stop() noexcept {
-    stop_requested.store(true, std::memory_order_release);
+    {
+      std::lock_guard lock(mutex);
+      stop_requested.store(true, std::memory_order_release);
+    }
     if (worker.joinable()) {
       worker.request_stop();
     }
@@ -81,9 +84,11 @@ struct DeviceScanner::Impl {
   void thread_main(const std::stop_token token) noexcept {
     app::WorkerExitReason reason = app::WorkerExitReason::Completed;
     try {
+      const std::stop_callback stop_wakeup(token,
+                                           [this] { condition.notify_all(); });
       while (!token.stop_requested() &&
              !stop_requested.load(std::memory_order_acquire)) {
-        std::optional<ScanRequest> request;
+        ScanRequest request;
         {
           std::unique_lock lock(mutex);
           condition.wait(lock, [&] {
@@ -95,15 +100,19 @@ struct DeviceScanner::Impl {
               stop_requested.load(std::memory_order_acquire)) {
             break;
           }
-          request = requests.front();
+          active_request = requests.front();
           requests.pop_front();
+          request = *active_request;
         }
 
         auto devices = backend->enumerate();
         ScanCompletion completion;
-        completion.operation_id = request->operation_id;
-        completion.generation = request->generation;
-        if (devices) {
+        completion.operation_id = request.operation_id;
+        completion.generation = request.generation;
+        if (token.stop_requested() ||
+            stop_requested.load(std::memory_order_acquire)) {
+          completion.outcome = app::OperationOutcome::Cancelled;
+        } else if (devices) {
           completion.devices = std::move(*devices);
         } else {
           completion.outcome = app::OperationOutcome::Failed;
@@ -111,12 +120,13 @@ struct DeviceScanner::Impl {
         }
         {
           std::lock_guard lock(mutex);
-          auto *const slot = find_slot(request->operation_id);
+          auto *const slot = find_slot(request.operation_id);
           if (slot == nullptr || slot->completion) {
             throw std::logic_error("scanner completion slot invariant");
           }
           slot->completion.emplace(std::move(completion));
           slot->completion_order = ++last_completion_order;
+          active_request.reset();
         }
         notify_ui();
       }
@@ -134,11 +144,9 @@ struct DeviceScanner::Impl {
       reason = app::WorkerExitReason::Fatal;
     }
 
-    std::deque<ScanRequest> cancelled;
     {
       std::lock_guard lock(mutex);
-      cancelled.swap(requests);
-      for (const ScanRequest &request : cancelled) {
+      const auto cancel = [this](const ScanRequest &request) {
         auto *const slot = find_slot(request.operation_id);
         if (slot != nullptr && !slot->completion) {
           slot->completion.emplace(
@@ -149,7 +157,15 @@ struct DeviceScanner::Impl {
                              std::nullopt});
           slot->completion_order = ++last_completion_order;
         }
+      };
+      if (active_request) {
+        cancel(*active_request);
+        active_request.reset();
       }
+      for (const ScanRequest &request : requests) {
+        cancel(request);
+      }
+      requests.clear();
     }
     stopped = {app::WorkerKind::Scanner, app::WorkerLifecycle::AtReturnPoint,
                reason};
@@ -162,6 +178,7 @@ struct DeviceScanner::Impl {
   mutable std::mutex mutex;
   mutable std::condition_variable condition;
   std::deque<ScanRequest> requests;
+  std::optional<ScanRequest> active_request;
   std::array<CompletionSlot, 2> slots{};
   ScanGeneration last_generation{};
   std::uint64_t last_completion_order{};

@@ -97,6 +97,7 @@ enum class TaskStartStatus : std::uint8_t {
   InvalidInterval,
   InvalidExecution,
   GenerationOverflow,
+  DeadlineOverflow,
 };
 
 struct TaskStartResult {
@@ -121,6 +122,7 @@ enum class StopConfirmationStatus : std::uint8_t {
   ReplacementStarted,
   IgnoredStale,
   GenerationOverflow,
+  DeadlineOverflow,
 };
 
 struct StopConfirmationResult {
@@ -137,6 +139,17 @@ struct ScheduledRequestToken {
 struct ScheduledSend {
   ScheduledRequestToken token{};
   std::shared_ptr<const QuickSendExecution> execution;
+};
+
+enum class AutomaticStopReason : std::uint8_t {
+  DeadlineOverflow,
+  SequenceOverflow,
+};
+
+struct AutomaticStopRequest {
+  TaskGeneration generation{};
+  AutomaticStopReason reason{AutomaticStopReason::DeadlineOverflow};
+  auto operator<=>(const AutomaticStopRequest &) const = default;
 };
 
 struct TxBoundary {
@@ -162,7 +175,8 @@ public:
   using TimePoint = Clock::time_point;
   static_assert(Clock::is_steady);
 
-  explicit Scheduler(TaskGeneration last_issued = {}) noexcept;
+  explicit Scheduler(TaskGeneration last_issued = {},
+                     std::uint64_t first_request_sequence = 1U) noexcept;
 
   [[nodiscard]] static constexpr bool
   valid_interval(const std::uint64_t interval_ms) noexcept {
@@ -185,17 +199,21 @@ public:
   on_tx_boundary(TimePoint now, const TxBoundary &boundary = {});
 
   [[nodiscard]] std::optional<TimePoint> next_deadline() const noexcept;
+  // Returned once when an internal exhaustion condition requires the owner to
+  // stop this generation at its TX boundary.
+  [[nodiscard]] std::optional<AutomaticStopRequest>
+  take_automatic_stop_request() noexcept;
   [[nodiscard]] SchedulerSnapshot snapshot() const noexcept;
   [[nodiscard]] bool accepts(TaskGeneration generation) const noexcept;
 
 private:
   [[nodiscard]] bool
   valid_execution(const QuickSendExecution &execution) const noexcept;
-  [[nodiscard]] std::optional<TaskGeneration> activate(TaskRequest request,
-                                                       TimePoint now);
+  [[nodiscard]] TaskStartResult activate(TaskRequest request, TimePoint now);
   [[nodiscard]] TaskInvalidationResult
   invalidate(bool discard_replacement) noexcept;
   [[nodiscard]] std::optional<ScheduledSend> emit_pending();
+  void begin_automatic_stop(AutomaticStopReason reason) noexcept;
   void add_missed(std::uint64_t count) noexcept;
 
   IdSequence<TaskGeneration> generations_;
@@ -206,6 +224,8 @@ private:
   std::optional<TimePoint> next_deadline_;
   std::optional<ScheduledRequestToken> outstanding_;
   std::optional<TaskRequest> pending_replacement_;
+  std::optional<AutomaticStopRequest> automatic_stop_request_;
+  std::uint64_t first_request_sequence_{1U};
   std::uint64_t next_sequence_{1U};
   std::uint64_t sent_count_{};
   std::uint64_t missed_count_{};

@@ -34,6 +34,8 @@ struct VisibleRecord {
   std::string time_utc;
   std::vector<std::byte> payload;
   std::string message;
+  std::optional<ErrorCode> error_code;
+  std::optional<OperationId> operation_id;
 };
 
 struct DirectionFilter {
@@ -83,6 +85,7 @@ struct ApplicationSnapshot {
   bool quick_send_save_failed{};
   bool manual_pause{};
   bool shutting_down{};
+  bool fatal_stopping{};
   std::optional<UserAlert> alert;
 };
 
@@ -114,6 +117,8 @@ public:
   void tick();
   void request_scan();
   void set_device_path(std::string path);
+  void connect();
+  void disconnect();
   void connection_control();
   void set_interaction(InteractionState state) noexcept;
   void set_draft(std::string draft);
@@ -164,9 +169,13 @@ private:
   [[nodiscard]] ConnectionGeneration issue_connection_generation();
   [[nodiscard]] ScanGeneration issue_scan_generation();
   void set_notice(std::string message);
+  [[nodiscard]] bool operations_allowed() const noexcept;
+  [[nodiscard]] Status operation_rejected() const;
   void start_connection();
   void finish_failed_connection(const serial::ConnectCompletion &completion);
   void request_disconnect();
+  void request_cancel_connect();
+  void retry_cancel_race_disconnect();
   void process_serial_data();
   void process_serial_completions();
   void process_scan_completions();
@@ -176,11 +185,12 @@ private:
   [[nodiscard]] bool request_quick_task_stop(TaskGeneration generation,
                                              std::string_view notice);
   void begin_log_session();
-  void end_log_session();
+  void end_log_session(ConnectionGeneration generation, SessionId session_id);
   void start_log_rollover_if_needed();
   void enqueue_record(RecordDirection direction,
                       std::span<const std::byte> payload,
                       std::string message = {},
+                      std::optional<ErrorCode> error_code = std::nullopt,
                       std::optional<OperationId> operation = std::nullopt,
                       SessionEventOrigin origin = SessionEventOrigin::Normal);
   void enqueue_frames(std::vector<framing::RxFrame> frames,
@@ -192,7 +202,27 @@ private:
   void save_config();
   void save_state();
   void update_worker_state();
+  void enter_fatal_stopping(const FatalSignal &signal) noexcept;
   void reconfigure_log_writer_if_inactive();
+
+  struct LogSessionOwner {
+    ConnectionGeneration generation{};
+    SessionId session_id{};
+    auto operator<=>(const LogSessionOwner &) const = default;
+  };
+
+  struct PendingLogCommand {
+    std::future<logging::SessionCommandResult> completion;
+    enum class Kind : std::uint8_t { Start, End, Disable } kind{Kind::Start};
+    std::optional<LogSessionOwner> owner;
+    bool close_after_start{};
+    std::chrono::steady_clock::time_point deadline;
+  };
+
+  struct PendingLogRecord {
+    LogSessionOwner owner;
+    logging::Record record;
+  };
 
   ApplicationSnapshot snapshot_;
   ConnectionStateMachine connection_;
@@ -224,11 +254,12 @@ private:
   std::uint64_t next_record_id_{1U};
   std::uint64_t next_sequence_{1U};
   std::chrono::steady_clock::time_point session_started_{};
-  std::optional<std::future<logging::SessionCommandResult>> log_command_;
-  std::deque<logging::Record> log_backlog_;
+  std::optional<PendingLogCommand> log_command_;
+  std::deque<PendingLogRecord> log_backlog_;
   std::size_t log_backlog_bytes_{};
-  enum class LogCommandKind : std::uint8_t { Start, End, Disable };
-  std::optional<LogCommandKind> log_command_kind_;
+  std::optional<LogSessionOwner> restart_log_owner_;
+  std::optional<LogSessionOwner> processed_cleanup_;
+  std::deque<serial::DisconnectCompletion> deferred_disconnect_completions_;
   std::array<std::optional<std::future<config::SaveCompletion>>, 3>
       save_completions_;
   std::optional<config::QuickSendSnapshot> pending_quick_send_;
@@ -238,7 +269,11 @@ private:
   bool config_save_dirty_{};
   bool state_save_dirty_{};
   bool writer_reconfigure_pending_{};
-  bool restart_log_after_reconfigure_{};
+  bool connect_after_log_{};
+  bool cancel_race_disconnect_pending_{};
+  MainThreadFatalGuard fatal_guard_;
+  WorkerLifecycleRegistry workers_;
+  std::optional<std::future<logging::SessionCommandResult>> fatal_log_shutdown_;
   bool stopped_{};
 };
 

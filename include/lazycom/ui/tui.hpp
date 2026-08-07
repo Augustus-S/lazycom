@@ -75,6 +75,14 @@ enum class ReceiveVimAction : std::uint8_t {
   Invalid,
 };
 
+enum class Utf8EditAction : std::uint8_t {
+  Insert,
+  Backspace,
+  Delete,
+  MoveLeft,
+  MoveRight,
+};
+
 struct ReceiveVimResult {
   ReceiveVimAction action{ReceiveVimAction::Invalid};
   std::size_t count{1U};
@@ -91,6 +99,10 @@ struct RouteInput {
 [[nodiscard]] RoutedAction route_key(const RouteInput &input) noexcept;
 [[nodiscard]] ReceiveVimResult
 parse_receive_vim_command(std::string_view command) noexcept;
+[[nodiscard]] bool edit_utf8_text(std::string &value, std::size_t &cursor,
+                                  Utf8EditAction action,
+                                  std::string_view insertion,
+                                  std::size_t maximum_bytes);
 
 class Tui final {
 public:

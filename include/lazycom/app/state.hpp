@@ -17,7 +17,6 @@ enum class StateChange : std::uint8_t {
   NoChange,
   IgnoredStale,
   InvalidTransition,
-  CapacityExceeded,
   Unauthorized,
 };
 
@@ -33,16 +32,6 @@ enum class InteractionState : std::uint8_t {
   Normal,
   SendEdit,
   ReceiveBrowse,
-};
-
-enum class OverlayKind : std::uint8_t {
-  None,
-  Search,
-  Modal,
-  Confirm,
-  ErrorDialog,
-  Help,
-  CommandPalette,
 };
 
 enum class LogState : std::uint8_t {
@@ -212,37 +201,6 @@ public:
 
 private:
   InteractionState state_{InteractionState::Normal};
-};
-
-struct OverlayFrame {
-  OverlayKind kind{OverlayKind::None};
-  std::uint32_t focus{};
-  std::array<std::uint64_t, 4> field_state{};
-  InteractionState interaction{InteractionState::Normal};
-  auto operator<=>(const OverlayFrame &) const = default;
-};
-
-struct OverlayCloseResult {
-  StateChange change{StateChange::InvalidTransition};
-  InteractionState interaction{InteractionState::Normal};
-};
-
-class OverlayStack {
-public:
-  static constexpr std::size_t capacity = 8;
-
-  [[nodiscard]] std::size_t size() const noexcept { return size_; }
-  [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
-  [[nodiscard]] const OverlayFrame *active() const noexcept;
-  [[nodiscard]] StateChange open(const OverlayFrame &frame) noexcept;
-  [[nodiscard]] OverlayCloseResult
-  toggle_help(const OverlayFrame &frame) noexcept;
-  [[nodiscard]] StateChange update_active(const OverlayFrame &frame) noexcept;
-  [[nodiscard]] OverlayCloseResult close_top() noexcept;
-
-private:
-  std::array<OverlayFrame, capacity> frames_{};
-  std::size_t size_{};
 };
 
 class LogStateMachine {

@@ -1,4 +1,5 @@
 #include <lazycom/serial/backend.hpp>
+#include <lazycom/serial/libserialport_probe.hpp>
 
 #include <libserialport.h>
 
@@ -17,7 +18,25 @@
 #include <unistd.h>
 
 namespace lazycom::serial {
+namespace detail {
+void ensure_libserialport_initialized() noexcept;
+}
 namespace {
+
+void silent_sp_debug_handler(const char *, ...) {
+  const int saved_errno = errno;
+  errno = saved_errno;
+}
+
+void initialize_libserialport() noexcept {
+  const int saved_errno = errno;
+  static const bool initialized = [] {
+    sp_set_debug_handler(silent_sp_debug_handler);
+    return true;
+  }();
+  static_cast<void>(initialized);
+  errno = saved_errno;
+}
 
 [[nodiscard]] DeviceIdentity identity_from(const struct stat &value) noexcept {
   return {
@@ -205,7 +224,37 @@ void discard_sp_error(const enum sp_return result) noexcept {
   }
 }
 
+class OpenPortGuard final {
+public:
+  explicit OpenPortGuard(sp_port *port) noexcept : port_(port) {}
+  ~OpenPortGuard() {
+    if (open_) {
+      discard_sp_error(sp_close(port_));
+    }
+    if (port_ != nullptr) {
+      sp_free_port(port_);
+    }
+  }
+  OpenPortGuard(const OpenPortGuard &) = delete;
+  OpenPortGuard &operator=(const OpenPortGuard &) = delete;
+
+  [[nodiscard]] sp_port *get() const noexcept { return port_; }
+  void mark_open() noexcept { open_ = true; }
+  [[nodiscard]] sp_port *release() noexcept {
+    open_ = false;
+    return std::exchange(port_, nullptr);
+  }
+
+private:
+  sp_port *port_{};
+  bool open_{};
+};
+
 } // namespace
+
+void detail::ensure_libserialport_initialized() noexcept {
+  initialize_libserialport();
+}
 
 PortConfig
 PortConfig::from_defaults(const config::SerialDefaults &defaults) noexcept {
@@ -223,14 +272,14 @@ Result<DevicePath> inspect_device_path(const std::string_view absolute_path) {
 
   const std::string requested{absolute_path};
   errno = 0;
-  char *const resolved = ::realpath(requested.c_str(), nullptr);
+  std::unique_ptr<char, decltype(&std::free)> resolved{
+      ::realpath(requested.c_str(), nullptr), &std::free};
   if (resolved == nullptr) {
     const int error = errno;
     return tl::unexpected(posix_error(error, Operation::OpenSerial,
                                       "cannot resolve device path"));
   }
-  std::string canonical{resolved};
-  std::free(resolved);
+  std::string canonical{resolved.get()};
 
   struct stat value{};
   if (::stat(canonical.c_str(), &value) != 0) {
@@ -283,8 +332,9 @@ struct LibserialportBackend::Impl {
   bool open{};
 };
 
-LibserialportBackend::LibserialportBackend()
-    : impl_(std::make_unique<Impl>()) {}
+LibserialportBackend::LibserialportBackend() : impl_(std::make_unique<Impl>()) {
+  detail::ensure_libserialport_initialized();
+}
 
 LibserialportBackend::~LibserialportBackend() {
   if (impl_->open) {
@@ -384,49 +434,40 @@ Status LibserialportBackend::open(const DevicePath &path,
     return tl::unexpected(adapt_sp_error(result, Operation::OpenSerial,
                                          "cannot create port handle"));
   }
-  impl_->port = port;
+  OpenPortGuard port_guard{port};
 
-  result = sp_open(impl_->port, SP_MODE_READ_WRITE);
+  result = sp_open(port_guard.get(), SP_MODE_READ_WRITE);
   if (result != SP_OK) {
-    Error error = adapt_sp_error(result, Operation::OpenSerial,
-                                 "cannot open serial port");
-    sp_free_port(std::exchange(impl_->port, nullptr));
-    return tl::unexpected(std::move(error));
+    return tl::unexpected(adapt_sp_error(result, Operation::OpenSerial,
+                                         "cannot open serial port"));
   }
-  impl_->open = true;
+  port_guard.mark_open();
 
   int native_fd = -1;
-  result = sp_get_port_handle(impl_->port, &native_fd);
+  result = sp_get_port_handle(port_guard.get(), &native_fd);
   if (result != SP_OK) {
-    Error error = adapt_sp_error(result, Operation::OpenSerial,
-                                 "cannot obtain native serial handle");
-    static_cast<void>(close());
-    return tl::unexpected(std::move(error));
+    return tl::unexpected(adapt_sp_error(result, Operation::OpenSerial,
+                                         "cannot obtain native serial handle"));
   }
   struct stat opened_stat{};
   if (::fstat(native_fd, &opened_stat) != 0) {
     const int error_number = errno;
-    Error error = posix_error(error_number, Operation::OpenSerial,
-                              "cannot inspect opened serial handle");
-    static_cast<void>(close());
-    return tl::unexpected(std::move(error));
+    return tl::unexpected(posix_error(error_number, Operation::OpenSerial,
+                                      "cannot inspect opened serial handle"));
   }
   if (!S_ISCHR(opened_stat.st_mode) ||
       identity_from(opened_stat) != path.identity) {
-    Error error =
+    return tl::unexpected(
         make_error(ErrorCode::SerialDeviceGone, Operation::OpenSerial,
-                   "opened serial device identity does not match selection");
-    static_cast<void>(close());
-    return tl::unexpected(std::move(error));
+                   "opened serial device identity does not match selection"));
   }
 
   sp_port_config *raw_config = nullptr;
   result = sp_new_config(&raw_config);
   if (result != SP_OK) {
-    Error error = adapt_sp_error(result, Operation::ConfigureSerial,
-                                 "cannot allocate complete port configuration");
-    static_cast<void>(close());
-    return tl::unexpected(std::move(error));
+    return tl::unexpected(
+        adapt_sp_error(result, Operation::ConfigureSerial,
+                       "cannot allocate complete port configuration"));
   }
   PortConfigGuard config_guard{raw_config};
   const auto set_field = [&](const enum sp_return field_result,
@@ -459,7 +500,7 @@ Status LibserialportBackend::open(const DevicePath &path,
                        "invalid flow control");
   }
   if (status) {
-    result = sp_set_config(impl_->port, config_guard.get());
+    result = sp_set_config(port_guard.get(), config_guard.get());
     if (result != SP_OK) {
       status = tl::unexpected(
           adapt_sp_error(result, Operation::ConfigureSerial,
@@ -467,10 +508,10 @@ Status LibserialportBackend::open(const DevicePath &path,
     }
   }
   if (!status) {
-    Error error = std::move(status.error());
-    static_cast<void>(close());
-    return tl::unexpected(std::move(error));
+    return tl::unexpected(std::move(status.error()));
   }
+  impl_->port = port_guard.release();
+  impl_->open = true;
   impl_->wait_fd = native_fd;
   return {};
 }
