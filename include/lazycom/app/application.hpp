@@ -98,10 +98,35 @@ struct ApplicationDependencies {
   std::optional<std::filesystem::path> log_directory;
 };
 
+/**
+ * @brief Main-thread application coordinator and UI-facing command facade.
+ *
+ * Construction, all member calls, shutdown, and destruction are confined to
+ * the UI/main thread. Worker threads may invoke only the supplied wake callback
+ * and never mutate Application state directly. A successful instance owns its
+ * serial, scanner, logging, and persistence workers; wake_context remains
+ * caller-owned until all workers are stopped and destroyed.
+ *
+ * snapshot() exposes borrowed state that may change after any command or tick.
+ */
 class Application final {
 public:
+  /**
+   * @brief Loads configuration and starts all application workers.
+   * @param dependencies Consumed dependencies. Serial and scanner backends must
+   * be distinct non-null instances.
+   * @return An owning application, or an expected construction Error.
+   * @note Success does not imply the asynchronously requested startup scan or
+   * initial logging session has succeeded.
+   */
   [[nodiscard]] static Result<std::unique_ptr<Application>>
   create(ApplicationDependencies dependencies);
+  /**
+   * @brief Creates independent default libserialport backends and the app.
+   * @param wake_callback Optional worker-safe coalesced UI wake callback.
+   * @param wake_context Borrowed callback context valid through shutdown.
+   * @throws std::bad_alloc if backend allocation fails before error adaptation.
+   */
   [[nodiscard]] static Result<std::unique_ptr<Application>>
   create_default(serial::UiWakeCallback wake_callback = nullptr,
                  void *wake_context = nullptr);
@@ -112,19 +137,47 @@ public:
   Application(Application &&) = delete;
   Application &operator=(Application &&) = delete;
 
+  /** @return Borrowed view-model state valid until Application destruction. */
   [[nodiscard]] const ApplicationSnapshot &snapshot() const noexcept;
 
+  /**
+   * @brief Advances worker completions, serial data, framing, logging, saves,
+   * and scheduled-send state.
+   * @note Main-thread only and non-reentrant. Normal progress does not wait for
+   * worker I/O; fatal deadline handling may abort the process.
+   */
   void tick();
+  /** @brief Attempts to admit an asynchronous device scan. */
   void request_scan();
+  /**
+   * @brief Sets a device path through the internal/test seam while
+   * disconnected.
+   * @warning Product UI selection must use apply_port() and the latest scan.
+   */
   void set_device_path(std::string path);
+  /** @brief Attempts to admit a connection using a captured hardware snapshot.
+   */
   void connect();
+  /** @brief Cancels Connecting or begins cleanup of the active session. */
   void disconnect();
+  /** @brief Dispatches connect, cancel, or disconnect for the current state. */
   void connection_control();
   void set_interaction(InteractionState state) noexcept;
+  /**
+   * @brief Replaces the editable draft, truncating it to the configured bytes.
+   * @note Byte truncation does not preserve a UTF-8 code-point boundary.
+   */
   void set_draft(std::string draft);
+  /**
+   * @brief Parses and attempts to admit the complete draft for transmission.
+   * @note Validation or admission failure preserves the draft. Serial-service
+   * admission records history and clears it immediately, before terminal TX.
+   */
   void submit_draft();
   void history_previous();
   void history_next();
+  /** @brief Starts the asynchronous log-state transition for the current state.
+   */
   void toggle_log();
   void toggle_pause() noexcept;
   void clear_records();
@@ -133,26 +186,70 @@ public:
   void publish_permission_alert(std::string_view path,
                                 const serial::DevicePermission &permission);
 
+  /**
+   * @brief Applies a path from the latest scan after identity and permission
+   * reinspection. Hardware settings are mutable only while disconnected.
+   */
   [[nodiscard]] Status apply_port(std::string_view value);
+  /** @brief Applies a preset baud and asynchronously persists the snapshot. */
   [[nodiscard]] Status apply_baud(std::string_view value);
+  /** @brief Applies a complete preset data-bits/parity/stop/flow format. */
   [[nodiscard]] Status apply_data_format(std::string_view value);
+  /** @brief Applies the runtime TX newline setting. */
   [[nodiscard]] Status apply_newline(std::string_view value);
+  /** @brief Applies RX/TX display modes and direction visibility together. */
   [[nodiscard]] Status apply_view(std::string_view value);
+  /** @brief Applies TXT or HEX draft interpretation. */
   [[nodiscard]] Status apply_send_mode(std::string_view value);
+  /**
+   * @brief Applies the complete logging-settings candidate.
+   * @note Status success means validation and save admission, not durable
+   * commit. NextSession preserves an active file; RotateNow closes and restarts
+   * it.
+   */
   [[nodiscard]] Status
   apply_logging(std::string_view value,
                 LogApplyPolicy policy = LogApplyPolicy::RotateNow);
+  /** @brief Validates a complete logging-settings candidate without applying
+   * it. */
   [[nodiscard]] Status validate_logging(std::string_view value) const;
+  /**
+   * @brief Validates and asynchronously saves one complete quick-send slot.
+   * @note Visible quick-send state changes only after a committed completion.
+   */
   [[nodiscard]] Status apply_quick_slot(std::string_view value);
+  /**
+   * @brief Starts one-shot or periodic execution from an immutable slot
+   * snapshot.
+   * @param slot User-facing quick-send slot in the range 1 through 20.
+   * @param interval_ms Zero for one-shot, otherwise 10 through 86400000.
+   * @param replacement_confirmed Whether an active task may enter stop/replace.
+   */
   [[nodiscard]] Status execute_quick(std::uint32_t slot,
                                      std::uint64_t interval_ms,
                                      bool replacement_confirmed = false);
+  /** @brief Requests the owner stop barrier for the active task generation. */
   void stop_quick_task();
 
+  /**
+   * @brief Finds stable record IDs whose current safe rendering contains query.
+   * @param query Case-sensitive substring to find.
+   * @param filter Directions eligible for matching.
+   * @return At most 10000 IDs in record order.
+   */
   [[nodiscard]] std::vector<std::uint64_t>
   search(std::string_view query, DirectionFilter filter = {}) const;
+  /** @brief Renders one record through its terminal-safe direction projection.
+   */
   [[nodiscard]] std::string render_record(const VisibleRecord &record) const;
+  /** @brief Reports whether current user state warrants exit confirmation. */
   [[nodiscard]] bool has_exit_risk() const noexcept;
+  /**
+   * @brief Performs idempotent deadline-coordinated application shutdown.
+   * @return true after graceful nonfatal shutdown, false after fatal
+   * coordination.
+   * @warning A worker that misses its shutdown deadline causes std::abort().
+   */
   [[nodiscard]] bool shutdown() noexcept;
 
 private:

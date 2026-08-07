@@ -39,6 +39,14 @@ struct LogBarrierCompleted {
   OperationOutcome outcome{OperationOutcome::Succeeded};
 };
 
+/**
+ * @brief Terminal value for one admitted asynchronous application operation.
+ *
+ * The carrying mailbox, not this variant, provides reliable delivery and must
+ * reserve capacity before admission. Consumers match lifecycle results by
+ * operation ID and must ignore stale terminal events without mutating a newer
+ * generation or session.
+ */
 using CompletionEvent =
     std::variant<ConnectSucceeded, ConnectFailed, SendCompleted,
                  DisconnectCompleted, TaskStopped, ScanCompleted, SaveCompleted,
@@ -46,6 +54,7 @@ using CompletionEvent =
 
 static_assert(std::is_trivially_copyable_v<CompletionEvent>);
 
+/** @brief Returns the operation identity shared by every completion variant. */
 [[nodiscard]] inline OperationId
 operation_id(const CompletionEvent &event) noexcept {
   return std::visit(
@@ -68,6 +77,10 @@ enum class CompletionKind : std::uint8_t {
   LogBarrier,
 };
 
+/**
+ * @brief Classifies a completion independently of its success/failure variant.
+ * @note ConnectSucceeded and ConnectFailed both map to CompletionKind::Connect.
+ */
 [[nodiscard]] inline CompletionKind
 completion_kind(const CompletionEvent &event) noexcept {
   return std::visit(

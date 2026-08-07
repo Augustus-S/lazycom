@@ -36,7 +36,14 @@ struct PayloadParseResult {
   }
 };
 
-// Session is resolved before bytes are returned. Any failure returns no bytes.
+/**
+ * @brief Parses a bounded quick-send payload and appends its resolved newline.
+ * @param mode TXT requires strict UTF-8; HEX uses whitespace-separated bytes.
+ * @param content Untrusted slot content.
+ * @param newline Requested newline, possibly Session.
+ * @param session_newline Concrete newline used to resolve Session.
+ * @return Complete owned bytes on success. Every failure returns no bytes.
+ */
 [[nodiscard]] PayloadParseResult
 parse_payload(config::SendMode mode, std::string_view content,
               config::Newline newline,
@@ -71,8 +78,15 @@ struct QuickSendBuildResult {
   }
 };
 
-// slot_index is the user-facing 1..20 index. The result owns a snapshot and is
-// therefore unaffected by later edits to the persisted slots.
+/**
+ * @brief Builds an immutable execution snapshot for a persisted quick-send
+ * slot.
+ * @param slots Complete slot snapshot to inspect.
+ * @param slot_index User-facing slot number in the range 1 through 20.
+ * @param session_newline Concrete newline used by slots configured as Session.
+ * @return A fully owned snapshot unaffected by later configuration edits, or a
+ * shape/payload error.
+ */
 [[nodiscard]] QuickSendBuildResult
 make_quick_send_execution(const config::QuickSendSnapshot &slots,
                           std::uint32_t slot_index,
@@ -169,6 +183,15 @@ struct SchedulerSnapshot {
   bool outstanding{};
 };
 
+/**
+ * @brief Pure single-owner state machine for one-shot and fixed-rate sends.
+ *
+ * Scheduler owns task state and immutable execution snapshots but creates no
+ * thread, timer, queue, or serial resource. It is not synchronized; all calls
+ * belong to one logical TX coordinator and supplied time points should be
+ * monotonic and nondecreasing. Generation, request-sequence, and deadline
+ * arithmetic report exhaustion instead of wrapping.
+ */
 class Scheduler {
 public:
   using Clock = std::chrono::steady_clock;
@@ -184,23 +207,48 @@ public:
                                  interval_ms <= kMaximumPeriodicIntervalMs);
   }
 
+  /**
+   * @brief Starts a task or begins confirmed stop-and-replace.
+   *
+   * Interval zero is one-shot; periodic intervals are 10 through 86400000 ms.
+   * Starting while Running requires confirmation, then returns the old
+   * generation whose TX boundary must be stopped before replacement activates.
+   * @param request Owned execution snapshot and interval.
+   * @param now Current monotonic time.
+   * @param replacement_confirmed Whether an active task may be replaced.
+   */
   [[nodiscard]] TaskStartResult start(TaskRequest request, TimePoint now,
                                       bool replacement_confirmed = false);
+  /** @brief Invalidates the running generation and suppresses new triggers. */
   [[nodiscard]] TaskInvalidationResult request_stop() noexcept;
+  /** @brief Invalidates for disconnect and discards a pending replacement. */
   [[nodiscard]] TaskInvalidationResult invalidate_for_disconnect() noexcept;
+  /** @brief Invalidates for shutdown and discards a pending replacement. */
   [[nodiscard]] TaskInvalidationResult invalidate_for_shutdown() noexcept;
+  /**
+   * @brief Applies an exact owner stop confirmation and activates replacement.
+   * @return IgnoredStale without mutation for a nonmatching generation.
+   */
   [[nodiscard]] StopConfirmationResult
   confirm_stopped(TaskGeneration generation, TimePoint now);
 
-  // The owner calls on_deadline after its monotonic wait expires, then calls
-  // on_tx_boundary whenever no logical TX request is being partially written.
+  /**
+   * @brief Advances fixed-rate deadlines and records missed periods.
+   * @note At most one trigger and one TX request can be outstanding.
+   */
   void on_deadline(TimePoint now) noexcept;
+  /**
+   * @brief Applies a completed TX boundary and emits at most one scheduled
+   * send.
+   * @note manual_pending suppresses scheduled emission for this boundary.
+   */
   [[nodiscard]] std::optional<ScheduledSend>
   on_tx_boundary(TimePoint now, const TxBoundary &boundary = {});
 
   [[nodiscard]] std::optional<TimePoint> next_deadline() const noexcept;
-  // Returned once when an internal exhaustion condition requires the owner to
-  // stop this generation at its TX boundary.
+  /**
+   * @brief Consumes the one-shot request to stop after internal exhaustion.
+   */
   [[nodiscard]] std::optional<AutomaticStopRequest>
   take_automatic_stop_request() noexcept;
   [[nodiscard]] SchedulerSnapshot snapshot() const noexcept;

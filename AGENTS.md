@@ -32,7 +32,7 @@ LazyCom 是使用 C++20 开发的 Linux 优先 TUI 串口助手。项目使用�
 - `Plan.md` 是产品行为、交互语义、状态名称、限制和验收标准的事实来源。
 - `DevelopPlan.md` 是架构、模块边界、并发、所有权、构建策略和质量门禁的事实来源。
 - `CMakeLists.txt`、`CMakePresets.json` 和 `cmake/` 中的文件描述当前实际构建。
-- `Fix.md`、审查报告和 `docs/` 中的文件提供历史背景和验证证据，但不能覆盖
+- 审查报告和 `docs/` 中的文件提供历史背景和验证证据，但不能覆盖
   `Plan.md` 或 `DevelopPlan.md`。
 
 如果 `Plan.md` 与 `DevelopPlan.md` 在产品行为上冲突，停止实现并请求设计决策，

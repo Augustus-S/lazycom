@@ -24,11 +24,18 @@ struct SinkEnvelope {
   std::optional<SequenceGap> gap_before;
 };
 
+/**
+ * @brief Nonblocking sink interface used during sequenced fan-out.
+ *
+ * envelope is borrowed for the call. A sink that retains it must copy the
+ * shared batch pointer and gap value. Implementations must not re-enter the
+ * originating SessionSequencer because delivery occurs under its mutex.
+ */
 class IRecordSink {
 public:
   virtual ~IRecordSink() = default;
-  [[nodiscard]] virtual QueuePushResult
-  push(const SinkEnvelope &envelope, std::size_t logical_bytes) = 0;
+  [[nodiscard]] virtual QueuePushResult push(const SinkEnvelope &envelope,
+                                             std::size_t logical_bytes) = 0;
 };
 
 enum class SequenceStatus {
@@ -60,15 +67,34 @@ struct SequenceResult {
 
 class SessionSequencer {
 public:
-  SessionSequencer(SessionId session_id, GlobalMemoryBudget &budget,
-                   IRecordSink *ui_sink, IRecordSink *log_sink,
-                   BudgetCategory batch_category =
-                       BudgetCategory::OwnerScratch);
+  /**
+   * @brief Creates a sequencer for one session and two optional borrowed sinks.
+   * @param session_id Session accepted by submit() and lifecycle operations.
+   * @param budget Borrowed budget that must outlive all sequencer calls.
+   * @param ui_sink Optional borrowed UI sink.
+   * @param log_sink Optional borrowed logging sink.
+   * @param batch_category Category charged for batch metadata.
+   */
+  SessionSequencer(
+      SessionId session_id, GlobalMemoryBudget &budget, IRecordSink *ui_sink,
+      IRecordSink *log_sink,
+      BudgetCategory batch_category = BudgetCategory::OwnerScratch);
 
-  [[nodiscard]] SequenceResult
-  submit(SessionId session_id, app::SessionEventOrigin origin,
-         std::vector<RecordDraft> drafts);
+  /**
+   * @brief Validates, sequences, constructs, and independently fans out a
+   * batch.
+   * @return Admission status, contiguous sequence range, immutable batch, and
+   * per-sink delivery results. Sequence acceptance remains successful even when
+   * a sink is full or stopped; that sink receives a gap on a later success.
+   * @note Active phase accepts Normal origin and cleanup phase accepts Cleanup
+   * origin. Rejection consumes no sequence numbers.
+   */
+  [[nodiscard]] SequenceResult submit(SessionId session_id,
+                                      app::SessionEventOrigin origin,
+                                      std::vector<RecordDraft> drafts);
+  /** @brief Enters cleanup exactly once for the matching active session. */
   [[nodiscard]] bool begin_cleanup(SessionId session_id) noexcept;
+  /** @brief Permanently closes the matching active or cleanup session. */
   [[nodiscard]] bool close(SessionId session_id) noexcept;
   [[nodiscard]] std::uint64_t next_seq() const noexcept;
 
@@ -78,8 +104,8 @@ private:
   [[nodiscard]] SinkDelivery deliver(IRecordSink *sink,
                                      std::optional<SequenceGap> &pending,
                                      const SessionRecordBatchPtr &batch);
-  static void extend_gap(std::optional<SequenceGap> &gap,
-                         std::uint64_t first, std::uint64_t last) noexcept;
+  static void extend_gap(std::optional<SequenceGap> &gap, std::uint64_t first,
+                         std::uint64_t last) noexcept;
 
   SessionId session_id_{};
   GlobalMemoryBudget &budget_;

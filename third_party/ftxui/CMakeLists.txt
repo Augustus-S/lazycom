@@ -177,5 +177,11 @@ include(cmake/ftxui_export.cmake)
 include(cmake/ftxui_install.cmake)
 include(cmake/ftxui_package.cmake)
 
-add_subdirectory(examples)
-add_subdirectory(doc)
+# LazyCom trims the vendored tree to Linux build inputs; examples and
+# documentation are not part of the build.
+if(FTXUI_BUILD_EXAMPLES)
+  add_subdirectory(examples)
+endif()
+if(FTXUI_BUILD_DOCS)
+  add_subdirectory(doc)
+endif()

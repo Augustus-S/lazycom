@@ -13,6 +13,7 @@
 
 namespace lazycom::encoding {
 
+/** Maximum decoded payload accepted by the default TX parsers. */
 inline constexpr std::size_t kMaxTxBytes = 1024U * 1024U;
 
 enum class TxParseErrorCode { InvalidUtf8, InvalidHex, LimitExceeded };
@@ -53,6 +54,12 @@ namespace detail {
 
 } // namespace detail
 
+/**
+ * @brief Validates structural UTF-8 without normalization.
+ * @return true for well-formed UTF-8, including empty input and encoded control
+ * characters; false for overlong, surrogate, truncated, or out-of-range input.
+ * @note Structural validity does not make text safe for terminal display.
+ */
 [[nodiscard]] inline bool is_strict_utf8(const std::string_view text) noexcept {
   std::size_t index = 0U;
   while (index < text.size()) {
@@ -100,6 +107,13 @@ namespace detail {
   return true;
 }
 
+/**
+ * @brief Converts strict UTF-8 text to its exact byte representation.
+ * @param text Text to validate and copy.
+ * @param maximum Maximum encoded byte count.
+ * @return Owned bytes, or a parse error. No newline or display escaping is
+ * applied.
+ */
 [[nodiscard]] inline ParsedTxBytes
 parse_text(const std::string_view text,
            const std::size_t maximum = kMaxTxBytes) {
@@ -117,6 +131,13 @@ parse_text(const std::string_view text,
   return std::vector<std::byte>{bytes.begin(), bytes.end()};
 }
 
+/**
+ * @brief Parses whitespace-separated one-byte hexadecimal tokens.
+ * @param text Tokens in NN or 0xNN form, separated by space, tab, CR, or LF.
+ * @param maximum Maximum decoded byte count.
+ * @return The complete decoded payload, or an error at the source token offset.
+ * No partial output is returned on failure.
+ */
 [[nodiscard]] inline ParsedTxBytes
 parse_hex(const std::string_view text,
           const std::size_t maximum = kMaxTxBytes) {

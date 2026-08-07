@@ -16,3 +16,9 @@ SHA-256 values are recorded in `include/dependencies/DEPENDENCIES.lock`.
 libserialport is built as a shared library. Distribution must preserve the
 LGPL license, corresponding source, and the user's ability to replace the
 library with a compatible build.
+
+Vendored trees are trimmed to the Linux build inputs; non-building upstream
+content (examples, tests, docs, CI/ecosystem metadata, non-Linux sources) is
+removed. `third_party/libserialport/LAZYCOM_PATCHES.md` records the details for
+libserialport. Upstream source URLs and SHA-256 values in
+`include/dependencies/DEPENDENCIES.lock` still identify the original archives.

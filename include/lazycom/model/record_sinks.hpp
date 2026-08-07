@@ -11,14 +11,19 @@
 
 namespace lazycom::model {
 
+/**
+ * @brief FIFO record-batch sink with hard batch and logical-byte limits.
+ *
+ * stop() rejects new batches but preserves queued batches for draining.
+ * wait_pop() may wait indefinitely until a batch arrives or stop is requested.
+ */
 class BoundedRecordSink final : public IRecordSink {
 public:
   BoundedRecordSink(std::size_t max_batches, std::size_t max_logical_bytes)
       : queue_(max_batches, max_logical_bytes) {}
 
-  [[nodiscard]] QueuePushResult
-  push(const SinkEnvelope &envelope,
-       const std::size_t logical_bytes) override {
+  [[nodiscard]] QueuePushResult push(const SinkEnvelope &envelope,
+                                     const std::size_t logical_bytes) override {
     return queue_.push(envelope, logical_bytes);
   }
   [[nodiscard]] std::optional<BoundedQueue<SinkEnvelope>::Value> try_pop() {
@@ -33,17 +38,21 @@ private:
   BoundedQueue<SinkEnvelope> queue_;
 };
 
-// UI overload keeps newest data. Whole immutable batches are evicted, and the
-// removed sequence range is attached to the earliest remaining batch.
+/**
+ * @brief UI sink that preserves newest data by evicting whole oldest batches.
+ *
+ * Removed sequence ranges are merged into the earliest remaining envelope, or
+ * the incoming envelope when the queue becomes empty. The supplied sink charge
+ * is ignored; record count and logical bytes are derived from the batch.
+ */
 class EvictingUiRecordSink final : public IRecordSink {
 public:
   EvictingUiRecordSink(const std::size_t max_records,
                        const std::size_t max_logical_bytes)
       : max_records_(max_records), max_logical_bytes_(max_logical_bytes) {}
 
-  [[nodiscard]] QueuePushResult
-  push(const SinkEnvelope &envelope,
-       const std::size_t) override {
+  [[nodiscard]] QueuePushResult push(const SinkEnvelope &envelope,
+                                     const std::size_t) override {
     if (!envelope.batch) {
       return QueuePushResult::Full;
     }
@@ -54,13 +63,11 @@ public:
     if (stopped_) {
       return QueuePushResult::Stopped;
     }
-    if (incoming_records > max_records_ ||
-        logical_bytes > max_logical_bytes_) {
+    if (incoming_records > max_records_ || logical_bytes > max_logical_bytes_) {
       return QueuePushResult::Full;
     }
-    while (!queue_.empty() &&
-           (records_ > max_records_ - incoming_records ||
-            bytes_ > max_logical_bytes_ - logical_bytes)) {
+    while (!queue_.empty() && (records_ > max_records_ - incoming_records ||
+                               bytes_ > max_logical_bytes_ - logical_bytes)) {
       auto evicted_gap = queue_.front().gap_before;
       merge(evicted_gap, SequenceGap{queue_.front().batch->first_seq(),
                                      queue_.front().batch->last_seq()});

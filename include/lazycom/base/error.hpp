@@ -16,6 +16,12 @@ namespace lazycom {
 
 inline constexpr std::size_t kMaxErrorDetailBytes = 512U;
 
+/**
+ * @brief Stable machine-readable error categories.
+ *
+ * Each value has a stable external identifier returned by error_descriptor().
+ * Published values must not be reused for a different meaning.
+ */
 enum class ErrorCode : std::uint32_t {
   ValidationInvalidValue = 0x010001,
   SerialPermissionDenied = 0x020001,
@@ -57,6 +63,18 @@ struct ErrorDescriptor {
   std::string_view default_message;
 };
 
+/**
+ * @brief Bounded context for an expected application failure.
+ *
+ * Recovery policy is intentionally not encoded here. The layer handling the
+ * error decides whether it fails one operation, closes a session, disables a
+ * subsystem, or terminates the process.
+ *
+ * @warning detail produced by make_error() is safe for terminal display, but it
+ * is not a redaction mechanism. Direct aggregate construction bypasses that
+ * sanitization. Callers must not supply payloads, credentials, or other secrets
+ * as error detail.
+ */
 struct Error {
   ErrorCode code;
   Operation operation;
@@ -71,8 +89,28 @@ template <class T> using Result = tl::expected<T, Error>;
 
 using Status = Result<void>;
 
+/**
+ * @brief Returns the stable descriptor registered for an error code.
+ * @return A reference to process-lifetime immutable storage. An unregistered
+ * value maps to the generic internal-error descriptor.
+ */
 [[nodiscard]] const ErrorDescriptor &error_descriptor(ErrorCode code) noexcept;
 
+/**
+ * @brief Constructs an error with bounded, terminal-safe dynamic detail.
+ * @param code Stable application error category.
+ * @param operation Operation that observed the failure.
+ * @param detail Untrusted diagnostic context. Invalid UTF-8, control bytes, and
+ * bidirectional formatting controls are escaped, and output is limited to
+ * kMaxErrorDetailBytes.
+ * @param cause Optional underlying system or library error.
+ * @param session_id Session associated with the failure, when applicable.
+ * @param operation_id Asynchronous operation associated with the failure, when
+ * applicable.
+ * @param source Call site at which the error is adapted.
+ * @return An owning Error value.
+ * @warning Sanitization makes detail display-safe but does not remove secrets.
+ */
 [[nodiscard]] Error
 make_error(ErrorCode code, Operation operation, std::string_view detail = {},
            std::error_code cause = {},

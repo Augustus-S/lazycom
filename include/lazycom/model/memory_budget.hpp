@@ -77,10 +77,26 @@ private:
   std::size_t bytes_{};
 };
 
+/**
+ * @brief Shared, thread-safe accounting for bounded managed-memory categories.
+ *
+ * Reservations atomically enforce both the selected category limit and the
+ * fixed 128 MiB aggregate limit. This type accounts only allocations that are
+ * explicitly reserved through it; it is not an end-to-end process RSS limit.
+ */
 class GlobalMemoryBudget {
 public:
+  /**
+   * @throws std::invalid_argument if any category or their sum exceeds the
+   * managed-memory hard limit.
+   */
   explicit GlobalMemoryBudget(BudgetLimits limits = BudgetLimits::defaults());
 
+  /**
+   * @brief Attempts to reserve bytes until the returned token is released.
+   * @return A move-only reservation, or nullopt when a category or total limit
+   * would be exceeded. A zero-byte reservation is valid.
+   */
   [[nodiscard]] std::optional<BudgetReservation>
   try_reserve(BudgetCategory category, std::size_t bytes) noexcept;
   [[nodiscard]] std::size_t used(BudgetCategory category) const noexcept;
@@ -94,6 +110,7 @@ private:
 class SharedPayload;
 using SharedPayloadPtr = std::shared_ptr<const SharedPayload>;
 
+/** @brief Immutable payload whose budget charge follows shared ownership. */
 class SharedPayload {
 public:
   [[nodiscard]] std::span<const std::byte> bytes() const noexcept {
@@ -117,11 +134,22 @@ private:
 static_assert(kSharedPayloadFixedBudgetBytes >=
               sizeof(SharedPayload) + 4U * sizeof(void *));
 
-// The reservation is acquired before payload or shared ownership allocation.
+/**
+ * @brief Copies bytes into an immutable shared payload after reserving budget.
+ * @return Shared ownership, or an empty pointer when size arithmetic or budget
+ * admission fails.
+ * @note The reservation is acquired before payload and control-block
+ * allocation. Standard allocation failure may still throw.
+ */
 [[nodiscard]] SharedPayloadPtr
 make_shared_payload(GlobalMemoryBudget &budget, BudgetCategory category,
                     std::span<const std::byte> bytes);
 
+/**
+ * @brief Immutable range retaining ownership of its underlying shared payload.
+ * @throws std::out_of_range if an explicit range is outside a non-null payload,
+ * or if an explicit range is constructed from a null payload.
+ */
 class ByteSlice {
 public:
   ByteSlice() noexcept = default;

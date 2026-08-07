@@ -1196,6 +1196,9 @@ void Application::process_serial_completions() {
     return !log_command_ || !log_command_->owner ||
            *log_command_->owner != LogSessionOwner{generation, session_id};
   };
+  // Completion and data use independent channels. Hold disconnect completion
+  // until this session's ordered Cleanup event and its log close boundary have
+  // both been processed, so session identity cannot be cleared prematurely.
   for (std::size_t index = deferred_disconnect_completions_.size(); index != 0U;
        --index) {
     auto value = std::move(deferred_disconnect_completions_.front());

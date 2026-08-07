@@ -39,3 +39,19 @@ error.
 call. LazyCom can therefore install its errno-preserving silent handler before
 any serial operation without one final message reaching stderr when
 `LIBSERIALPORT_DEBUG` is set.
+
+## LazyCom vendored-tree trimming
+
+LazyCom keeps only the files required to build libserialport on Linux from the
+checked-in `configure`/`Makefile.in`. Removed from the upstream 0.1.2 archive:
+
+- `examples/` (only listed in `EXTRA_DIST`)
+- `test_timing.c` (`make check` only)
+- `Doxyfile`
+- `macosx.c`, `windows.c`, `freebsd.c` (automake conditionals not active on
+  Linux; the generated Linux Makefile never references them)
+
+`serialport.c`, `timing.c`, `linux.c`, `linux_termios.c/.h`,
+`libserialport_internal.h`, the autotools build files, and all license/provenance
+files remain unchanged. Re-running `autoreconf` or `make dist` against this tree
+is not supported.

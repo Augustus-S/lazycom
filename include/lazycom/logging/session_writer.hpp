@@ -19,6 +19,7 @@ namespace lazycom::logging {
 
 enum class SessionLogState { Off, Waiting, Recording, Error };
 
+/** @brief File-count and encoded-byte limits for one logging directory. */
 struct SessionLogQuotas {
   std::size_t max_files{100U};
   std::uint64_t max_total_bytes{1024ULL * 1024ULL * 1024ULL};
@@ -26,6 +27,13 @@ struct SessionLogQuotas {
   auto operator<=>(const SessionLogQuotas &) const = default;
 };
 
+/**
+ * @brief Bounded queue, flush, filtering, and filesystem options.
+ *
+ * All numeric limits and flush_interval must be positive, and max_file_bytes
+ * must not exceed max_total_bytes. Invalid options cause SessionWriter
+ * construction to throw std::invalid_argument.
+ */
 struct SessionWriterOptions {
   std::filesystem::path directory;
   SessionLogQuotas quotas;
@@ -37,8 +45,13 @@ struct SessionWriterOptions {
   bool include_error{true};
 };
 
-// The worker owns one implementation for its complete lifetime. Tests can
-// inject failures without weakening the Linux directory-fd implementation.
+/**
+ * @brief Worker-confined filesystem seam for session-log storage.
+ *
+ * Calls are serialized on the writer thread. begin_session() and append_line()
+ * receive complete LF-terminated schema lines. flush() releases implementation
+ * buffering but does not imply fsync. close() must be idempotent and reusable.
+ */
 class SessionLogFileSystem {
 public:
   virtual ~SessionLogFileSystem() = default;
@@ -53,6 +66,13 @@ public:
   [[nodiscard]] virtual std::filesystem::path active_path() const = 0;
 };
 
+/**
+ * @brief Creates the Linux private, no-follow session-log implementation.
+ *
+ * Directories and files use private ownership/modes. Quota cleanup deletes only
+ * closed, identity-stable, successfully decoded supported logs; active,
+ * damaged, symlinked, or otherwise unverifiable entries are retained.
+ */
 [[nodiscard]] std::unique_ptr<SessionLogFileSystem>
 make_linux_session_log_file_system();
 
@@ -71,8 +91,27 @@ struct SessionCommandResult {
   std::optional<Error> error;
 };
 
+/**
+ * @brief Asynchronous bounded session-log writer with one filesystem worker.
+ *
+ * Submission and snapshot operations are synchronized; destruction must not
+ * race callers. Off rejects producers, Waiting is enabled without an active
+ * file, Recording accepts records, and Error rejects later records after a
+ * terminal queue/schema/filesystem failure. The stopping gate is separate from
+ * SessionLogState.
+ *
+ * Queue byte accounting is a conservative in-memory charge; file quotas use
+ * actual encoded NDJSON bytes. Filtering SYS/ERR lines still advances processed
+ * and barrier watermarks.
+ */
 class SessionWriter {
 public:
+  /**
+   * @brief Validates options and starts the filesystem worker.
+   * @param options Bounded logging and directory policy.
+   * @param file_system Exclusively owned implementation used for the complete
+   * worker lifetime.
+   */
   explicit SessionWriter(SessionWriterOptions options,
                          std::unique_ptr<SessionLogFileSystem> file_system =
                              make_linux_session_log_file_system());
@@ -83,25 +122,64 @@ public:
   SessionWriter(SessionWriter &&) = delete;
   SessionWriter &operator=(SessionWriter &&) = delete;
 
-  // OFF -> WAITING. ERROR must first be reset with disable().
+  /**
+   * @brief Enables logging without opening a session file.
+   * @return true for Off to Waiting and idempotent enabled states; false while
+   * stopping, closing, or in Error.
+   */
   [[nodiscard]] bool enable() noexcept;
-  // Immediately stops producers; completion follows final flush and close.
+  /**
+   * @brief Immediately closes producer admission, then flushes and closes.
+   * @return A future completed after records ordered before the command and the
+   * final close have been processed.
+   */
   [[nodiscard]] std::future<SessionCommandResult> disable();
 
-  // Valid only while WAITING. Completion is Recording only after the header was
-  // safely created, or Error after a create/quota failure.
+  /**
+   * @brief Safely creates a new file and writes its session header.
+   * @param header Untrusted header value validated and encoded by the worker.
+   * @return A future whose result is Recording only after file creation and
+   * header append succeed, or Error after a validation/quota/filesystem
+   * failure.
+   * @pre Visible state is Waiting.
+   */
   [[nodiscard]] std::future<SessionCommandResult> start_session(Header header);
-  // Immediately changes Recording -> Waiting and drains records ordered before
-  // this command before flushing and closing.
+  /**
+   * @brief Stops the active file while leaving logging enabled.
+   * @return A future completed after earlier records, flush, and close.
+   * @post Visible Recording state changes to Waiting before worker completion,
+   * preventing later producer admission.
+   */
   [[nodiscard]] std::future<SessionCommandResult> end_session();
 
-  // Never waits for filesystem I/O or queue space. Queue exhaustion moves the
-  // writer to ERROR and prevents any later record from being written.
+  /**
+   * @brief Attempts to enqueue an owned, strictly increasing record batch.
+   * @return Immediate admission status without waiting for filesystem I/O or
+   * queue capacity. QueueFull transitions the writer to Error and prevents
+   * later records from being written.
+   * @note Full schema validation occurs on the worker after admission.
+   */
   [[nodiscard]] EnqueueResult try_enqueue(std::vector<Record> batch) noexcept;
 
-  // Every returned future completes, including writer error and shutdown.
+  /**
+   * @brief Requests a user-space flush through an inclusive sequence watermark.
+   * @param target_seq Highest sequence that must be processed before flush.
+   * @note Confirmation includes filtered records but never guarantees fsync or
+   * physical-media durability.
+   */
   [[nodiscard]] std::future<BarrierResult> barrier(std::uint64_t target_seq);
+  /**
+   * @brief Permanently stops admission and drains the worker to its return
+   * point.
+   * @warning Destruction waits for the worker without an internal deadline.
+   * Deadline-sensitive owners must enforce wait_until_stopped() before destroy.
+   */
   [[nodiscard]] std::future<SessionCommandResult> shutdown();
+  /**
+   * @brief Waits for the worker return point without requesting stop or
+   * joining.
+   * @param deadline Absolute steady-clock deadline.
+   */
   [[nodiscard]] bool wait_until_stopped(
       std::chrono::steady_clock::time_point deadline) const noexcept;
 

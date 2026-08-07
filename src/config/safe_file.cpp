@@ -637,6 +637,9 @@ public:
     if (temporary_.empty() || temporary_fd_.get() >= 0 || committed_) {
       return status_failure("atomic write transaction is not ready to commit");
     }
+    // Build the backup only from the identity observed by the caller, then
+    // recheck after backup I/O so an external replacement cannot be overwritten
+    // without another optimistic-concurrency check immediately before rename.
     const auto initial_identity_status = validate_expected_target(
         directory_.get(), target_, maximum_bytes_, expected_identity_);
     if (!initial_identity_status) {
@@ -861,6 +864,9 @@ write_file_atomically(const std::filesystem::path &target,
                       std::string_view bytes, std::size_t maximum_bytes,
                       const SafeFileIdentity &expected_identity,
                       AtomicFileSystem &file_system) {
+  // This flag records the visibility boundary. Any failure or exception after
+  // commit() must report the replacement as visible even if durability is
+  // unknown; reporting NotCommitted could make a caller overwrite newer state.
   bool committed = false;
   try {
     if (maximum_bytes == 0 || bytes.size() > maximum_bytes) {

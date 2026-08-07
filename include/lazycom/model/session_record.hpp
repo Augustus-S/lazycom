@@ -30,6 +30,13 @@ struct RecordDraft {
   std::optional<OperationId> operation_id;
 };
 
+/**
+ * @brief Immutable, sequenced session event.
+ *
+ * RX/TX retain shared raw bytes; SYS/ERR retain bounded terminal-safe text.
+ * References and spans returned by accessors remain valid while the containing
+ * SessionRecordBatch is owned.
+ */
 class SessionRecord {
 public:
   [[nodiscard]] std::uint64_t seq() const noexcept { return seq_; }
@@ -38,18 +45,24 @@ public:
   }
   [[nodiscard]] const RecordTime &time() const noexcept { return time_; }
   [[nodiscard]] const ByteSlice &payload() const noexcept { return payload_; }
-  [[nodiscard]] const std::optional<logging::InputMode> &input_mode() const
-      noexcept {
+  [[nodiscard]] const std::optional<logging::InputMode> &
+  input_mode() const noexcept {
     return input_mode_;
   }
   [[nodiscard]] const std::string &message() const noexcept { return message_; }
   [[nodiscard]] const std::optional<std::string> &code() const noexcept {
     return code_;
   }
-  [[nodiscard]] const std::optional<OperationId> &operation_id() const noexcept {
+  [[nodiscard]] const std::optional<OperationId> &
+  operation_id() const noexcept {
     return operation_id_;
   }
   [[nodiscard]] std::size_t logical_bytes() const noexcept;
+  /**
+   * @brief Converts this model record to the owning NDJSON value model.
+   * @note Payload bytes are copied. Structured operation_id is not represented
+   * by logging::Record and is therefore not retained by this conversion.
+   */
   [[nodiscard]] logging::Record to_log_record() const;
 
 private:
@@ -69,6 +82,13 @@ private:
 class SessionRecordBatch;
 using SessionRecordBatchPtr = std::shared_ptr<const SessionRecordBatch>;
 
+/**
+ * @brief Immutable contiguous sequence of records for one session.
+ *
+ * The batch retains its metadata budget reservation and all payload ownership
+ * until the last shared pointer is released. Immutable batches may be read
+ * concurrently.
+ */
 class SessionRecordBatch {
 public:
   [[nodiscard]] SessionId session_id() const noexcept { return session_id_; }
@@ -96,7 +116,17 @@ private:
   BudgetReservation reservation_;
 };
 
+/**
+ * @brief Validates direction-specific record shape and bounded field syntax.
+ * @note The function validates strict UTF-8 and stable error-code shape but
+ * does not sanitize or bound draft.message; construction performs that
+ * projection.
+ */
 [[nodiscard]] bool valid_record_draft(const RecordDraft &draft) noexcept;
+/**
+ * @brief Conservatively estimates batch metadata excluding shared payload data.
+ * @return A saturating byte estimate suitable for budget admission.
+ */
 [[nodiscard]] std::size_t
 estimate_batch_metadata(std::span<const RecordDraft> drafts) noexcept;
 

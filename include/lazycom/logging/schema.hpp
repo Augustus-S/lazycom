@@ -1,5 +1,15 @@
 #pragma once
 
+/**
+ * @file
+ * @brief Bounded NDJSON session-log value model and codec.
+ *
+ * Value structs are not self-validating. Codec functions validate untrusted
+ * input against physical-line, document, record-count, payload, metadata, and
+ * message limits. These functions allocate and are not suitable for emergency
+ * or fatal-signal paths.
+ */
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -67,12 +77,12 @@ struct Record {
   std::uint64_t elapsed_ns{};
   Direction direction{Direction::Rx};
 
-  // RX/TX use payload. The codec always derives encoding from the bytes.
+  /** RX/TX bytes. The encoder derives encoding and ignores its input value. */
   std::vector<std::byte> payload;
   PayloadEncoding encoding{PayloadEncoding::Utf8};
   std::optional<InputMode> input_mode;
 
-  // SYS/ERR use message. ERR additionally requires code.
+  /** SYS/ERR safe text. ERR additionally requires a stable-shaped code. */
   std::string message;
   std::optional<std::string> code;
   bool operator==(const Record &) const = default;
@@ -111,23 +121,61 @@ struct NdjsonDocument {
   std::optional<SchemaError> tail_error;
 };
 
+/**
+ * @brief Validates structural UTF-8 without terminal-safety filtering.
+ * @note Valid controls, NUL, ESC, and bidi formatting code points remain valid
+ * UTF-8 and require a separate safe-display projection.
+ */
 [[nodiscard]] bool is_strict_utf8(std::span<const std::byte> bytes) noexcept;
+/**
+ * @brief Validates `YYYY-MM-DDTHH:MM:SS[.fraction]Z` UTC timestamps.
+ * @note Fractions contain one to nine digits; offsets and leap seconds are not
+ * accepted.
+ */
 [[nodiscard]] bool is_valid_utc(std::string_view value) noexcept;
 
-// Produces valid UTF-8 with controls and bidi formatting characters made
-// visible.
+/**
+ * @brief Produces bounded terminal-safe UTF-8 from untrusted message text.
+ *
+ * Invalid bytes, controls, DEL, and bidi formatting characters are escaped.
+ * Output is truncated only at complete UTF-8 or escape boundaries.
+ *
+ * @warning This is a display-safety projection, not secret redaction and not a
+ * reversible payload codec.
+ */
 [[nodiscard]] std::string sanitize_message(std::string_view message);
 
-// Encoded lines include exactly one trailing LF.
+/**
+ * @brief Encodes a validated header as one ASCII JSON line.
+ * @return A line ending in exactly one LF, or a schema error.
+ */
 [[nodiscard]] SchemaResult<std::string>
 encode_header_line(const Header &header);
+/** @brief Encodes one validated record as an LF-terminated JSON line. */
 [[nodiscard]] SchemaResult<std::string>
 encode_record_line(const Record &record);
+/**
+ * @brief Encodes one header and a strictly increasing record sequence.
+ * @return A complete bounded NDJSON document or a schema error.
+ */
 [[nodiscard]] SchemaResult<std::string>
 encode_ndjson(const Header &header, std::span<const Record> records);
 
+/**
+ * @brief Decodes one optional-LF/CRLF header line.
+ * @note Unknown fields and supported-minor additions are ignored; unknown major
+ * versions are rejected.
+ */
 [[nodiscard]] SchemaResult<Header> decode_header_line(std::string_view line);
+/** @brief Decodes one optional-LF/CRLF record line. */
 [[nodiscard]] SchemaResult<Record> decode_record_line(std::string_view line);
+/**
+ * @brief Decodes a bounded NDJSON document with a leading header.
+ *
+ * A final unterminated line is reported as an incomplete tail and earlier
+ * complete records are retained. Any malformed complete line rejects the
+ * document.
+ */
 [[nodiscard]] SchemaResult<NdjsonDocument>
 decode_ndjson(std::string_view input);
 
@@ -141,8 +189,7 @@ enum class BarrierState {
   WaitingForFlush,
   FlushFailed,
   Confirmed,
-  // Worker-level terminal result. BarrierTracker itself never emits this and
-  // retains its existing pure processed/flush behavior.
+  /** Worker-level failure; BarrierTracker itself never emits this state. */
   WriterFailed
 };
 
@@ -152,14 +199,24 @@ struct BarrierResult {
   std::uint64_t processed_through_seq{};
   std::uint64_t flush_attempted_through_seq{};
   std::uint64_t flushed_through_seq{};
-  // Session log barriers only describe write/flush, never fsync durability.
+  /** Session barriers describe write/flush, never fsync durability. */
   bool fsync_guaranteed{false};
 };
 
+/**
+ * @brief Single-owner watermarks for processed records and user-space flushes.
+ *
+ * A processed watermark may advance over intentionally filtered records or
+ * known gaps; it does not prove every intervening sequence was written.
+ * Confirmation never implies fsync or physical-media durability.
+ */
 class BarrierTracker {
 public:
+  /** @return false for a regressing watermark; equal values are accepted. */
   [[nodiscard]] bool mark_processed_through(std::uint64_t seq) noexcept;
+  /** @brief Records a flush attempt through the current processed watermark. */
   void mark_flush_result(bool succeeded) noexcept;
+  /** @brief Evaluates a target against the current process/flush watermarks. */
   [[nodiscard]] BarrierResult check(LogBarrier barrier) const noexcept;
 
   [[nodiscard]] std::uint64_t processed_through_seq() const noexcept;

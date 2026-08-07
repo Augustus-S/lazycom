@@ -51,6 +51,13 @@ struct SignalSourceLocation {
   }
 };
 
+/**
+ * @brief Fixed-size emergency notification published by a failed worker.
+ *
+ * Publishing this value requires no dynamic allocation or normal queue. The
+ * source string pointers normally refer to static source-location storage; any
+ * custom pointers must outlive all observations of the signal.
+ */
 struct FatalSignal {
   ErrorCode code{ErrorCode::InternalInvariantBroken};
   Operation operation{Operation::ValidateConfig};
@@ -59,12 +66,20 @@ struct FatalSignal {
   SignalSourceLocation source{};
 };
 
+/**
+ * @brief Lock-free first-writer-wins storage for one worker fatal signal.
+ *
+ * publish(), load(), and additional_count() may be called concurrently while
+ * the slot remains alive. The slot has no reset operation. Later publishers do
+ * not replace the first signal and only increment the additional count.
+ */
 class FatalSignalSlot {
 public:
   FatalSignalSlot() noexcept = default;
   FatalSignalSlot(const FatalSignalSlot &) = delete;
   FatalSignalSlot &operator=(const FatalSignalSlot &) = delete;
 
+  /** @return true only for the signal that changes the slot to ready. */
   [[nodiscard]] bool publish(FatalSignal signal) noexcept {
     std::uint8_t expected = empty;
     if (!state_.compare_exchange_strong(expected, writing,
@@ -78,6 +93,8 @@ public:
     return true;
   }
 
+  /** @return The first signal after publication completes, otherwise nullopt.
+   */
   [[nodiscard]] std::optional<FatalSignal> load() const noexcept {
     if (state_.load(std::memory_order_acquire) != ready) {
       return std::nullopt;
@@ -143,6 +160,19 @@ fatal_worker_result(const WorkerKind worker, const Operation operation,
 
 } // namespace detail
 
+/**
+ * @brief Executes a worker body behind the project exception boundary.
+ * @param worker Worker whose return point is represented by the result.
+ * @param operation Operation used when adapting an exception.
+ * @param worker_body Synchronous body executed on the calling thread.
+ * @param exception_code Error code for an ordinary std::exception.
+ * @param source Source attached to adapted failures.
+ * @return Completed for normal return, RecoverableError with a bounded Error
+ * for std::exception, or Fatal for allocation/adaptation/unknown failures.
+ * @post The returned lifecycle is AtReturnPoint. All potentially blocking
+ * cleanup owned by the body must already be complete.
+ * @note This helper neither creates a thread nor publishes its result.
+ */
 template <class WorkerBody>
 [[nodiscard]] WorkerTrampolineResult run_worker_trampoline(
     const WorkerKind worker, const Operation operation,

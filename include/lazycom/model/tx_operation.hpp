@@ -17,6 +17,13 @@ namespace lazycom::model {
 enum class TxTermination { Succeeded, Failed, Cancelled, TimedOut };
 enum class TxOperationError { InvalidAcceptance, InvalidTermination };
 
+/**
+ * @brief Owner-confined state of one non-interleaved TX request.
+ *
+ * The object captures operation, connection, session, payload, input mode, and
+ * an absolute steady-clock deadline at construction. It does not validate
+ * those values and is not safe for concurrent mutation.
+ */
 class TxOperation {
 public:
   using Deadline = std::chrono::steady_clock::time_point;
@@ -37,11 +44,22 @@ public:
   [[nodiscard]] std::span<const std::byte> remaining() const noexcept;
   [[nodiscard]] Deadline deadline() const noexcept { return deadline_; }
 
-  // A positive owner write advances only the prefix known to be OS-accepted.
+  /**
+   * @brief Advances the prefix accepted by one positive owner write.
+   * @param bytes Positive count no greater than remaining().size().
+   * @param observed_at Time assigned to the accepted prefix.
+   * @return false without mutation for zero or out-of-range counts.
+   */
   [[nodiscard]] bool accept(std::size_t bytes, RecordTime observed_at) noexcept;
 
-  // Failure/cancellation/timeout emits accepted TX first (if any), followed by
-  // an ERR carrying the operation ID. Success requires the whole request.
+  /**
+   * @brief Builds the ordered terminal records for the operation.
+   *
+   * Failure, cancellation, and timeout emit the accepted TX prefix first, when
+   * nonempty, followed by an ERR containing the operation ID. Success requires
+   * the complete payload and emits one TX record for a nonempty payload.
+   * Calling this function does not mark the object terminal.
+   */
   [[nodiscard]] tl::expected<std::vector<RecordDraft>, TxOperationError>
   terminal_records(TxTermination termination, RecordTime terminal_time,
                    std::string error_code = "LC-SER-2004",

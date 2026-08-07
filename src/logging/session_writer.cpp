@@ -1491,6 +1491,8 @@ std::future<SessionCommandResult> SessionWriter::disable() {
       return ready_future(std::move(result));
     }
     impl_->disable_waiters.push_back(std::move(promise));
+    // Close the producer gate before publishing the asynchronous close command;
+    // records admitted before this store remain ordered ahead of that command.
     impl_->state.store(SessionLogState::Off, std::memory_order_release);
     impl_->close_pending = true;
     if (!impl_->disable_pending) {
@@ -1540,6 +1542,8 @@ std::future<SessionCommandResult> SessionWriter::end_session() {
         impl_->queued_control_count >= kMaxQueuedControlCommands) {
       return ready_future(impl_->command_result_locked());
     }
+    // Waiting is visible immediately so no producer can enqueue behind the
+    // close command while the worker drains the preceding record batches.
     impl_->state.store(SessionLogState::Waiting, std::memory_order_release);
     impl_->close_pending = true;
     item.final_state = SessionLogState::Waiting;

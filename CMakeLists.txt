@@ -48,7 +48,6 @@ target_link_libraries(lazycom_logging
 add_library(lazycom_data_path STATIC
   src/framing/rx_framer.cpp
   src/encoding/display.cpp
-  src/encoding/tx.cpp
   src/model/memory_budget.cpp
   src/model/session_record.cpp
   src/model/session_sequencer.cpp

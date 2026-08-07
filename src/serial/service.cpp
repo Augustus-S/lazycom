@@ -1578,6 +1578,8 @@ Result<OperationId> SerialService::submit_connect(ConnectRequest request) {
     return tl::unexpected(submission_error(
         "serial connection is not idle", Operation::OpenSerial, operation_id));
   }
+  // Admission reserves both the typed completion and the eventual cleanup data
+  // slot under the same lock. Every later failure rolls both reservations back.
   if (!impl_->mailbox.reserve(operation_id, app::OperationClass::Normal,
                               MailboxKind::Connect)) {
     return tl::unexpected(submission_error(
@@ -1645,6 +1647,8 @@ Result<OperationId> SerialService::submit_tx(TxRequest request) {
     return tl::unexpected(submission_error(
         "serial TX queue is full", Operation::WriteSerial, operation_id));
   }
+  // Two terminal data slots cover the accepted TX prefix plus a following ERR.
+  // They are reserved with completion capacity before the request is visible.
   if (!impl_->mailbox.reserve(operation_id, app::OperationClass::Tx,
                               MailboxKind::Tx)) {
     return tl::unexpected(submission_error(

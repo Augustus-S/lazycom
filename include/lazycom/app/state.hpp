@@ -142,6 +142,14 @@ using AppEvent =
                  SessionDataEvent, SessionFaultEvent, FatalSignal,
                  WorkerStoppedSignal>;
 
+/**
+ * @brief Single-owner connection lifecycle with strong stale-event filtering.
+ *
+ * The state machine is not synchronized. Commands and events must carry
+ * nonzero identities issued by their owning coordinator; value structs do not
+ * enforce that invariant themselves. A connection generation is consumed when
+ * begin_connect() succeeds and is never reused, including after failure.
+ */
 class ConnectionStateMachine {
 public:
   [[nodiscard]] ConnectionState state() const noexcept { return state_; }
@@ -159,13 +167,23 @@ public:
     return cleanup_operation_;
   }
 
+  /** @brief Begins a newer generation from Disconnected. */
   [[nodiscard]] StateChange
   begin_connect(const ConnectCommand &command) noexcept;
+  /**
+   * @brief Installs a session for the matching connect operation.
+   * @note A matching success may arrive during cancellation cleanup; callers
+   * must continue that cleanup rather than exposing a new connection.
+   */
   [[nodiscard]] StateChange
   connect_succeeded(const ConnectSucceeded &event) noexcept;
+  /** @brief Applies failure only to the matching connect operation/generation.
+   */
   [[nodiscard]] StateChange connect_failed(const ConnectFailed &event) noexcept;
+  /** @brief Moves a matching Connecting generation to Disconnecting cleanup. */
   [[nodiscard]] StateChange
   cancel_connect(const CancelConnectCommand &command) noexcept;
+  /** @brief Begins cleanup for the exact current generation and session. */
   [[nodiscard]] StateChange
   begin_disconnect(const DisconnectCommand &command) noexcept;
   [[nodiscard]] StateChange
@@ -173,7 +191,13 @@ public:
   [[nodiscard]] StateChange
   disconnect_completed(const DisconnectCompleted &event) noexcept;
 
+  /** @return true only for a nonzero TX operation matching the active session.
+   */
   [[nodiscard]] bool accepts(const SendCommand &command) const noexcept;
+  /**
+   * @return true when generation, session, origin, and lifecycle permit the
+   * event. Cleanup-origin events are accepted only while Disconnecting.
+   */
   [[nodiscard]] bool accepts(const SessionDataEvent &event) const noexcept;
 
   [[nodiscard]] static bool transition_allowed(ConnectionState from,
@@ -193,6 +217,7 @@ private:
   std::optional<OperationId> cleanup_operation_;
 };
 
+/** @brief Single-owner interaction-state transitions for the primary panels. */
 class InteractionStateMachine {
 public:
   [[nodiscard]] InteractionState state() const noexcept { return state_; }
@@ -203,6 +228,13 @@ private:
   InteractionState state_{InteractionState::Normal};
 };
 
+/**
+ * @brief Single-owner Off/Waiting/Recording/Error session-log state machine.
+ *
+ * enable(false) enters Waiting, enable(true) enters Recording, and disable()
+ * returns every non-Off state to Off. Connection events only move between
+ * Waiting and Recording.
+ */
 class LogStateMachine {
 public:
   [[nodiscard]] LogState state() const noexcept { return state_; }
@@ -220,6 +252,12 @@ private:
   LogState state_{LogState::Off};
 };
 
+/**
+ * @brief Coordinator-owned registry of worker return-point lifecycles.
+ * @pre WorkerKind arguments are valid enumerators.
+ * @note The registry records NotStarted to Running to AtReturnPoint; it does
+ * not request stop or join any thread.
+ */
 class WorkerLifecycleRegistry {
 public:
   [[nodiscard]] WorkerLifecycle state(WorkerKind worker) const noexcept;
@@ -245,10 +283,15 @@ enum class ProcessLifecycle : std::uint8_t {
 
 class MainThreadFatalGuard {
 public:
+  /** @brief Captures the constructing thread as the sole fatal coordinator. */
   MainThreadFatalGuard() noexcept;
 
   [[nodiscard]] ProcessLifecycle state() const noexcept { return state_; }
   [[nodiscard]] std::thread::id owner_thread() const noexcept { return owner_; }
+  /**
+   * @brief Idempotently enters FatalStopping on the captured owner thread.
+   * @return Unauthorized without mutation when called from another thread.
+   */
   [[nodiscard]] StateChange enter_fatal_stopping() noexcept;
   [[nodiscard]] StateChange
   enter_fatal_stopping_from(std::thread::id caller) noexcept;

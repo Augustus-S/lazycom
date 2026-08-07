@@ -1,5 +1,10 @@
 #pragma once
 
+/**
+ * @file
+ * @brief Convenience include for the bounded session-record data path.
+ */
+
 #include <lazycom/model/bounded_queue.hpp>
 #include <lazycom/model/memory_budget.hpp>
 #include <lazycom/model/record_sinks.hpp>
