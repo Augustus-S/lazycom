@@ -39,13 +39,15 @@ void RxFramer::emit(std::vector<RxFrame> &output) {
     pending_cr_ = false;
     return;
   }
-  output.push_back(RxFrame{std::move(bytes_), first_byte_observed_at_});
+  output.push_back(RxFrame{std::move(bytes_), first_byte_observed_at_,
+                           first_byte_observed_utc_});
   bytes_ = std::vector<std::byte>{};
   pending_cr_ = false;
 }
 
 void RxFramer::consume(const std::byte byte,
                        const ObservationClock::time_point observed_at,
+                       const std::chrono::system_clock::time_point observed_utc,
                        std::vector<RxFrame> &output) {
   if (pending_cr_) {
     if (byte == std::byte{0x0A}) {
@@ -58,6 +60,7 @@ void RxFramer::consume(const std::byte byte,
 
   if (bytes_.empty()) {
     first_byte_observed_at_ = observed_at;
+    first_byte_observed_utc_ = observed_utc;
   }
   bytes_.push_back(byte);
 
@@ -75,7 +78,8 @@ void RxFramer::consume(const std::byte byte,
 
 std::vector<RxFrame>
 RxFramer::push(const std::span<const std::byte> bytes,
-               const ObservationClock::time_point observed_at) {
+               const ObservationClock::time_point observed_at,
+               const std::chrono::system_clock::time_point observed_utc) {
   std::vector<RxFrame> output;
   if (bytes.empty()) {
     return output;
@@ -86,7 +90,7 @@ RxFramer::push(const std::span<const std::byte> bytes,
     emit(output);
   }
   for (const auto byte : bytes) {
-    consume(byte, observed_at, output);
+    consume(byte, observed_at, observed_utc, output);
   }
   last_read_observed_at_ = observed_at;
   has_last_read_ = true;

@@ -21,6 +21,16 @@ namespace lazycom::serial {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+struct Observation {
+  Clock::time_point observed_at{};
+  std::chrono::system_clock::time_point time_utc{};
+};
+
+[[nodiscard]] Observation observe() noexcept {
+  return {Clock::now(), std::chrono::system_clock::now()};
+}
+
 constexpr std::size_t kMaximumQueueMessages = 65536U;
 constexpr std::size_t kMaximumCommandBytes = 2U * 1024U * 1024U;
 constexpr std::size_t kMaximumTxBytes = 8U * 1024U * 1024U;
@@ -267,6 +277,7 @@ struct QueuedTx {
   std::size_t offset{};
   std::size_t charged_bytes{};
   std::array<std::size_t, 2> terminal_slots{kNoReservedSlot, kNoReservedSlot};
+  Observation last_write{};
 };
 
 [[nodiscard]] std::size_t
@@ -698,8 +709,10 @@ struct SerialService::Impl {
                           Operation::OpenSerial));
       return;
     }
+    Observation established;
     {
       std::lock_guard lock(mutex);
+      established = observe();
       connected = true;
       connecting = false;
       disconnecting = false;
@@ -711,7 +724,8 @@ struct SerialService::Impl {
     }
     static_cast<void>(complete(ConnectCompletion{
         request.command.operation_id, request.command.generation, session,
-        app::OperationOutcome::Succeeded, std::nullopt}));
+        app::OperationOutcome::Succeeded, std::nullopt, established.observed_at,
+        established.time_utc}));
     active_connect.reset();
   }
 
@@ -810,12 +824,14 @@ struct SerialService::Impl {
   }
 
   void stop_task_barrier(const app::StopTaskCommand &command) {
+    const auto observation = observe();
     if (active_tx &&
         active_tx->request.command.task_generation == command.generation) {
       auto cancelled = std::move(*active_tx);
       active_tx.reset();
       reset_tx_backoff();
-      finish_tx(std::move(cancelled), app::OperationOutcome::Cancelled);
+      finish_tx(std::move(cancelled), app::OperationOutcome::Cancelled, nullptr,
+                observation);
     }
     while (true) {
       std::optional<QueuedTx> cancelled;
@@ -834,7 +850,8 @@ struct SerialService::Impl {
       if (!cancelled) {
         break;
       }
-      finish_tx(std::move(*cancelled), app::OperationOutcome::Cancelled);
+      finish_tx(std::move(*cancelled), app::OperationOutcome::Cancelled,
+                nullptr, observation);
     }
     static_cast<void>(
         complete(TaskStopCompletion{command.operation_id, command.generation,
@@ -915,16 +932,18 @@ struct SerialService::Impl {
               request.offset);
       const auto attempt = remaining.first(std::min(remaining.size(), budget));
       auto written = backend->write_some(attempt);
+      const auto observation = observe();
       if (!written) {
         Error error = std::move(written.error());
         auto failed = std::move(request);
         active_tx.reset();
         reset_tx_backoff();
-        finish_tx(std::move(failed), app::OperationOutcome::Failed, &error);
+        finish_tx(std::move(failed), app::OperationOutcome::Failed, &error,
+                  observation);
         handle_fault(make_error(ErrorCode::SerialDeviceGone,
                                 Operation::WriteSerial,
                                 "serial write fault closed the session"),
-                     true);
+                     true, observation);
         return;
       }
       if (*written == 0U) {
@@ -933,10 +952,12 @@ struct SerialService::Impl {
       }
       if (*written > attempt.size()) {
         handle_fault(invariant_error("backend over-reported serial write",
-                                     Operation::WriteSerial));
+                                     Operation::WriteSerial),
+                     false, observation);
         return;
       }
       reset_tx_backoff();
+      request.last_write = observation;
       request.offset += *written;
       budget -= *written;
       if (request.offset == request.request.payload.size()) {
@@ -954,7 +975,8 @@ struct SerialService::Impl {
   }
 
   void finish_tx(QueuedTx request, const app::OperationOutcome outcome,
-                 const Error *const source_error = nullptr) noexcept {
+                 const Error *const source_error = nullptr,
+                 const Observation observation = observe()) noexcept {
     std::optional<Error> error;
     try {
       if (source_error != nullptr) {
@@ -991,7 +1013,8 @@ struct SerialService::Impl {
       }
     }
 
-    const bool charge_retained = publish_tx_terminal(request, error);
+    const bool charge_retained =
+        publish_tx_terminal(request, error, observation);
     if (!charge_retained) {
       std::lock_guard lock(mutex);
       --tx_messages;
@@ -1004,8 +1027,8 @@ struct SerialService::Impl {
   }
 
   [[nodiscard]] bool
-  publish_tx_terminal(QueuedTx &request,
-                      const std::optional<Error> &error) noexcept {
+  publish_tx_terminal(QueuedTx &request, const std::optional<Error> &error,
+                      const Observation observation) noexcept {
     std::optional<SerialDataEvent> accepted;
     try {
       if (request.offset != 0U) {
@@ -1014,6 +1037,9 @@ struct SerialService::Impl {
         accepted->session_id = request.request.command.session_id;
         accepted->kind = SerialDataKind::Tx;
         accepted->operation_id = request.request.command.operation_id;
+        accepted->observed_at = request.last_write.observed_at;
+        accepted->time_utc = request.last_write.time_utc;
+        accepted->input_mode = request.request.input_mode;
         request.request.payload.resize(request.offset);
         accepted->bytes = std::move(request.request.payload);
       }
@@ -1033,6 +1059,8 @@ struct SerialService::Impl {
         terminal->session_id = request.request.command.session_id;
         terminal->kind = SerialDataKind::Error;
         terminal->operation_id = request.request.command.operation_id;
+        terminal->observed_at = observation.observed_at;
+        terminal->time_utc = observation.time_utc;
         terminal->error = error;
       } catch (const std::bad_alloc &) {
         terminal_failure(app::FatalReason::OutOfMemory);
@@ -1123,8 +1151,9 @@ struct SerialService::Impl {
       std::array<std::byte, 64U * 1024U> scratch;
       auto amount =
           backend->read_some(std::span<std::byte>{scratch}.first(request_size));
+      const auto observation = observe();
       if (!amount) {
-        handle_fault(std::move(amount.error()));
+        handle_fault(std::move(amount.error()), false, observation);
         return;
       }
       if (*amount == 0U) {
@@ -1132,7 +1161,8 @@ struct SerialService::Impl {
       }
       if (*amount > request_size) {
         handle_fault(invariant_error("backend over-reported serial read",
-                                     Operation::ReadSerial));
+                                     Operation::ReadSerial),
+                     false, observation);
         return;
       }
       budget -= *amount;
@@ -1150,6 +1180,8 @@ struct SerialService::Impl {
         event.session_id = *session_id;
       }
       event.kind = SerialDataKind::Rx;
+      event.observed_at = observation.observed_at;
+      event.time_utc = observation.time_utc;
       event.bytes.assign(scratch.begin(),
                          scratch.begin() +
                              static_cast<std::ptrdiff_t>(*amount));
@@ -1208,8 +1240,8 @@ struct SerialService::Impl {
                        app::SignalSourceLocation::current()}));
   }
 
-  void handle_fault(Error error,
-                    const bool tx_error_already_published = false) {
+  void handle_fault(Error error, const bool tx_error_already_published = false,
+                    const Observation observation = observe()) {
     if (!port_open) {
       return;
     }
@@ -1225,8 +1257,9 @@ struct SerialService::Impl {
       connecting = false;
       disconnecting = true;
     }
-    cancel_all_tx(app::OperationOutcome::Failed, &error);
+    cancel_all_tx(app::OperationOutcome::Failed, &error, observation);
     const Status closed = backend->close();
+    const auto close_observation = observe();
     port_open = false;
     serial_fd = -1;
     std::optional<Error> cleanup_error;
@@ -1236,9 +1269,12 @@ struct SerialService::Impl {
       cleanup_error = std::move(error);
     }
     if (fault_generation && fault_session) {
-      publish_cleanup(*fault_generation, *fault_session,
-                      cleanup_slot.value_or(kNoReservedSlot),
-                      std::move(cleanup_error));
+      // Cleanup carries the original fault unless close itself failed.
+      publish_cleanup(
+          *fault_generation, *fault_session,
+          cleanup_slot.value_or(kNoReservedSlot), std::move(cleanup_error),
+          closed && !tx_error_already_published ? observation
+                                                : close_observation);
     }
     {
       std::lock_guard lock(mutex);
@@ -1252,12 +1288,13 @@ struct SerialService::Impl {
   }
 
   void cancel_all_tx(const app::OperationOutcome outcome,
-                     const Error *const error = nullptr) {
+                     const Error *const error = nullptr,
+                     const Observation observation = observe()) {
     if (active_tx) {
       auto cancelled = std::move(*active_tx);
       active_tx.reset();
       reset_tx_backoff();
-      finish_tx(std::move(cancelled), outcome, error);
+      finish_tx(std::move(cancelled), outcome, error, observation);
     }
     while (true) {
       std::optional<QueuedTx> cancelled;
@@ -1271,7 +1308,7 @@ struct SerialService::Impl {
       if (!cancelled) {
         break;
       }
-      finish_tx(std::move(*cancelled), outcome, error);
+      finish_tx(std::move(*cancelled), outcome, error, observation);
     }
   }
 
@@ -1293,13 +1330,15 @@ struct SerialService::Impl {
       port_open = false;
       serial_fd = -1;
     }
+    const auto close_observation = observe();
     std::optional<Error> error;
     if (!close_status) {
       error = close_status.error();
     }
     if (old_generation && old_session) {
       publish_cleanup(*old_generation, *old_session,
-                      cleanup_slot.value_or(kNoReservedSlot), error);
+                      cleanup_slot.value_or(kNoReservedSlot), error,
+                      close_observation);
     }
     {
       std::lock_guard lock(mutex);
@@ -1320,12 +1359,15 @@ struct SerialService::Impl {
   void publish_cleanup(const ConnectionGeneration event_generation,
                        const SessionId event_session,
                        const std::size_t cleanup_slot,
-                       std::optional<Error> error) {
+                       std::optional<Error> error,
+                       const Observation observation) {
     SerialDataEvent event;
     event.generation = event_generation;
     event.session_id = event_session;
     event.origin = app::SessionEventOrigin::Cleanup;
     event.kind = SerialDataKind::Cleanup;
+    event.observed_at = observation.observed_at;
+    event.time_utc = observation.time_utc;
     event.error = std::move(error);
     bool stored = false;
     {
@@ -1410,13 +1452,15 @@ struct SerialService::Impl {
       const auto old_generation = generation;
       const auto old_session = session_id;
       const auto closed = backend->close();
+      const auto close_observation = observe();
       port_open = false;
       serial_fd = -1;
       if (old_generation && old_session) {
         publish_cleanup(*old_generation, *old_session,
                         active_cleanup_slot.value_or(kNoReservedSlot),
                         closed ? std::nullopt
-                               : std::optional<Error>{closed.error()});
+                               : std::optional<Error>{closed.error()},
+                        close_observation);
       }
     }
     std::lock_guard lock(mutex);

@@ -99,6 +99,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 - Ubuntu 24.04 系统仓库仅提供 libserialport 0.1.1，不能把系统 `pkg-config >= 0.1.2` 作为默认可满足前提。
 - 默认离线依赖包固定携带 libserialport 0.1.2 源码并构建 shared library；允许通过 `pkg-config` 显式选择已经过 spike 和集成测试的系统 0.1.2+。
+- 随附 libserialport 的 build/install 通过 GNU Make `--old-file` 使用预生成的 `aclocal.m4`、`configure`、`Makefile.in` 和 `config.h.in`，不因 checkout 时间戳重新运行 Autotools，也不改写 vendored 源码。普通构建不要求安装 Autoconf 或特定 Automake 版本；依赖升级必须提供匹配的预生成文件。
 - libserialport 不静态并入主程序。发布包必须携带 LGPL 许可、对应源码、动态替换说明，并用受控 RUNPATH 或发行版依赖保证加载预期 shared library。
 - nlohmann/json、toml++ 和 tl::expected 的已验证头文件固定放在 `include/dependencies/`，构建时不下载，也不替换为系统版本。
 - `include/dependencies/DEPENDENCIES.lock` 记录每个 header-only 库的上游项目、精确版本、源归档 SHA-256 和导入日期。

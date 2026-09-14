@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ranges>
 #include <span>
 #include <stdexcept>
@@ -829,7 +830,13 @@ TEST_CASE("quick-send deletion changes memory only after persistence commits") {
   REQUIRE(created);
   auto &application = **created;
 
-  REQUIRE(application.apply_quick_slot("3|Ping|txt|AT|crlf|probe"));
+  const lazycom::config::QuickSendSlot slot{3U,
+                                            "Ping",
+                                            lazycom::config::SendMode::Txt,
+                                            "AT",
+                                            lazycom::config::Newline::CrLf,
+                                            "probe"};
+  REQUIRE(application.apply_quick_slot(3U, slot));
   REQUIRE_FALSE(application.snapshot().quick_send.slots[2U]);
   for (int attempt = 0;
        attempt < 100 && !application.snapshot().quick_send.slots[2U];
@@ -838,9 +845,9 @@ TEST_CASE("quick-send deletion changes memory only after persistence commits") {
     std::this_thread::sleep_for(std::chrono::milliseconds{1});
   }
   REQUIRE(application.snapshot().quick_send.slots[2U]);
-  REQUIRE(application.snapshot().quick_send.slots[2U]->content == "AT");
+  REQUIRE(application.snapshot().quick_send.slots[2U] == slot);
 
-  REQUIRE(application.apply_quick_slot("3|||||"));
+  REQUIRE(application.apply_quick_slot(3U, std::nullopt));
   REQUIRE(application.snapshot().quick_send.slots[2U]);
   for (int attempt = 0;
        attempt < 100 && application.snapshot().quick_send.slots[2U];
@@ -942,7 +949,10 @@ TEST_CASE(
   REQUIRE(created);
   auto &application = **created;
 
-  REQUIRE(application.apply_quick_slot("1|Probe|txt|AT|none|"));
+  REQUIRE(application.apply_quick_slot(
+      1U, lazycom::config::QuickSendSlot{1U, "Probe",
+                                         lazycom::config::SendMode::Txt, "AT",
+                                         lazycom::config::Newline::None, ""}));
   for (int attempt = 0;
        attempt < 100 && !application.snapshot().quick_send.slots[0U];
        ++attempt) {

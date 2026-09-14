@@ -8,6 +8,7 @@
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/dom/elements.hpp>
+#include <ftxui/dom/node.hpp>
 #include <ftxui/screen/terminal.hpp>
 
 #include <algorithm>
@@ -659,7 +660,16 @@ struct Tui::Impl {
   int draft_cursor{};
   Component draft_input;
   RouteMode mode{RouteMode::Normal};
-  RouteMode mode_before_help{RouteMode::Normal};
+  struct OverlayFrame {
+    RouteMode mode;
+    app::InteractionState interaction;
+    std::uint64_t modal_id;
+  };
+  std::array<OverlayFrame, 3> overlay_stack{};
+  std::size_t overlay_depth{};
+  std::uint64_t modal_id{};
+  std::uint64_t quick_save_modal_id{};
+  std::size_t help_line{};
   std::string modal_kind;
   std::string modal_title;
   std::string edit_value;
@@ -672,7 +682,8 @@ struct Tui::Impl {
   config::ReceiveView tx_view_candidate{config::ReceiveView::Txt};
   app::DirectionFilter filter_candidate;
   config::LoggingSettings logging_candidate;
-  std::size_t scroll_from_bottom{};
+  std::optional<std::uint64_t> viewport_anchor;
+  bool at_bottom{true};
   std::string search_query;
   std::vector<std::uint64_t> search_matches;
   std::size_t search_match{};
@@ -688,8 +699,6 @@ struct Tui::Impl {
     ReplaceQuickTask,
   };
   ConfirmAction confirm_action{ConfirmAction::None};
-  RouteMode confirm_return_mode{RouteMode::Normal};
-  RouteMode alert_return_mode{RouteMode::Normal};
   bool confirm_accept{};
   std::uint32_t pending_quick_slot{};
   std::uint64_t pending_quick_interval{};
@@ -699,7 +708,13 @@ struct Tui::Impl {
   std::optional<std::uint64_t> receive_cursor;
   std::string receive_vim_pending;
   std::string selected_text;
-  std::string ui_notice;
+  config::QuickSendSlot quick_candidate;
+  std::uint32_t quick_slot{1U};
+  std::uint64_t quick_interval{};
+  std::string quick_preview;
+  std::string quick_preview_summary;
+  std::size_t preview_offset{};
+  bool preserve_selection{};
   std::atomic_bool custom_event_pending{};
 
   Impl() {
@@ -771,7 +786,8 @@ struct Tui::Impl {
       return;
     }
     if (value.size() > maximum) {
-      set_notice(std::string{label} + " exceeds the 1 MiB clipboard limit");
+      set_notice(std::string{label} + " exceeds the 1 MiB clipboard limit",
+                 true);
       return;
     }
     std::cout << "\x1b]52;c;" << base64_encode(value) << '\a' << std::flush;
@@ -793,6 +809,68 @@ struct Tui::Impl {
     return indices;
   }
 
+  [[nodiscard]] bool search_visible() const {
+    if (mode == RouteMode::Search) {
+      return true;
+    }
+    return std::any_of(
+        overlay_stack.begin(),
+        overlay_stack.begin() + static_cast<std::ptrdiff_t>(overlay_depth),
+        [](const auto &frame) { return frame.mode == RouteMode::Search; });
+  }
+
+  [[nodiscard]] std::vector<std::size_t> view_indices() const {
+    if (!search_visible()) {
+      return receive_visible_indices();
+    }
+    std::vector<std::size_t> indices;
+    const auto &records = application->snapshot().records;
+    const auto filter = search_direction_filter();
+    for (std::size_t index = 0U; index < records.size(); ++index) {
+      if (visible(records[index], filter)) {
+        indices.push_back(index);
+      }
+    }
+    return indices;
+  }
+
+  [[nodiscard]] std::size_t
+  nearest_position(const std::vector<std::size_t> &indices,
+                   const std::uint64_t id) const {
+    const auto &records = application->snapshot().records;
+    const auto next =
+        std::ranges::lower_bound(indices, id, {}, [&](const auto index) {
+          return records[index].record_id;
+        });
+    if (next == indices.begin()) {
+      return 0U;
+    }
+    if (next == indices.end()) {
+      return indices.size() - 1U;
+    }
+    const auto position =
+        static_cast<std::size_t>(std::distance(indices.begin(), next));
+    return id - records[indices[position - 1U]].record_id <
+                   records[indices[position]].record_id - id
+               ? position - 1U
+               : position;
+  }
+
+  void normalize_viewport(const bool follow = false) {
+    const auto indices = view_indices();
+    if (indices.empty()) {
+      viewport_anchor.reset();
+      at_bottom = true;
+      return;
+    }
+    const auto &records = application->snapshot().records;
+    const auto position = follow || !viewport_anchor
+                              ? indices.size() - 1U
+                              : nearest_position(indices, *viewport_anchor);
+    viewport_anchor = records[indices[position]].record_id;
+    at_bottom = position + 1U == indices.size();
+  }
+
   void set_receive_cursor(const std::vector<std::size_t> &indices,
                           const std::size_t position) {
     if (indices.empty()) {
@@ -802,15 +880,16 @@ struct Tui::Impl {
     const auto selected = indices[std::min(position, indices.size() - 1U)];
     const auto &records = application->snapshot().records;
     receive_cursor = records[selected].record_id;
-    const auto visible_position = static_cast<std::size_t>(
-        std::distance(indices.begin(), std::ranges::find(indices, selected)));
-    scroll_from_bottom = indices.size() - visible_position - 1U;
+    viewport_anchor = receive_cursor;
+    at_bottom = selected == indices.back();
   }
 
   void normalize_receive_cursor(const bool prefer_latest = false) {
     const auto indices = receive_visible_indices();
     if (indices.empty()) {
       receive_cursor.reset();
+      viewport_anchor.reset();
+      at_bottom = true;
       receive_vim_pending.clear();
       return;
     }
@@ -821,28 +900,20 @@ struct Tui::Impl {
             return records[index].record_id == *receive_cursor;
           });
       if (retained != indices.end()) {
-        const auto position =
-            static_cast<std::size_t>(std::distance(indices.begin(), retained));
-        scroll_from_bottom = indices.size() - position - 1U;
+        viewport_anchor = receive_cursor;
+        at_bottom = retained + 1 == indices.end();
         return;
       }
-      const auto next = std::ranges::find_if(indices, [&](const auto index) {
-        return records[index].record_id > *receive_cursor;
-      });
-      set_receive_cursor(indices, next == indices.end()
-                                      ? indices.size() - 1U
-                                      : static_cast<std::size_t>(std::distance(
-                                            indices.begin(), next)));
+      set_receive_cursor(indices, nearest_position(indices, *receive_cursor));
       return;
     }
     if (prefer_latest) {
       set_receive_cursor(indices, indices.size() - 1U);
       return;
     }
-    const auto end = indices.size() > scroll_from_bottom
-                         ? indices.size() - scroll_from_bottom
-                         : 0U;
-    set_receive_cursor(indices, end == 0U ? 0U : end - 1U);
+    set_receive_cursor(
+        indices, viewport_anchor ? nearest_position(indices, *viewport_anchor)
+                                 : indices.size() - 1U);
   }
 
   void move_receive_cursor(const bool down, const std::size_t count) {
@@ -908,15 +979,19 @@ struct Tui::Impl {
     switch (parsed.action) {
     case ReceiveVimAction::MoveDown:
       move_receive_cursor(true, parsed.count);
+      preserve_selection = true;
       break;
     case ReceiveVimAction::MoveUp:
       move_receive_cursor(false, parsed.count);
+      preserve_selection = true;
       break;
     case ReceiveVimAction::First:
       move_receive_edge(false);
+      preserve_selection = true;
       break;
     case ReceiveVimAction::Last:
       move_receive_edge(true);
+      preserve_selection = true;
       break;
     case ReceiveVimAction::YankLine:
       copy_receive_record();
@@ -928,15 +1003,40 @@ struct Tui::Impl {
     return true;
   }
 
-  void set_notice(std::string message) { ui_notice = std::move(message); }
+  void set_notice(std::string message, const bool error = false) {
+    application->publish_notice(std::move(message), error);
+  }
+
+  void push_overlay(const RouteMode next) {
+    if (overlay_depth == overlay_stack.size()) {
+      set_notice("Cannot nest another overlay", true);
+      return;
+    }
+    // Suspended fields and Input components stay in place and do not receive
+    // input.
+    overlay_stack[overlay_depth++] = {mode, application->snapshot().interaction,
+                                      modal_id};
+    mode = next;
+  }
+
+  void pop_overlay() {
+    if (overlay_depth == 0U) {
+      close_overlay();
+      return;
+    }
+    const auto frame = overlay_stack[--overlay_depth];
+    mode = frame.mode;
+    application->set_interaction(frame.interaction);
+    normalize_viewport();
+  }
 
   void open_help() {
     if (mode == RouteMode::Help) {
-      mode = mode_before_help;
+      pop_overlay();
       return;
     }
-    mode_before_help = mode;
-    mode = RouteMode::Help;
+    help_line = 0U;
+    push_overlay(RouteMode::Help);
   }
 
   void show_alert_if_needed() {
@@ -944,19 +1044,16 @@ struct Tui::Impl {
         mode == RouteMode::Help) {
       return;
     }
-    alert_return_mode = mode;
-    mode = RouteMode::ErrorDialog;
+    push_overlay(RouteMode::ErrorDialog);
   }
 
   void dismiss_alert() {
     application->dismiss_alert();
-    mode = alert_return_mode;
-    if (mode == RouteMode::ErrorDialog) {
-      mode = RouteMode::Normal;
-    }
+    pop_overlay();
   }
 
   void open_modal(std::string kind, std::string title, std::string value) {
+    ++modal_id;
     modal_kind = std::move(kind);
     modal_title = std::move(title);
     edit_value = std::move(value);
@@ -982,8 +1079,17 @@ struct Tui::Impl {
     if (modal_kind == "G-dir") {
       return kPathMaximumBytes;
     }
-    if (modal_kind == "F") {
+    if (modal_kind == "F-content") {
       return config::kQuickSendMaximumBytes;
+    }
+    if (modal_kind == "F-name") {
+      return 64U;
+    }
+    if (modal_kind == "F-note") {
+      return 256U;
+    }
+    if (modal_kind == "f-interval") {
+      return kNumericMaximumBytes;
     }
     return kGeneralModalMaximumBytes;
   }
@@ -991,6 +1097,7 @@ struct Tui::Impl {
   void open_choice(std::string kind, std::string title,
                    std::vector<std::string> options,
                    const std::size_t selected = 0U, std::string parent = {}) {
+    ++modal_id;
     modal_kind = std::move(kind);
     modal_title = std::move(title);
     modal_options = std::move(options);
@@ -1051,22 +1158,24 @@ struct Tui::Impl {
   }
 
   void close_overlay() {
+    overlay_depth = 0U;
     mode = RouteMode::Normal;
     application->set_interaction(app::InteractionState::Normal);
     confirm_action = ConfirmAction::None;
     awaiting_quick_save = false;
     connect_after_port = false;
+    normalize_viewport();
   }
 
   void open_confirm(const ConfirmAction action, const RouteMode return_mode) {
     confirm_action = action;
-    confirm_return_mode = return_mode;
     confirm_accept = false;
-    mode = RouteMode::Confirm;
+    mode = return_mode;
+    push_overlay(RouteMode::Confirm);
   }
 
   void cancel_confirm() {
-    mode = confirm_return_mode;
+    pop_overlay();
     confirm_action = ConfirmAction::None;
     confirm_accept = false;
     if (mode == RouteMode::Normal) {
@@ -1074,34 +1183,87 @@ struct Tui::Impl {
     }
   }
 
-  [[nodiscard]] static bool parse_quick_request(const std::string_view value,
-                                                std::uint32_t &slot,
-                                                std::uint64_t &interval) {
-    const auto separator = value.find('|');
-    if (separator == std::string_view::npos) {
-      return false;
-    }
-    const auto first =
-        std::from_chars(value.data(), value.data() + separator, slot);
-    const auto second = std::from_chars(value.data() + separator + 1U,
-                                        value.data() + value.size(), interval);
-    return first.ec == std::errc{} && first.ptr == value.data() + separator &&
-           second.ec == std::errc{} &&
-           second.ptr == value.data() + value.size();
+  [[nodiscard]] static std::string short_value(const std::string_view value) {
+    const auto end = utf8_boundary_at_or_before(
+        value, std::min(value.size(), std::size_t{64U}));
+    return logging::sanitize_message(value.substr(0U, end)) +
+           (end < value.size() ? "..." : "");
   }
 
-  [[nodiscard]] static std::optional<std::uint32_t>
-  quick_slot_from_editor(const std::string_view value) {
-    const auto separator = value.find('|');
-    const auto field = value.substr(0U, separator);
-    std::uint32_t slot{};
-    const auto parsed =
-        std::from_chars(field.data(), field.data() + field.size(), slot);
-    if (parsed.ec != std::errc{} || parsed.ptr != field.data() + field.size() ||
-        slot < 1U || slot > 20U) {
-      return std::nullopt;
+  void open_quick_slots(const bool edit) {
+    std::vector<std::string> options;
+    for (std::size_t index = 0U;
+         index < application->snapshot().quick_send.slots.size(); ++index) {
+      const auto &slot = application->snapshot().quick_send.slots[index];
+      options.push_back(
+          std::to_string(index + 1U) + "  " +
+          (slot ? short_value(slot->name) + " [" +
+                      uppercase_ascii(config::to_string(slot->mode)) + "] " +
+                      short_value(slot->content)
+                : "[Input please.]"));
     }
-    return slot;
+    open_choice(edit ? "F" : "f",
+                edit ? "Quick Slots: Enter edit / Delete remove"
+                     : "Quick Send: select a slot",
+                std::move(options), quick_slot - 1U);
+  }
+
+  void open_quick_editor() {
+    open_choice(
+        "F-edit", "Edit Slot " + std::to_string(quick_slot),
+        {"Name: " + short_value(quick_candidate.name),
+         "Mode: " + uppercase_ascii(config::to_string(quick_candidate.mode)),
+         "Content: " + short_value(quick_candidate.content),
+         "NewLine: " + std::string{config::to_string(quick_candidate.newline)},
+         "Note: " + short_value(quick_candidate.note), "Preview bytes", "Save",
+         "Cancel"});
+  }
+
+  bool prepare_quick_preview(const config::QuickSendSlot &slot) {
+    const auto newline = application->snapshot().config.send.newline;
+    auto parsed = scheduler::parse_payload(slot.mode, slot.content,
+                                           slot.newline, newline);
+    if (!parsed) {
+      set_notice(
+          "Quick slot payload is invalid or exceeds 1 MiB including its suffix",
+          true);
+      return false;
+    }
+    quick_preview =
+        encoding::render(parsed.bytes, encoding::DisplayMode::Mixed);
+    quick_preview_summary =
+        uppercase_ascii(config::to_string(slot.mode)) + " | NewLine:" +
+        uppercase_ascii(config::to_string(
+            slot.newline == config::Newline::Session ? newline
+                                                     : slot.newline)) +
+        " | " + std::to_string(parsed.bytes.size()) + " byte(s)";
+    preview_offset = 0U;
+    return true;
+  }
+
+  void open_quick_run() {
+    open_choice("f-run", "Execute Slot " + std::to_string(quick_slot),
+                {"Interval: " + std::to_string(quick_interval) + " ms",
+                 "Full payload preview",
+                 quick_interval == 0U ? "Send once" : "Start periodic task",
+                 "Stop active task", "Cancel"});
+  }
+
+  [[nodiscard]] std::size_t preview_page_end(const std::size_t offset,
+                                             Elements *rows = nullptr) const {
+    const auto width =
+        static_cast<std::size_t>(std::clamp(Terminal::Size().dimx - 8, 4, 78));
+    const auto height = std::clamp(Terminal::Size().dimy - 9, 1, 12);
+    auto cursor = offset;
+    for (int line = 0; line < height && cursor < quick_preview.size(); ++line) {
+      const auto end = utf8_boundary_at_or_before(
+          quick_preview, std::min(quick_preview.size(), cursor + width));
+      if (rows) {
+        rows->push_back(text(quick_preview.substr(cursor, end - cursor)));
+      }
+      cursor = end;
+    }
+    return cursor;
   }
 
   [[nodiscard]] app::DirectionFilter search_direction_filter() const noexcept {
@@ -1160,10 +1322,8 @@ struct Tui::Impl {
     if (found == records.end()) {
       return false;
     }
-    const auto filter = search_direction_filter();
-    scroll_from_bottom = static_cast<std::size_t>(std::ranges::count_if(
-        std::ranges::subrange(std::next(found), records.end()),
-        [&filter](const auto &record) { return visible(record, filter); }));
+    viewport_anchor = found->record_id;
+    normalize_viewport();
     return true;
   }
 
@@ -1260,28 +1420,14 @@ struct Tui::Impl {
       open_logging_root();
       break;
     case RoutedAction::QuickConfig: {
-      const auto slot_index = state.preferences.last_quick_send_slot;
-      const auto &slot = state.quick_send.slots[slot_index - 1U];
-      if (slot) {
-        open_modal("F", "F  index|name|mode|content|newline|note",
-                   std::to_string(slot_index) + "|" + slot->name + "|" +
-                       std::string{config::to_string(slot->mode)} + "|" +
-                       slot->content + "|" +
-                       std::string{config::to_string(slot->newline)} + "|" +
-                       slot->note);
-      } else {
-        open_modal("F", "F  index|name|mode|content|newline|note",
-                   std::to_string(slot_index) + "||txt||session|");
-      }
+      quick_slot = state.preferences.last_quick_send_slot;
+      open_quick_slots(true);
       break;
     }
     case RoutedAction::QuickExecute:
-      open_modal("f",
-                 state.task.state == scheduler::SchedulerState::Idle
-                     ? "f  slot|interval_ms (0 or 10..86400000)"
-                     : "f  slot|interval_ms to replace; 'stop' stops the task",
-                 std::to_string(state.preferences.last_quick_send_slot) + "|" +
-                     std::to_string(state.preferences.last_interval_ms));
+      quick_slot = state.preferences.last_quick_send_slot;
+      quick_interval = state.preferences.last_interval_ms;
+      open_quick_slots(false);
       break;
     case RoutedAction::CommandPalette:
       open_modal("E", "E  Command: scan/connect/disconnect/help/stop-task", "");
@@ -1489,30 +1635,125 @@ struct Tui::Impl {
         open_logging_root();
         return;
       }
-    } else if (modal_kind == "F") {
-      result = application->apply_quick_slot(edit_value);
-    } else if (modal_kind == "f") {
-      if (edit_value == "stop") {
+    } else if (modal_kind == "F" || modal_kind == "f") {
+      quick_slot = static_cast<std::uint32_t>(selected_device + 1U);
+      const auto &slot =
+          application->snapshot().quick_send.slots[selected_device];
+      if (modal_kind == "F") {
+        quick_candidate = slot.value_or(config::QuickSendSlot{});
+        quick_candidate.index = quick_slot;
+        open_quick_editor();
+      } else if (slot && prepare_quick_preview(*slot)) {
+        open_quick_run();
+      } else if (!slot) {
+        set_notice("The selected quick-send slot is empty", true);
+      }
+      return;
+    } else if (modal_kind == "F-edit") {
+      if (selected_device == 0U || selected_device == 2U ||
+          selected_device == 4U) {
+        const auto field = selected_device;
+        open_modal(field == 0U   ? "F-name"
+                   : field == 2U ? "F-content"
+                                 : "F-note",
+                   field == 2U ? "Content: Alt+Enter inserts a newline"
+                               : "Edit slot field",
+                   field == 0U   ? quick_candidate.name
+                   : field == 2U ? quick_candidate.content
+                                 : quick_candidate.note);
+        modal_parent = "F-edit";
+      } else if (selected_device == 1U) {
+        open_choice("F-mode", "Slot input mode", {"TXT", "HEX"},
+                    quick_candidate.mode == config::SendMode::Txt ? 0U : 1U,
+                    "F-edit");
+      } else if (selected_device == 3U) {
+        open_choice(
+            "F-newline", "Slot suffix", {"None", "LF", "CR", "CRLF", "Session"},
+            static_cast<std::size_t>(quick_candidate.newline), "F-edit");
+      } else if (selected_device == 5U) {
+        if (prepare_quick_preview(quick_candidate)) {
+          open_modal("quick-preview", "Payload preview", "");
+          modal_parent = "F-edit";
+        }
+      } else if (selected_device == 6U) {
+        result = application->apply_quick_slot(quick_slot, quick_candidate);
+        if (result) {
+          awaiting_quick_save = true;
+          quick_save_modal_id = modal_id;
+          modal_title = "Saving quick-send slot...";
+          return;
+        }
+      } else {
+        open_quick_slots(true);
+      }
+      if (result) {
+        return;
+      }
+    } else if (modal_kind == "F-name" || modal_kind == "F-content" ||
+               modal_kind == "F-note") {
+      if (modal_kind == "F-name") {
+        quick_candidate.name = edit_value;
+      } else if (modal_kind == "F-content") {
+        quick_candidate.content = edit_value;
+      } else {
+        quick_candidate.note = edit_value;
+      }
+      open_quick_editor();
+      return;
+    } else if (modal_kind == "F-mode" || modal_kind == "F-newline") {
+      if (modal_kind == "F-mode") {
+        quick_candidate.mode = selected_device == 0U ? config::SendMode::Txt
+                                                     : config::SendMode::Hex;
+      } else {
+        quick_candidate.newline = static_cast<config::Newline>(selected_device);
+      }
+      open_quick_editor();
+      return;
+    } else if (modal_kind == "f-interval") {
+      std::uint64_t interval{};
+      const auto parsed = std::from_chars(
+          edit_value.data(), edit_value.data() + edit_value.size(), interval);
+      if (parsed.ec != std::errc{} ||
+          parsed.ptr != edit_value.data() + edit_value.size() ||
+          (interval != 0U &&
+           (interval < scheduler::kMinimumPeriodicIntervalMs ||
+            interval > scheduler::kMaximumPeriodicIntervalMs))) {
+        set_notice("Interval must be 0 or 10..86400000 ms", true);
+      } else {
+        quick_interval = interval;
+        open_quick_run();
+      }
+      return;
+    } else if (modal_kind == "f-run") {
+      if (selected_device == 0U) {
+        open_modal("f-interval", "Interval in ms: 0 or 10..86400000",
+                   std::to_string(quick_interval));
+        modal_parent = "f-run";
+        return;
+      }
+      if (selected_device == 1U) {
+        preview_offset = 0U;
+        open_modal("quick-preview", "Payload preview", "");
+        modal_parent = "f-run";
+        return;
+      }
+      if (selected_device == 3U) {
         application->stop_quick_task();
         close_overlay();
         return;
       }
-      std::uint32_t slot{};
-      std::uint64_t interval{};
-      if (!parse_quick_request(edit_value, slot, interval)) {
-        result = tl::unexpected(make_error(
-            ErrorCode::ValidationInvalidValue, Operation::ValidateConfig,
-            "quick execution format is slot|interval_ms"));
-      } else {
-        const auto task_state = application->snapshot().task.state;
-        if (task_state == scheduler::SchedulerState::Running) {
-          pending_quick_slot = slot;
-          pending_quick_interval = interval;
-          open_confirm(ConfirmAction::ReplaceQuickTask, RouteMode::Modal);
-          return;
-        }
-        result = application->execute_quick(slot, interval);
+      if (selected_device == 4U) {
+        close_overlay();
+        return;
       }
+      if (application->snapshot().task.state ==
+          scheduler::SchedulerState::Running) {
+        pending_quick_slot = quick_slot;
+        pending_quick_interval = quick_interval;
+        open_confirm(ConfirmAction::ReplaceQuickTask, RouteMode::Modal);
+        return;
+      }
+      result = application->execute_quick(quick_slot, quick_interval);
     } else if (modal_kind == "E") {
       if (edit_value == "scan") {
         application->request_scan();
@@ -1555,11 +1796,6 @@ struct Tui::Impl {
       show_alert_if_needed();
       return;
     }
-    if (modal_kind == "F") {
-      awaiting_quick_save = true;
-      modal_title = "F  Saving quick-send slot...";
-      return;
-    }
     const bool should_connect = modal_kind == "P" && connect_after_port;
     connect_after_port = false;
     close_overlay();
@@ -1593,40 +1829,47 @@ struct Tui::Impl {
   }
 
   void scroll(RoutedAction action) {
-    const auto count = mode == RouteMode::Search
-                           ? application->snapshot().records.size()
-                           : receive_visible_indices().size();
+    normalize_viewport();
+    const auto indices = view_indices();
+    if (indices.empty()) {
+      return;
+    }
+    auto position = nearest_position(indices, *viewport_anchor);
     switch (action) {
     case RoutedAction::ScrollUp:
-      scroll_from_bottom = std::min(count, scroll_from_bottom + 1U);
+      position -= std::min(position, std::size_t{1U});
       break;
     case RoutedAction::ScrollDown:
-      if (scroll_from_bottom != 0U) {
-        --scroll_from_bottom;
-      }
+      position = std::min(indices.size() - 1U, position + 1U);
       break;
     case RoutedAction::PageUp:
-      scroll_from_bottom = std::min(count, scroll_from_bottom + 10U);
+      position -= std::min(position, std::size_t{10U});
       break;
     case RoutedAction::PageDown:
-      scroll_from_bottom =
-          scroll_from_bottom > 10U ? scroll_from_bottom - 10U : 0U;
+      position = std::min(indices.size() - 1U, position + 10U);
       break;
     case RoutedAction::Home:
-      scroll_from_bottom = count;
+      position = 0U;
       break;
     case RoutedAction::End:
-      scroll_from_bottom = 0U;
+      position = indices.size() - 1U;
       break;
     default:
       break;
     }
+    viewport_anchor =
+        application->snapshot().records[indices[position]].record_id;
+    at_bottom = position + 1U == indices.size();
   }
 
   bool handle(Event event) {
+    preserve_selection = false;
     if (event == Event::Custom) {
       custom_event_pending.store(false, std::memory_order_release);
-      const auto old_count = receive_visible_indices().size();
+      const bool follow = at_bottom && !application->snapshot().manual_pause &&
+                          !search_visible() &&
+                          application->snapshot().interaction !=
+                              app::InteractionState::ReceiveBrowse;
       application->tick();
       if (application->snapshot().fatal_stopping) {
         exit_ok = false;
@@ -1654,7 +1897,7 @@ struct Tui::Impl {
         }
         selected_device = std::min(selected_device, modal_options.size() - 1U);
       }
-      if (mode == RouteMode::Search) {
+      if (search_visible()) {
         prune_search_matches();
       }
       if (awaiting_quick_save &&
@@ -1663,19 +1906,25 @@ struct Tui::Impl {
         if (application->snapshot().quick_send_save_failed) {
           modal_title = "F  Save failed; edit is preserved";
         } else {
-          close_overlay();
+          if (mode == RouteMode::Modal && modal_id == quick_save_modal_id) {
+            close_overlay();
+          } else {
+            for (std::size_t index = 0U; index < overlay_depth; ++index) {
+              auto &frame = overlay_stack[index];
+              if (frame.mode == RouteMode::Modal &&
+                  frame.modal_id == quick_save_modal_id) {
+                frame.mode = RouteMode::Normal;
+                frame.interaction = app::InteractionState::Normal;
+              }
+            }
+          }
         }
       }
-      const auto new_count = receive_visible_indices().size();
       if (mode == RouteMode::ReceiveBrowse) {
         normalize_receive_cursor();
-      } else if (new_count > old_count &&
-                 (scroll_from_bottom != 0U ||
-                  application->snapshot().manual_pause)) {
-        scroll_from_bottom =
-            std::min(new_count, scroll_from_bottom + (new_count - old_count));
+      } else {
+        normalize_viewport(follow);
       }
-      scroll_from_bottom = std::min(scroll_from_bottom, new_count);
       return false;
     }
     if (event == Event::CtrlC) {
@@ -1697,7 +1946,7 @@ struct Tui::Impl {
       if (event.mouse().button == Mouse::WheelUp) {
         if (mode == RouteMode::ReceiveBrowse) {
           move_receive_cursor(false, 1U);
-          return true;
+          return false;
         }
         scroll(RoutedAction::ScrollUp);
         return false;
@@ -1705,13 +1954,18 @@ struct Tui::Impl {
       if (event.mouse().button == Mouse::WheelDown) {
         if (mode == RouteMode::ReceiveBrowse) {
           move_receive_cursor(true, 1U);
-          return true;
+          return false;
         }
         scroll(RoutedAction::ScrollDown);
         return false;
       }
     }
     const auto key = event_key(event);
+    if (event == Event::Escape && mode == RouteMode::Normal &&
+        !application->snapshot().notice.empty()) {
+      application->dismiss_notice();
+      return true;
+    }
     const auto connected =
         application->snapshot().connection == app::ConnectionState::Connected;
     const auto action = route_key(
@@ -1724,6 +1978,17 @@ struct Tui::Impl {
     if (mode == RouteMode::Help) {
       if (action == RoutedAction::Escape) {
         open_help();
+      } else if (event == Event::ArrowDown || event == Event::PageDown ||
+                 (event.is_mouse() &&
+                  event.mouse().button == Mouse::WheelDown)) {
+        help_line = std::min(help_line + 1U, std::size_t{8U});
+      } else if (event == Event::ArrowUp || event == Event::PageUp ||
+                 (event.is_mouse() && event.mouse().button == Mouse::WheelUp)) {
+        help_line -= std::min(help_line, std::size_t{1U});
+      } else if (event == Event::Home) {
+        help_line = 0U;
+      } else if (event == Event::End) {
+        help_line = 8U;
       }
       return true;
     }
@@ -1753,28 +2018,22 @@ struct Tui::Impl {
           exit_ok = application->shutdown();
           screen.Exit();
         } else if (confirm_action == ConfirmAction::DeleteQuickSlot) {
-          const auto value = std::to_string(pending_quick_slot) + "|||||";
-          const auto result = application->apply_quick_slot(value);
+          const auto result =
+              application->apply_quick_slot(pending_quick_slot, std::nullopt);
+          cancel_confirm();
           if (!result) {
-            mode = RouteMode::Modal;
-            confirm_action = ConfirmAction::None;
-            edit_value = status_error(result.error());
-            edit_cursor = edit_value.size();
+            set_notice(status_error(result.error()), true);
           } else {
-            mode = RouteMode::Modal;
-            confirm_action = ConfirmAction::None;
-            confirm_accept = false;
             awaiting_quick_save = true;
+            quick_save_modal_id = modal_id;
             modal_title = "F  Deleting quick-send slot...";
           }
         } else if (confirm_action == ConfirmAction::ReplaceQuickTask) {
           const auto result = application->execute_quick(
               pending_quick_slot, pending_quick_interval, true);
           if (!result) {
-            mode = RouteMode::Modal;
-            confirm_action = ConfirmAction::None;
-            edit_value = status_error(result.error());
-            edit_cursor = edit_value.size();
+            cancel_confirm();
+            set_notice(status_error(result.error()), true);
           } else {
             close_overlay();
           }
@@ -1793,8 +2052,34 @@ struct Tui::Impl {
           open_view_root();
         } else if (modal_parent == "G") {
           open_logging_root();
+        } else if (modal_parent == "F-edit") {
+          open_quick_editor();
+        } else if (modal_parent == "f-run") {
+          open_quick_run();
+        } else if (modal_kind == "F-edit" || modal_kind == "f-run") {
+          open_quick_slots(modal_kind == "F-edit");
         } else {
           close_overlay();
+        }
+      } else if (modal_kind == "quick-preview") {
+        if (event == Event::PageDown || event == Event::ArrowDown ||
+            (event.is_mouse() && event.mouse().button == Mouse::WheelDown)) {
+          const auto next = preview_page_end(preview_offset);
+          if (next < quick_preview.size()) {
+            preview_offset = next;
+          }
+        } else if (event == Event::PageUp || event == Event::ArrowUp ||
+                   (event.is_mouse() &&
+                    event.mouse().button == Mouse::WheelUp)) {
+          const auto width = static_cast<std::size_t>(
+              std::clamp(Terminal::Size().dimx - 8, 4, 78));
+          const auto height = static_cast<std::size_t>(
+              std::clamp(Terminal::Size().dimy - 9, 1, 12));
+          preview_offset = utf8_boundary_at_or_before(
+              quick_preview,
+              preview_offset - std::min(preview_offset, width * height));
+        } else if (event == Event::Home) {
+          preview_offset = 0U;
         }
       } else if (action == RoutedAction::Scan) {
         application->request_scan();
@@ -1812,17 +2097,16 @@ struct Tui::Impl {
           ++selected_device;
         }
       } else if (modal_kind == "F" && event == Event::Delete) {
-        const auto slot = quick_slot_from_editor(edit_value);
-        if (!slot) {
-          edit_value = "Select a valid slot number before deleting";
-          edit_cursor = edit_value.size();
-        } else if (!application->snapshot().quick_send.slots[*slot - 1U]) {
-          edit_value = "The selected quick-send slot is already empty";
-          edit_cursor = edit_value.size();
+        const auto slot = static_cast<std::uint32_t>(selected_device + 1U);
+        if (!application->snapshot().quick_send.slots[slot - 1U]) {
+          set_notice("The selected quick-send slot is already empty", true);
         } else {
-          pending_quick_slot = *slot;
+          pending_quick_slot = slot;
           open_confirm(ConfirmAction::DeleteQuickSlot, RouteMode::Modal);
         }
+      } else if (!modal_options.empty() &&
+                 (event == Event::Home || event == Event::End)) {
+        selected_device = event == Event::Home ? 0U : modal_options.size() - 1U;
       } else if (!modal_options.empty() &&
                  (event == Event::ArrowUp || event == Event::ArrowDown)) {
         if (event == Event::ArrowUp && selected_device != 0U) {
@@ -1832,7 +2116,17 @@ struct Tui::Impl {
           ++selected_device;
         }
       } else if (modal_options.empty()) {
-        edit_text(event, modal_input_limit());
+        if (modal_kind == "F-content" && key == "Alt+Enter") {
+          static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
+                                           Utf8EditAction::Insert, "\n",
+                                           modal_input_limit()));
+        } else if (event == Event::Home) {
+          edit_cursor = 0U;
+        } else if (event == Event::End) {
+          edit_cursor = edit_value.size();
+        } else {
+          edit_text(event, modal_input_limit());
+        }
       }
       return true;
     }
@@ -1840,8 +2134,8 @@ struct Tui::Impl {
       if (action == RoutedAction::Escape) {
         close_overlay();
       } else if (action == RoutedAction::End) {
-        scroll_from_bottom = 0U;
         close_overlay();
+        normalize_viewport(true);
       } else if (action == RoutedAction::Apply) {
         run_search();
       } else if (action == RoutedAction::FocusNext ||
@@ -1876,8 +2170,11 @@ struct Tui::Impl {
       if (action == RoutedAction::Escape) {
         close_overlay();
       } else if (action == RoutedAction::Submit) {
-        application->submit_draft();
-        sync_draft_from_application();
+        if (application->submit_draft()) {
+          sync_draft_from_application();
+          // Let Input clear its private selection after a successful admission.
+          static_cast<void>(draft_input->OnEvent(Event::Home));
+        }
       } else if (action == RoutedAction::InsertNewline) {
         const auto cursor = static_cast<std::size_t>(std::max(draft_cursor, 0));
         const auto position = std::min(cursor, draft_input_value.size());
@@ -1902,34 +2199,34 @@ struct Tui::Impl {
       if (action == RoutedAction::Escape) {
         receive_vim_pending.clear();
       } else if (event.is_character() && handle_receive_vim_key(key)) {
-        return true;
+        return !preserve_selection;
       } else if (!receive_vim_pending.empty()) {
         receive_vim_pending.clear();
         return true;
       }
       if (action == RoutedAction::ScrollUp) {
         move_receive_cursor(false, 1U);
-        return true;
+        return false;
       }
       if (action == RoutedAction::ScrollDown) {
         move_receive_cursor(true, 1U);
-        return true;
+        return false;
       }
       if (action == RoutedAction::PageUp) {
         move_receive_cursor(false, 10U);
-        return true;
+        return false;
       }
       if (action == RoutedAction::PageDown) {
         move_receive_cursor(true, 10U);
-        return true;
+        return false;
       }
       if (action == RoutedAction::Home) {
         move_receive_edge(false);
-        return true;
+        return false;
       }
       if (action == RoutedAction::End) {
         move_receive_edge(true);
-        return true;
+        return false;
       }
     }
 
@@ -1977,6 +2274,7 @@ struct Tui::Impl {
       search_focus = SearchFocus::Query;
       search_direction = SearchDirection::All;
       edit_cursor = 0U;
+      normalize_viewport();
       break;
     case RoutedAction::Scan:
       application->request_scan();
@@ -2033,20 +2331,11 @@ struct Tui::Impl {
                " evicted record(s) ...") |
           color(theme::gold));
     }
-    std::vector<std::size_t> indices;
-    if (mode == RouteMode::Search) {
-      const auto filter = search_direction_filter();
-      for (std::size_t index = 0U; index < state.records.size(); ++index) {
-        if (visible(state.records[index], filter)) {
-          indices.push_back(index);
-        }
-      }
-    } else {
-      indices = receive_visible_indices();
-    }
-    std::size_t end = indices.size() > scroll_from_bottom
-                          ? indices.size() - scroll_from_bottom
-                          : 0U;
+    const auto indices = view_indices();
+    std::size_t end = indices.empty() ? 0U
+                      : viewport_anchor
+                          ? nearest_position(indices, *viewport_anchor) + 1U
+                          : indices.size();
     std::size_t begin = end > 200U ? end - 200U : 0U;
     if (mode == RouteMode::ReceiveBrowse && receive_cursor) {
       const auto current = std::ranges::find_if(indices, [&](const auto index) {
@@ -2082,6 +2371,8 @@ struct Tui::Impl {
       if (current) {
         row |= bold;
         row |= inverted;
+      }
+      if (position + 1U == end) {
         row |= focus;
       }
       rows.push_back(std::move(row));
@@ -2185,63 +2476,61 @@ struct Tui::Impl {
     add_direction("ERR", state.filter.error);
 
     Elements fields;
-    fields.push_back(text("Status:") | color(theme::subtle));
-    fields.push_back(text(interaction_text(state.interaction)) |
-                     color(theme::iris) | bold);
-    fields.push_back(divider());
-    fields.push_back(link_element(state.connection));
-    if (terminal_width >= 54) {
-      fields.push_back(divider());
-      const bool locked =
-          state.connection != app::ConnectionState::Disconnected;
-      fields.push_back(text(locked ? "HW:LOCKED" : "HW:UNLOCKED") |
-                       color(locked ? theme::gold : theme::success));
+    int used = 0;
+    bool full = false;
+    const auto add_field = [&](Element field) {
+      field->ComputeRequirement();
+      const auto needed = field->requirement().min_x + (fields.empty() ? 0 : 3);
+      if (full || needed > std::max(terminal_width - 2 - used, 0)) {
+        full = true;
+        return;
+      }
+      if (!fields.empty()) {
+        fields.push_back(divider());
+      }
+      used += needed;
+      fields.push_back(std::move(field));
+    };
+    if (terminal_width < 70) {
+      add_field(text("Link:" + connection_text(state.connection)) |
+                color(state.connection == app::ConnectionState::Connected
+                          ? theme::success
+                          : theme::gold));
+      add_field(
+          text("Log:" + log_text(state.log)) |
+          color(state.log == app::LogState::Error ? theme::love : theme::text) |
+          bold);
+    } else {
+      add_field(link_element(state.connection));
+      add_field(log_element(state.log));
     }
-    if (terminal_width >= 84) {
-      fields.push_back(divider());
-      fields.push_back(status_field(
-          "Port", "P", port,
-          state.device_path.empty() ? theme::love : theme::success));
-    }
-    if (terminal_width >= 104) {
-      fields.push_back(divider());
-      fields.push_back(status_field(
-          "Baud", "B", std::to_string(port_config.baud), theme::success));
-    }
-    if (terminal_width >= 135) {
-      fields.push_back(divider());
-      fields.push_back(
-          status_field("Serial", "D", serial_value, theme::success));
-    }
-    if (terminal_width >= 156) {
-      fields.push_back(divider());
-      fields.push_back(log_element(state.log));
-    }
-    if (terminal_width >= 176) {
-      fields.push_back(divider());
-      fields.push_back(status_field(
-          "NewLine", "N",
-          uppercase_ascii(config::to_string(state.config.send.newline)),
-          theme::success));
-    }
-    if (terminal_width >= 222) {
-      fields.push_back(divider());
-      fields.push_back(status_field(
-          "View", "V",
-          "RX:" +
-              uppercase_ascii(config::to_string(state.config.receive.rx_view)) +
-              " TX:" +
-              uppercase_ascii(config::to_string(state.config.receive.tx_view)) +
-              "/" + visible_directions,
-          theme::success));
-    }
-    if (terminal_width >= 242) {
-      fields.push_back(divider());
-      fields.push_back(status_field(
-          "InputType", "H",
-          uppercase_ascii(config::to_string(state.config.send.mode)),
-          theme::success));
-    }
+    add_field(text("Status:" + interaction_text(state.interaction)) |
+              color(theme::iris) | bold);
+    const bool locked = state.connection != app::ConnectionState::Disconnected;
+    add_field(text(locked ? "HW:LOCKED" : "HW:UNLOCKED") |
+              color(locked ? theme::gold : theme::success));
+    add_field(
+        status_field("Port", "P", port,
+                     state.device_path.empty() ? theme::love : theme::success));
+    add_field(status_field("Baud", "B", std::to_string(port_config.baud),
+                           theme::success));
+    add_field(status_field("Serial", "D", serial_value, theme::success));
+    add_field(status_field(
+        "NewLine", "N",
+        uppercase_ascii(config::to_string(state.config.send.newline)),
+        theme::success));
+    add_field(status_field(
+        "View", "V",
+        "RX:" +
+            uppercase_ascii(config::to_string(state.config.receive.rx_view)) +
+            " TX:" +
+            uppercase_ascii(config::to_string(state.config.receive.tx_view)) +
+            "/" + visible_directions,
+        theme::success));
+    add_field(
+        status_field("InputType", "H",
+                     uppercase_ascii(config::to_string(state.config.send.mode)),
+                     theme::success));
     return hbox(std::move(fields)) | size(HEIGHT, EQUAL, 1);
   }
 
@@ -2303,8 +2592,7 @@ struct Tui::Impl {
         " RXQ:" + std::to_string(state.rx_ingress_bytes / 1024U) + "KiB" +
         " LOGQ:" + std::to_string(state.log_pending) + " | " + task +
         (state.manual_pause ? " | PAUSED" : "") +
-        (scroll_from_bottom != 0U ? " | AWAY" : "") +
-        (mode == RouteMode::Search ? " | SEARCH" : "");
+        (!at_bottom ? " | AWAY" : "") + (search_visible() ? " | SEARCH" : "");
     return panel_background(text(metrics) | color(theme::text),
                             theme::overlay) |
            size(HEIGHT, EQUAL, 1);
@@ -2322,7 +2610,30 @@ struct Tui::Impl {
       actions.push_back(text(" " + std::string{label}) | color(theme::text));
     };
 
-    if (mode == RouteMode::SendEdit) {
+    if (mode == RouteMode::Help) {
+      add_action("Esc/F1", "Return");
+      add_action("Up/Down", "Read");
+    } else if (mode == RouteMode::ErrorDialog) {
+      add_action("Enter/Esc", "Close");
+      add_action("F1", "Help");
+    } else if (mode == RouteMode::Confirm) {
+      add_action("Esc", "Cancel");
+      add_action("Tab", "Choose");
+      add_action("Enter", "Apply");
+    } else if (mode == RouteMode::Search) {
+      add_action("Esc", "Return");
+      add_action("Enter", "Search");
+      if (width >= 70) {
+        add_action("F3", "Next");
+      }
+    } else if (mode == RouteMode::Modal) {
+      add_action("Esc", "Back");
+      add_action(modal_kind == "quick-preview" ? "PgUp/PgDn" : "Enter",
+                 modal_kind == "quick-preview" ? "Read" : "Select");
+      if (width >= 70) {
+        add_action("Tab", "Focus");
+      }
+    } else if (mode == RouteMode::SendEdit) {
       add_action("Enter", "Send");
       add_action("Esc", "Normal");
       if (width >= 70 &&
@@ -2385,8 +2696,10 @@ struct Tui::Impl {
     if (!state.configuration_notice.empty()) {
       content.push_back(text(state.configuration_notice) | color(theme::gold));
     }
-    content.push_back(text(ui_notice.empty() ? state.notice : ui_notice) |
-                      color(theme::muted));
+    content.push_back(
+        text(state.notice +
+             (state.notice_error ? " [Esc in Normal: dismiss]" : "")) |
+        color(state.notice_error ? theme::love : theme::muted));
     content.push_back(metrics_element());
     content.push_back(actions_element());
     auto root = panel_background(
@@ -2403,26 +2716,47 @@ struct Tui::Impl {
 
   [[nodiscard]] Element overlay_element() const {
     if (mode == RouteMode::Help) {
-      return window(text(" LazyCom shortcuts ") | bold,
-                    vbox({text("Normal: C connect/cancel/disconnect, i send "
-                               "edit, R browse"),
-                          text("P/B/D/N/V/H/G/F configuration, g logging, f "
-                               "quick send"),
-                          text("F5 scan, Space pause, / search, X clear, E "
-                               "commands, y copy, q quit"),
-                          text("Copy: y or forwarded Ctrl+C; Ctrl+Shift+C is "
-                               "handled by the terminal"),
-                          text("Send: Enter send, Alt+Enter newline, "
-                               "Alt+Up/Down history"),
-                          text("Receive: j/k, [count]j/k, gg/G, yy; arrows and "
-                               "pages remain available"),
-                          text("SYS is lifecycle TXT; ERR is error TXT; "
-                               "HW:LOCKED protects serial settings"),
-                          text("Search: Enter query, F3 next, Shift+F3 "
-                               "previous, Tab direction, End latest"),
-                          text("F1 toggles this help over every context; Esc "
-                               "restores")})) |
-             size(WIDTH, LESS_THAN, 78) | center;
+      const std::array<std::string, 9> sections{
+          "Normal: C connect/cancel/disconnect, i input, R browse. Esc "
+          "dismisses a notice.",
+          "P/B/D/N/V/H/G/F configure; g logging; f quick send. Quick slots: "
+          "arrows/Home/End select, Enter open.",
+          "F5 scan; Space pause; / search; X clear; E commands; q quit. Help "
+          "never sends data.",
+          "Normal y copies selection; Receive yy copies current record. "
+          "Forwarded Ctrl+C copies selection. Ctrl+Shift+C belongs to the "
+          "terminal; OSC 52 must be supported.",
+          "Input: Enter send; Alt+Enter newline; Alt+Up/Down history; Esc "
+          "Normal. Rejected sends preserve the draft and cursor.",
+          "Receive: j/k, [count]j/k, gg/G, yy; arrows, pages and wheel. Esc "
+          "Normal. Returning to the bottom does not cancel manual pause.",
+          "SYS is lifecycle text; ERR is error text. HW:LOCKED protects serial "
+          "settings. Log:ERROR means logging stopped, not serial failure.",
+          "Search: Enter query; F3/Shift+F3 next/previous; Tab direction; End "
+          "latest; Esc nearest normally visible record.",
+          "F1/Esc restores the source context. Quick payload preview uses "
+          "pages; interval 0 sends once, 10..86400000 ms is best effort, not "
+          "real time."};
+      Elements body;
+      for (std::size_t index = 0U; index < sections.size(); ++index) {
+        auto section = paragraph(sections[index]);
+        if (index == help_line) {
+          section |= focus;
+          section |= bold;
+        }
+        body.push_back(std::move(section));
+        body.push_back(separator());
+      }
+      return window(text(" Help " + std::to_string(help_line + 1U) + "/9 ") |
+                        bold,
+                    vbox({vbox(std::move(body)) | yframe | flex,
+                          hbox({shortcut("Up/Down"), text(" Read  "),
+                                shortcut("F1/Esc"), text(" Return")})})) |
+             size(WIDTH, LESS_THAN,
+                  std::min(78, std::max(Terminal::Size().dimx - 4, 1))) |
+             size(HEIGHT, EQUAL,
+                  std::min(20, std::max(Terminal::Size().dimy - 2, 1))) |
+             center;
     }
     if (mode == RouteMode::Confirm) {
       std::string message;
@@ -2502,12 +2836,38 @@ struct Tui::Impl {
     }
     if (mode == RouteMode::Modal) {
       Elements body;
-      if (modal_options.empty()) {
-        body.push_back(paragraph(edit_value.empty()
-                                     ? "[Input please.]"
-                                     : logging::sanitize_message(edit_value)) |
-                       inverted);
+      if (modal_kind == "quick-preview") {
+        body.push_back(text(quick_preview_summary) | color(theme::gold));
+        const auto end = preview_page_end(preview_offset, &body);
+        body.push_back(text("Preview " + std::to_string(preview_offset) + ".." +
+                            std::to_string(end) + "/" +
+                            std::to_string(quick_preview.size())) |
+                       dim);
+        body.push_back(text("PgUp/PgDn read | Home first | Esc back") | bold);
+      } else if (modal_options.empty()) {
+        const auto cursor = utf8_boundary_at_or_before(edit_value, edit_cursor);
+        const auto begin = utf8_boundary_at_or_before(
+            edit_value, cursor - std::min(cursor, std::size_t{64U}));
+        const auto end = utf8_boundary_at_or_before(
+            edit_value, std::min(edit_value.size(), cursor + 64U));
+        body.push_back(
+            paragraph(
+                (begin == 0U ? "" : "...") +
+                logging::sanitize_message(std::string_view{edit_value}.substr(
+                    begin, cursor - begin)) +
+                "|" +
+                logging::sanitize_message(
+                    std::string_view{edit_value}.substr(cursor, end - cursor)) +
+                (end == edit_value.size() ? "" : "...")) |
+            inverted);
+        body.push_back(text("Cursor " + std::to_string(cursor) + "/" +
+                            std::to_string(edit_value.size()) + " bytes") |
+                       dim);
       } else {
+        if (modal_kind == "f-run") {
+          body.push_back(text(quick_preview_summary) | color(theme::gold));
+          body.push_back(paragraph(short_value(quick_preview)));
+        }
         if (modal_kind == "P" && application->snapshot().scanning) {
           body.push_back(text("Scanning...") | color(theme::gold));
         }
@@ -2525,20 +2885,34 @@ struct Tui::Impl {
           if (index == selected_device) {
             item |= bold;
             item |= inverted;
+            item |= focus;
           }
           body.push_back(std::move(item));
         }
       }
       body.push_back(separator());
-      body.push_back(text("Enter apply | Esc cancel | F1 help") | dim);
+      if (modal_kind != "quick-preview") {
+        body.push_back(text("Enter apply | Esc back | F1 help") | dim);
+      }
       return window(text(" " + modal_title + " ") | bold,
-                    vbox(std::move(body))) |
-             size(WIDTH, LESS_THAN, 88) | size(HEIGHT, LESS_THAN, 20) | center;
+                    vbox(std::move(body)) | yframe) |
+             size(WIDTH, LESS_THAN,
+                  std::min(88, std::max(Terminal::Size().dimx - 4, 1))) |
+             size(HEIGHT, LESS_THAN,
+                  std::min(20, std::max(Terminal::Size().dimy - 2, 1))) |
+             center;
     }
     return text("");
   }
 
   [[nodiscard]] Element render() const {
+    if (Terminal::Size().dimx < 40 || Terminal::Size().dimy < 12) {
+      return panel_background(
+          paragraph(
+              "Resize terminal to at least 40x12; serial activity continues.") |
+              color(theme::gold),
+          theme::base);
+    }
     auto base = main_element();
     if (mode == RouteMode::Normal || mode == RouteMode::SendEdit ||
         mode == RouteMode::ReceiveBrowse) {

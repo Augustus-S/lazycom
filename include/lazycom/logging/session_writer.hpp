@@ -1,5 +1,6 @@
 #pragma once
 
+#include <lazycom/app/signals.hpp>
 #include <lazycom/base/error.hpp>
 #include <lazycom/logging/schema.hpp>
 
@@ -169,8 +170,24 @@ public:
    */
   [[nodiscard]] std::future<BarrierResult> barrier(std::uint64_t target_seq);
   /**
+   * @brief Permanently closes admission and wakes the worker without
+   * allocation.
+   * @note Idempotent, independent of queue capacity, and does not wait for I/O.
+   * Accepted commands drain before final flush/close and return-point
+   * publication.
+   */
+  void request_stop() noexcept;
+  /**
+   * @return The first fixed worker fatal signal, or nullopt.
+   * @note Fatal cleanup retains the filesystem until destruction because its
+   * virtual close contract does not guarantee allocation-free cleanup.
+   */
+  [[nodiscard]] std::optional<app::FatalSignal> fatal_signal() const noexcept;
+  /**
    * @brief Permanently stops admission and drains the worker to its return
    * point.
+   * @note This allocating API retains snapshot results for repeated requests;
+   * future readiness is not proof of the worker return point.
    * @warning Destruction waits for the worker without an internal deadline.
    * Deadline-sensitive owners must enforce wait_until_stopped() before destroy.
    */
@@ -179,6 +196,7 @@ public:
    * @brief Waits for the worker return point without requesting stop or
    * joining.
    * @param deadline Absolute steady-clock deadline.
+   * @note An expired deadline performs only an atomic query and clock check.
    */
   [[nodiscard]] bool wait_until_stopped(
       std::chrono::steady_clock::time_point deadline) const noexcept;

@@ -65,6 +65,8 @@ struct ApplicationSnapshot {
   std::string device_path;
   std::string draft;
   std::string notice;
+  std::uint64_t notice_revision{};
+  bool notice_error{};
   std::string configuration_notice;
   std::vector<serial::DeviceInfo> devices;
   std::deque<VisibleRecord> records;
@@ -172,8 +174,9 @@ public:
    * @brief Parses and attempts to admit the complete draft for transmission.
    * @note Validation or admission failure preserves the draft. Serial-service
    * admission records history and clears it immediately, before terminal TX.
+   * @return true only when serial-service admission succeeded, not terminal TX.
    */
-  void submit_draft();
+  bool submit_draft();
   void history_previous();
   void history_next();
   /** @brief Starts the asynchronous log-state transition for the current state.
@@ -183,6 +186,11 @@ public:
   void clear_records();
   void dismiss_alert() noexcept;
   void publish_alert(UserAlert alert);
+  /** @brief Publishes a safe notice; successes never replace an error and
+   * expire after three seconds. New errors replace earlier errors. */
+  void publish_notice(std::string message, bool error = false);
+  /** @brief Acknowledges the current notice without allocation. */
+  void dismiss_notice() noexcept;
   void publish_permission_alert(std::string_view path,
                                 const serial::DevicePermission &permission);
 
@@ -204,8 +212,8 @@ public:
   /**
    * @brief Applies the complete logging-settings candidate.
    * @note Status success means validation and save admission, not durable
-   * commit. NextSession preserves an active file; RotateNow closes and restarts
-   * it.
+   * commit. Rejection of persistence does not undo runtime settings.
+   * NextSession preserves an active file; RotateNow closes and restarts it.
    */
   [[nodiscard]] Status
   apply_logging(std::string_view value,
@@ -215,9 +223,13 @@ public:
   [[nodiscard]] Status validate_logging(std::string_view value) const;
   /**
    * @brief Validates and asynchronously saves one complete quick-send slot.
+   * @param index User-facing slot number, 1 through 20.
+   * @param slot Complete candidate with matching index, or nullopt to delete.
    * @note Visible quick-send state changes only after a committed completion.
    */
-  [[nodiscard]] Status apply_quick_slot(std::string_view value);
+  [[nodiscard]] Status
+  apply_quick_slot(std::uint32_t index,
+                   std::optional<config::QuickSendSlot> slot);
   /**
    * @brief Starts one-shot or periodic execution from an immutable slot
    * snapshot.
@@ -265,7 +277,7 @@ private:
   [[nodiscard]] OperationId issue_operation();
   [[nodiscard]] ConnectionGeneration issue_connection_generation();
   [[nodiscard]] ScanGeneration issue_scan_generation();
-  void set_notice(std::string message);
+  void set_notice(std::string message, bool error = true);
   [[nodiscard]] bool operations_allowed() const noexcept;
   [[nodiscard]] Status operation_rejected() const;
   void start_connection();
@@ -273,7 +285,7 @@ private:
   void request_disconnect();
   void request_cancel_connect();
   void retry_cancel_race_disconnect();
-  void process_serial_data();
+  bool process_serial_data();
   void process_serial_completions();
   void process_scan_completions();
   void process_log_commands();
@@ -284,19 +296,25 @@ private:
   void begin_log_session();
   void end_log_session(ConnectionGeneration generation, SessionId session_id);
   void start_log_rollover_if_needed();
-  void enqueue_record(RecordDirection direction,
-                      std::span<const std::byte> payload,
-                      std::string message = {},
-                      std::optional<ErrorCode> error_code = std::nullopt,
-                      std::optional<OperationId> operation = std::nullopt,
-                      SessionEventOrigin origin = SessionEventOrigin::Normal);
+  void
+  enqueue_record(RecordDirection direction, std::span<const std::byte> payload,
+                 std::string message = {},
+                 std::optional<ErrorCode> error_code = std::nullopt,
+                 std::optional<OperationId> operation = std::nullopt,
+                 SessionEventOrigin origin = SessionEventOrigin::Normal,
+                 std::chrono::steady_clock::time_point observed_at =
+                     std::chrono::steady_clock::now(),
+                 std::chrono::system_clock::time_point time_utc =
+                     std::chrono::system_clock::now(),
+                 std::optional<config::SendMode> input_mode = std::nullopt);
   void enqueue_frames(std::vector<framing::RxFrame> frames,
                       SessionEventOrigin origin);
-  [[nodiscard]] bool submit_tx(std::vector<std::byte> payload,
-                               std::optional<TaskGeneration> task_generation,
-                               std::optional<scheduler::ScheduledRequestToken>
-                                   scheduled_token = std::nullopt);
-  void save_config();
+  [[nodiscard]] bool
+  submit_tx(std::vector<std::byte> payload, config::SendMode input_mode,
+            std::optional<TaskGeneration> task_generation,
+            std::optional<scheduler::ScheduledRequestToken> scheduled_token =
+                std::nullopt);
+  Status save_config();
   void save_state();
   void update_worker_state();
   void enter_fatal_stopping(const FatalSignal &signal) noexcept;
@@ -351,12 +369,18 @@ private:
   std::uint64_t next_record_id_{1U};
   std::uint64_t next_sequence_{1U};
   std::chrono::steady_clock::time_point session_started_{};
+  std::chrono::system_clock::time_point session_started_utc_{};
+  std::optional<std::chrono::steady_clock::time_point> notice_deadline_;
+  std::string fatal_notice_{
+      "Fatal worker signal; emergency shutdown requested"};
+  std::optional<std::chrono::steady_clock::time_point> writer_stop_deadline_;
   std::optional<PendingLogCommand> log_command_;
   std::deque<PendingLogRecord> log_backlog_;
   std::size_t log_backlog_bytes_{};
   std::optional<LogSessionOwner> restart_log_owner_;
   std::optional<LogSessionOwner> processed_cleanup_;
-  std::deque<serial::DisconnectCompletion> deferred_disconnect_completions_;
+  std::optional<LogSessionOwner> closed_log_owner_;
+  std::optional<serial::DisconnectCompletion> deferred_disconnect_completion_;
   std::array<std::optional<std::future<config::SaveCompletion>>, 3>
       save_completions_;
   std::optional<config::QuickSendSnapshot> pending_quick_send_;
@@ -370,7 +394,6 @@ private:
   bool cancel_race_disconnect_pending_{};
   MainThreadFatalGuard fatal_guard_;
   WorkerLifecycleRegistry workers_;
-  std::optional<std::future<logging::SessionCommandResult>> fatal_log_shutdown_;
   bool stopped_{};
 };
 

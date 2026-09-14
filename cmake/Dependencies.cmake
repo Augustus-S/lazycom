@@ -92,6 +92,24 @@ else()
     )
   endif()
 
+  # Use the shipped Autotools outputs even when checkout timestamps put their
+  # inputs later. Regeneration would require the upstream maintainer toolchain
+  # and modify the shared vendored source tree, including during make install.
+  set(lazycom_libserialport_make "${LAZYCOM_MAKE_EXECUTABLE}")
+  set(lazycom_libserialport_recursive_flags "")
+  foreach(lazycom_generated_file IN ITEMS
+      aclocal.m4 configure Makefile.in config.h.in)
+    set(lazycom_old_file
+      "--old-file=${PROJECT_SOURCE_DIR}/third_party/libserialport/${lazycom_generated_file}"
+    )
+    list(APPEND lazycom_libserialport_make "${lazycom_old_file}")
+    string(REPLACE "'" "'\\''" lazycom_old_file "${lazycom_old_file}")
+    string(APPEND lazycom_libserialport_recursive_flags " '${lazycom_old_file}'")
+  endforeach()
+  # GNU Make does not propagate --old-file through MAKEFLAGS to sub-makes.
+  list(APPEND lazycom_libserialport_make
+    "AM_MAKEFLAGS=${lazycom_libserialport_recursive_flags}")
+
   ExternalProject_Add(lazycom_libserialport_external
     SOURCE_DIR "${PROJECT_SOURCE_DIR}/third_party/libserialport"
     BINARY_DIR "${CMAKE_BINARY_DIR}/_deps/libserialport-build"
@@ -104,8 +122,8 @@ else()
       "--libdir=${LAZYCOM_LIBSERIALPORT_PREFIX}/lib"
       --enable-shared
       --disable-static
-    BUILD_COMMAND "${LAZYCOM_MAKE_EXECUTABLE}"
-    INSTALL_COMMAND "${LAZYCOM_MAKE_EXECUTABLE}" install
+    BUILD_COMMAND ${lazycom_libserialport_make}
+    INSTALL_COMMAND ${lazycom_libserialport_make} install
     BUILD_BYPRODUCTS "${LAZYCOM_LIBSERIALPORT_LIBRARY}"
   )
 

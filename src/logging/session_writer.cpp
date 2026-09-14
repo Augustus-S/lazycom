@@ -993,7 +993,11 @@ struct SessionWriter::Impl {
         options.quotas.max_file_bytes > options.quotas.max_total_bytes) {
       throw std::invalid_argument{"invalid session writer options"};
     }
-    worker = std::jthread{[this] { run(); }};
+    worker = std::jthread{[this] {
+      run();
+      stopped_ready.store(true, std::memory_order_release);
+      condition.notify_all();
+    }};
   }
 
   [[nodiscard]] SessionCommandResult command_result_locked() const {
@@ -1179,6 +1183,7 @@ struct SessionWriter::Impl {
     processed.store(0U, std::memory_order_release);
     bytes_since_flush = encoded->size();
     next_flush = std::chrono::steady_clock::now() + options.flush_interval;
+    auto path = file_system->active_path();
     bool cancelled = false;
     {
       std::scoped_lock lock{mutex};
@@ -1186,7 +1191,7 @@ struct SessionWriter::Impl {
       cancelled =
           state.load(std::memory_order_acquire) != SessionLogState::Waiting;
       if (!cancelled) {
-        active_file = file_system->active_path();
+        active_file = std::move(path);
         last_enqueued_seq = 0U;
         terminal_error.reset();
         state.store(SessionLogState::Recording, std::memory_order_release);
@@ -1272,7 +1277,7 @@ struct SessionWriter::Impl {
     ++pending_barrier_promises;
   }
 
-  [[nodiscard]] bool handle(ShutdownItem &item) {
+  void finish_stop() {
     observe_overload();
     if (worker_active) {
       static_cast<void>(flush_active());
@@ -1290,13 +1295,24 @@ struct SessionWriter::Impl {
         state.store(SessionLogState::Off, std::memory_order_release);
       }
     }
-    fulfill(item.promise, command_result());
-    return true;
+  }
+
+  void publish_fatal(app::FatalReason reason) noexcept {
+    static_cast<void>(
+        fatal.publish({reason == app::FatalReason::OutOfMemory
+                           ? ErrorCode::InternalOutOfMemory
+                           : ErrorCode::InternalInvariantBroken,
+                       Operation::WriteSessionLog, app::WorkerKind::SessionLog,
+                       reason, app::SignalSourceLocation::current()}));
   }
 
   void fail_worker(Item *current) noexcept {
     state.store(SessionLogState::Error, std::memory_order_release);
-    static_cast<void>(file_system->close());
+    // The virtual close contract is noexcept, not allocation-free. Leave the
+    // filesystem owned by Impl on fatal paths; the owner enforces its deadline.
+    if (!fatal.load()) {
+      static_cast<void>(file_system->close());
+    }
     worker_active = false;
     const auto command = failed_command_result();
     const auto complete_item = [this, &command](Item &item) noexcept {
@@ -1321,6 +1337,7 @@ struct SessionWriter::Impl {
       complete_item(*current);
     }
     std::scoped_lock lock{mutex};
+    stopping = true;
     worker_failed = true;
     start_pending = false;
     close_pending = false;
@@ -1352,15 +1369,17 @@ struct SessionWriter::Impl {
     try {
       while (true) {
         item.reset();
+        bool stop_when_empty = false;
         {
           std::unique_lock lock{mutex};
           if (worker_active && bytes_since_flush != 0U) {
             condition.wait_until(lock, next_flush, [this] {
-              return !items.empty() || overloaded;
+              return stopping || !items.empty() || overloaded;
             });
           } else {
-            condition.wait(lock,
-                           [this] { return !items.empty() || overloaded; });
+            condition.wait(lock, [this] {
+              return stopping || !items.empty() || overloaded;
+            });
           }
           if (!items.empty()) {
             item.emplace(std::move(items.front()));
@@ -1368,10 +1387,16 @@ struct SessionWriter::Impl {
               --queued_control_count;
             }
             items.pop_front();
+          } else {
+            stop_when_empty = stopping;
           }
         }
         observe_overload();
         if (!item) {
+          if (stop_when_empty) {
+            finish_stop();
+            break;
+          }
           if (worker_active && bytes_since_flush != 0U &&
               std::chrono::steady_clock::now() >= next_flush) {
             static_cast<void>(flush_active());
@@ -1383,7 +1408,9 @@ struct SessionWriter::Impl {
             [this, &stop](auto &value) {
               using Value = std::remove_cvref_t<decltype(value)>;
               if constexpr (std::is_same_v<Value, ShutdownItem>) {
-                stop = handle(value);
+                finish_stop();
+                fulfill(value.promise, command_result());
+                stop = true;
               } else {
                 handle(value);
               }
@@ -1394,14 +1421,25 @@ struct SessionWriter::Impl {
         }
         item.reset();
       }
+    } catch (const std::bad_alloc &) {
+      publish_fatal(app::FatalReason::OutOfMemory);
+      fail_worker(item ? &*item : nullptr);
+    } catch (const std::logic_error &) {
+      publish_fatal(app::FatalReason::InvariantBroken);
+      fail_worker(item ? &*item : nullptr);
+    } catch (const std::exception &) {
+      try {
+        set_error(log_error("session log filesystem exception"));
+      } catch (const std::bad_alloc &) {
+        publish_fatal(app::FatalReason::OutOfMemory);
+      } catch (...) {
+        publish_fatal(app::FatalReason::ErrorAdaptationFailed);
+      }
+      fail_worker(item ? &*item : nullptr);
     } catch (...) {
+      publish_fatal(app::FatalReason::UnknownException);
       fail_worker(item ? &*item : nullptr);
     }
-    {
-      std::scoped_lock lock{mutex};
-      stopped_ready = true;
-    }
-    condition.notify_all();
   }
 
   SessionWriterOptions options;
@@ -1431,7 +1469,8 @@ struct SessionWriter::Impl {
   bool start_pending{};
   bool close_pending{};
   bool disable_pending{};
-  bool stopped_ready{};
+  std::atomic<bool> stopped_ready{};
+  app::FatalSignalSlot fatal;
 };
 
 SessionWriter::SessionWriter(SessionWriterOptions options,
@@ -1443,8 +1482,9 @@ SessionWriter::~SessionWriter() {
   if (!impl_) {
     return;
   }
-  auto completion = shutdown();
-  completion.wait();
+  request_stop();
+  static_cast<void>(
+      wait_until_stopped(std::chrono::steady_clock::time_point::max()));
   if (impl_->worker.joinable()) {
     impl_->worker.join();
   }
@@ -1626,23 +1666,39 @@ std::future<SessionCommandResult> SessionWriter::shutdown() {
     if (impl_->stopping || impl_->worker_failed) {
       return ready_future(impl_->command_result_locked());
     }
-    impl_->stopping = true;
     impl_->items.emplace_back(std::move(item));
+    impl_->stopping = true;
     ++impl_->queued_control_count;
   }
   impl_->condition.notify_one();
   return future;
 }
 
+void SessionWriter::request_stop() noexcept {
+  {
+    // Use the wait predicate's mutex so notification cannot be lost between
+    // checking the predicate and sleeping. Never called while holding it.
+    std::scoped_lock lock{impl_->mutex};
+    impl_->stopping = true;
+  }
+  impl_->condition.notify_all();
+}
+
+std::optional<app::FatalSignal> SessionWriter::fatal_signal() const noexcept {
+  return impl_->fatal.load();
+}
+
 bool SessionWriter::wait_until_stopped(
     const std::chrono::steady_clock::time_point deadline) const noexcept {
-  try {
-    std::unique_lock lock{impl_->mutex};
-    return impl_->condition.wait_until(lock, deadline,
-                                       [this] { return impl_->stopped_ready; });
-  } catch (...) {
-    return false;
+  while (!impl_->stopped_ready.load(std::memory_order_acquire)) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_until(
+        std::min(deadline, now + std::chrono::milliseconds{1}));
   }
+  return true;
 }
 
 SessionLogState SessionWriter::state() const noexcept {

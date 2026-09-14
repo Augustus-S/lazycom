@@ -44,6 +44,7 @@ struct ConnectRequest {
 struct TxRequest {
   app::SendCommand command;
   std::vector<std::byte> payload;
+  config::SendMode input_mode{config::SendMode::Txt};
 };
 
 struct ConnectCompletion {
@@ -52,6 +53,9 @@ struct ConnectCompletion {
   std::optional<SessionId> session_id;
   app::OperationOutcome outcome{app::OperationOutcome::Succeeded};
   std::optional<Error> error;
+  /** @brief Paired owner observations of successful session establishment. */
+  std::chrono::steady_clock::time_point observed_at{};
+  std::chrono::system_clock::time_point time_utc{};
 };
 
 struct TxCompletion {
@@ -96,6 +100,10 @@ struct SerialDataEvent {
   std::optional<OperationId> operation_id;
   std::vector<std::byte> bytes;
   std::optional<Error> error;
+  /** @brief RX read, last positive TX write, or lifecycle observation time. */
+  std::chrono::steady_clock::time_point observed_at{};
+  std::chrono::system_clock::time_point time_utc{};
+  std::optional<config::SendMode> input_mode{};
 };
 
 struct SerialOverflowSignal {

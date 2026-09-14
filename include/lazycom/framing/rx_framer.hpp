@@ -12,6 +12,7 @@ using ObservationClock = std::chrono::steady_clock;
 struct RxFrame {
   std::vector<std::byte> bytes;
   ObservationClock::time_point first_byte_observed_at{};
+  std::chrono::system_clock::time_point first_byte_observed_utc{};
   bool operator==(const RxFrame &) const = default;
 };
 
@@ -44,12 +45,14 @@ public:
    * @brief Appends bytes observed at one monotonic time point.
    * @param bytes Bytes to copy into the framer.
    * @param observed_at Observation time shared by this chunk.
+   * @param observed_utc Paired UTC observation; defaults to epoch for models.
    * @return Frames completed by a prior idle gap, delimiters, or size limits.
    * Empty input is a no-op and does not trigger idle processing.
    */
   [[nodiscard]] std::vector<RxFrame>
   push(std::span<const std::byte> bytes,
-       ObservationClock::time_point observed_at);
+       ObservationClock::time_point observed_at,
+       std::chrono::system_clock::time_point observed_utc = {});
   /**
    * @brief Emits a pending frame when the inclusive idle deadline has elapsed.
    */
@@ -72,11 +75,13 @@ public:
 private:
   void emit(std::vector<RxFrame> &output);
   void consume(std::byte byte, ObservationClock::time_point observed_at,
+               std::chrono::system_clock::time_point observed_utc,
                std::vector<RxFrame> &output);
 
   RxFramerConfig config_;
   std::vector<std::byte> bytes_;
   ObservationClock::time_point first_byte_observed_at_{};
+  std::chrono::system_clock::time_point first_byte_observed_utc_{};
   ObservationClock::time_point last_read_observed_at_{};
   bool has_last_read_{};
   bool pending_cr_{};
