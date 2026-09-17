@@ -38,7 +38,7 @@ target_link_libraries(lazycom_tests
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/third_party/catch2/extras")
 include(Catch)
-catch_discover_tests(lazycom_tests)
+catch_discover_tests(lazycom_tests ADD_TAGS_AS_LABELS)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   if(NOT LAZYCOM_USE_SYSTEM_LIBSERIALPORT)
@@ -70,6 +70,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       lazycom_project_warnings
   )
   catch_discover_tests(lazycom_serial_backend_viability_tests
-    PROPERTIES LABELS "integration;serial"
+    ADD_TAGS_AS_LABELS
   )
 endif()

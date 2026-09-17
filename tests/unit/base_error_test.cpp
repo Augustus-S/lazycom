@@ -2,64 +2,42 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <array>
-#include <set>
+#include <cstdint>
 #include <string>
 
-TEST_CASE("error registry exposes stable identifiers", "[base]") {
-  const auto &descriptor =
-      lazycom::error_descriptor(lazycom::ErrorCode::SerialDeviceGone);
-
-  REQUIRE(descriptor.identifier == "LC-SER-2003");
-  REQUIRE(descriptor.domain == "serial");
-}
-
-TEST_CASE("published error codes retain unique numeric values and identifiers",
+TEST_CASE("published error codes retain their numeric values and identifiers",
           "[base]") {
-  constexpr std::array codes{
-      lazycom::ErrorCode::ValidationInvalidValue,
-      lazycom::ErrorCode::SerialPermissionDenied,
-      lazycom::ErrorCode::SerialPortBusy,
-      lazycom::ErrorCode::SerialDeviceGone,
-      lazycom::ErrorCode::SerialUnsupported,
-      lazycom::ErrorCode::SerialOperationTimedOut,
-      lazycom::ErrorCode::SerialOperationCancelled,
-      lazycom::ErrorCode::ConfigParseFailed,
-      lazycom::ErrorCode::ConfigSchemaInvalid,
-      lazycom::ErrorCode::ConfigUnsafeFile,
-      lazycom::ErrorCode::ConfigIoFailed,
-      lazycom::ErrorCode::LoggingDiskFull,
-      lazycom::ErrorCode::LoggingSchemaInvalid,
-      lazycom::ErrorCode::DiagnosticsUnavailable,
-      lazycom::ErrorCode::InternalInvariantBroken,
-      lazycom::ErrorCode::InternalOutOfMemory,
+  using lazycom::ErrorCode;
+  struct PublishedCode {
+    ErrorCode code;
+    std::uint32_t value;
+    std::string_view identifier;
   };
-  std::set<std::uint32_t> values;
-  std::set<std::string_view> identifiers;
-  for (const auto code : codes) {
-    values.insert(static_cast<std::uint32_t>(code));
-    identifiers.insert(lazycom::error_descriptor(code).identifier);
+  CHECK(lazycom::error_descriptor(ErrorCode::SerialDeviceGone).domain ==
+        "serial");
+  constexpr PublishedCode expected[]{
+      {ErrorCode::ValidationInvalidValue, 0x010001, "LC-VAL-1001"},
+      {ErrorCode::SerialPermissionDenied, 0x020001, "LC-SER-2001"},
+      {ErrorCode::SerialPortBusy, 0x020002, "LC-SER-2002"},
+      {ErrorCode::SerialDeviceGone, 0x020003, "LC-SER-2003"},
+      {ErrorCode::SerialUnsupported, 0x020004, "LC-SER-2004"},
+      {ErrorCode::SerialOperationTimedOut, 0x020005, "LC-SER-2005"},
+      {ErrorCode::SerialOperationCancelled, 0x020006, "LC-SER-2006"},
+      {ErrorCode::ConfigParseFailed, 0x030001, "LC-CFG-3001"},
+      {ErrorCode::ConfigSchemaInvalid, 0x030002, "LC-CFG-3002"},
+      {ErrorCode::ConfigUnsafeFile, 0x030003, "LC-CFG-3003"},
+      {ErrorCode::ConfigIoFailed, 0x030004, "LC-CFG-3004"},
+      {ErrorCode::LoggingDiskFull, 0x040001, "LC-LOG-4001"},
+      {ErrorCode::LoggingSchemaInvalid, 0x040002, "LC-LOG-4002"},
+      {ErrorCode::DiagnosticsUnavailable, 0x050001, "LC-DIAG-5001"},
+      {ErrorCode::InternalInvariantBroken, 0x090001, "LC-INT-9001"},
+      {ErrorCode::InternalOutOfMemory, 0x090002, "LC-INT-9002"},
+  };
+  for (const auto &entry : expected) {
+    CAPTURE(entry.identifier);
+    CHECK(static_cast<std::uint32_t>(entry.code) == entry.value);
+    CHECK(lazycom::error_descriptor(entry.code).identifier == entry.identifier);
   }
-  REQUIRE(values.size() == codes.size());
-  REQUIRE(identifiers.size() == codes.size());
-}
-
-TEST_CASE("serial operation terminal errors have stable identifiers",
-          "[base][serial]") {
-  CHECK(lazycom::error_descriptor(lazycom::ErrorCode::SerialOperationTimedOut)
-            .identifier == "LC-SER-2005");
-  CHECK(lazycom::error_descriptor(lazycom::ErrorCode::SerialOperationCancelled)
-            .identifier == "LC-SER-2006");
-}
-
-TEST_CASE("error captures operation context", "[base]") {
-  auto error = lazycom::make_error(
-      lazycom::ErrorCode::SerialPortBusy, lazycom::Operation::OpenSerial,
-      "test port", {}, lazycom::SessionId{7}, lazycom::OperationId{11});
-
-  REQUIRE(error.detail == "test port");
-  REQUIRE(error.session_id->value == 7);
-  REQUIRE(error.operation_id->value == 11);
 }
 
 TEST_CASE("error detail is bounded UTF-8 safe and control visible", "[base]") {

@@ -2,14 +2,11 @@
 #include <lazycom/base/ids.hpp>
 #include <lazycom/diagnostics/diagnostics.hpp>
 
-#include <support/fake_clock.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
-#include <barrier>
-#include <chrono>
 #include <cstdint>
+#include <latch>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -20,79 +17,51 @@
 using namespace lazycom;
 using namespace lazycom::app;
 
-TEST_CASE("strong identifiers advance without wrapping", "[ids]") {
+static_assert([] {
   ConnectionGeneration generation{41};
-  REQUIRE(increment_id(generation) == IdIncrementResult::Advanced);
-  REQUIRE(generation.value == 42);
-
   OperationId maximum{std::numeric_limits<std::uint64_t>::max()};
-  REQUIRE(increment_id(maximum) == IdIncrementResult::Overflow);
-  REQUIRE(maximum.value == std::numeric_limits<std::uint64_t>::max());
-
-  IdSequence<TaskGeneration> sequence{
-      TaskGeneration{std::numeric_limits<std::uint64_t>::max()}};
+  IdSequence<TaskGeneration> sequence{TaskGeneration{maximum.value}};
   TaskGeneration issued{9};
-  REQUIRE(sequence.issue(issued) == IdIncrementResult::Overflow);
-  REQUIRE(issued == TaskGeneration{9});
-}
+  return increment_id(generation) == IdIncrementResult::Advanced &&
+         generation.value == 42 &&
+         increment_id(maximum) == IdIncrementResult::Overflow &&
+         maximum.value == std::numeric_limits<std::uint64_t>::max() &&
+         sequence.issue(issued) == IdIncrementResult::Overflow &&
+         issued == TaskGeneration{9};
+}());
+static_assert(std::is_trivially_copyable_v<FatalSignal>);
+static_assert(std::is_trivially_copyable_v<WorkerStoppedSignal>);
+static_assert(sizeof(FatalSignal) <= 64);
+static_assert(noexcept(lazycom::diagnostics::emergency_write()));
+static_assert(noexcept(lazycom::diagnostics::install_terminate_handler()));
 
-TEST_CASE("fake clock advances deterministically without sleeping",
-          "[support]") {
-  lazycom::test::FakeClock clock;
-  const auto start = clock.now();
-  clock.advance(std::chrono::milliseconds{125});
-  REQUIRE(clock.now() - start == std::chrono::milliseconds{125});
-}
-
-TEST_CASE("fatal and stopped signals are fixed trivial values", "[signals]") {
-  STATIC_REQUIRE(std::is_trivially_copyable_v<FatalSignal>);
-  STATIC_REQUIRE(std::is_trivially_copyable_v<WorkerStoppedSignal>);
-  STATIC_REQUIRE(sizeof(FatalSignal) <= 64);
-  STATIC_REQUIRE(noexcept(lazycom::diagnostics::emergency_write()));
-  STATIC_REQUIRE(noexcept(lazycom::diagnostics::install_terminate_handler()));
-}
-
-TEST_CASE("first fatal signal wins without using a dynamic queue",
+TEST_CASE("concurrent and later fatal publishers preserve exactly one winner",
           "[signals]") {
-  FatalSignalSlot slot;
-  const FatalSignal first{ErrorCode::InternalOutOfMemory,
-                          Operation::SaveConfig,
-                          WorkerKind::Persistence,
-                          FatalReason::OutOfMemory,
-                          {}};
-  const FatalSignal second{ErrorCode::InternalInvariantBroken,
-                           Operation::ReadSerial,
-                           WorkerKind::Serial,
-                           FatalReason::InvariantBroken,
-                           {}};
-
-  REQUIRE(slot.publish(first));
-  REQUIRE_FALSE(slot.publish(second));
-  REQUIRE(slot.load());
-  REQUIRE(slot.load()->worker == WorkerKind::Persistence);
-  REQUIRE(slot.load()->code == ErrorCode::InternalOutOfMemory);
-  REQUIRE(slot.additional_count() == 1);
-}
-
-TEST_CASE("concurrent fatal publishers have exactly one winner", "[signals]") {
   constexpr std::size_t publisher_count = 16U;
   FatalSignalSlot slot;
-  std::barrier start{static_cast<std::ptrdiff_t>(publisher_count)};
+  std::latch start{1};
   std::atomic<std::size_t> winners{0U};
   std::vector<std::jthread> publishers;
   publishers.reserve(publisher_count);
-  for (std::size_t index = 0U; index < publisher_count; ++index) {
-    publishers.emplace_back([&, index] {
-      start.arrive_and_wait();
-      const auto source =
-          SignalSourceLocation{"concurrent", "publisher",
-                               static_cast<std::uint_least32_t>(index), 0U};
-      if (slot.publish({ErrorCode::InternalInvariantBroken,
-                        Operation::CoordinateFatal, WorkerKind::Serial,
-                        FatalReason::InvariantBroken, source})) {
-        winners.fetch_add(1U, std::memory_order_relaxed);
-      }
-    });
+  {
+    // Release already-created threads even if a later thread cannot be created.
+    struct ReleaseStart {
+      std::latch &start;
+      ~ReleaseStart() { start.count_down(); }
+    } release{start};
+    for (std::size_t index = 0U; index < publisher_count; ++index) {
+      publishers.emplace_back([&, index] {
+        start.wait();
+        const auto source =
+            SignalSourceLocation{"concurrent", "publisher",
+                                 static_cast<std::uint_least32_t>(index), 0U};
+        if (slot.publish({ErrorCode::InternalInvariantBroken,
+                          Operation::CoordinateFatal, WorkerKind::Serial,
+                          FatalReason::InvariantBroken, source})) {
+          winners.fetch_add(1U, std::memory_order_relaxed);
+        }
+      });
+    }
   }
   publishers.clear();
 
@@ -100,6 +69,14 @@ TEST_CASE("concurrent fatal publishers have exactly one winner", "[signals]") {
   REQUIRE(slot.load().has_value());
   REQUIRE(slot.load()->source.line < publisher_count);
   REQUIRE(slot.additional_count() == publisher_count - 1U);
+  CHECK_FALSE(slot.publish({ErrorCode::InternalOutOfMemory,
+                            Operation::SaveConfig,
+                            WorkerKind::Persistence,
+                            FatalReason::OutOfMemory,
+                            {}}));
+  CHECK(slot.load()->worker == WorkerKind::Serial);
+  CHECK(slot.load()->code == ErrorCode::InternalInvariantBroken);
+  CHECK(slot.additional_count() == publisher_count);
 }
 
 TEST_CASE("worker trampoline separates normal exceptions from fatal failures",

@@ -1,6 +1,7 @@
 #include <lazycom/app/application.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <support/temporary_directory.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <memory>
@@ -30,11 +32,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+namespace app = lazycom::app;
+namespace config = lazycom::config;
+namespace logging = lazycom::logging;
+namespace serial = lazycom::serial;
+
 namespace {
 
-class FakeBackend final : public lazycom::serial::ISerialBackend {
+class FakeBackend final : public serial::ISerialBackend {
 public:
-  explicit FakeBackend(std::vector<lazycom::serial::DeviceInfo> devices = {},
+  explicit FakeBackend(std::vector<serial::DeviceInfo> devices = {},
                        const bool block_enumerate = false)
       : devices_(std::move(devices)), block_enumerate_(block_enumerate),
         wait_fd_(::eventfd(0U, EFD_NONBLOCK)) {
@@ -45,8 +52,7 @@ public:
 
   ~FakeBackend() override { static_cast<void>(::close(wait_fd_)); }
 
-  lazycom::Result<std::vector<lazycom::serial::DeviceInfo>>
-  enumerate() override {
+  lazycom::Result<std::vector<serial::DeviceInfo>> enumerate() override {
     enumerate_entered_.store(true, std::memory_order_release);
     if (block_enumerate_) {
       std::unique_lock lock(mutex_);
@@ -54,8 +60,8 @@ public:
     }
     return devices_;
   }
-  lazycom::Status open(const lazycom::serial::DevicePath &,
-                       const lazycom::serial::PortConfig &) override {
+  lazycom::Status open(const serial::DevicePath &,
+                       const serial::PortConfig &) override {
     if (!open_rx_.empty()) {
       inject_rx(open_rx_);
     }
@@ -194,7 +200,7 @@ public:
   void inject_rx_on_open(std::string bytes) { open_rx_ = std::move(bytes); }
 
 private:
-  std::vector<lazycom::serial::DeviceInfo> devices_;
+  std::vector<serial::DeviceInfo> devices_;
   bool block_enumerate_{};
   int wait_fd_;
   mutable std::mutex mutex_;
@@ -214,247 +220,530 @@ private:
   bool fail_after_write_limit_{};
 };
 
-[[nodiscard]] lazycom::config::PersistencePaths test_paths() {
-  static std::uint32_t sequence{};
-  ++sequence;
-  const auto root = std::filesystem::temp_directory_path() /
-                    ("lazycom-application-unit-" +
-                     std::to_string(static_cast<long long>(::getpid())) + "-" +
-                     std::to_string(sequence));
-  return {root / "config.toml", root / "quick_send.toml", root / "state.toml"};
+template <typename Predicate>
+bool tick_until(app::Application &application, Predicate predicate,
+                const int attempts = 500) {
+  for (int attempt = 0; attempt < attempts; ++attempt) {
+    if (predicate()) {
+      return true;
+    }
+    application.tick();
+    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  }
+  return predicate();
 }
 
+struct ApplicationHarness {
+  lazycom::test::TemporaryDirectory directory;
+  config::PersistencePaths paths{directory.path() / "config.toml",
+                                 directory.path() / "quick_send.toml",
+                                 directory.path() / "state.toml"};
+  std::unique_ptr<app::Application> application;
+  bool shutdown_attempted{};
+
+  ApplicationHarness(std::unique_ptr<serial::ISerialBackend> serial =
+                         std::make_unique<FakeBackend>(),
+                     std::unique_ptr<serial::ISerialBackend> scanner =
+                         std::make_unique<FakeBackend>(),
+                     const std::string_view log_subdirectory = "logs",
+                     const std::function<void(const config::PersistencePaths &)>
+                         &prepare = {}) {
+    if (prepare) {
+      prepare(paths);
+    }
+    app::ApplicationDependencies dependencies;
+    dependencies.serial_backend = std::move(serial);
+    dependencies.scanner_backend = std::move(scanner);
+    dependencies.paths = paths;
+    dependencies.log_directory = directory.path() / log_subdirectory;
+    auto created = app::Application::create(std::move(dependencies));
+    if (!created) {
+      throw std::runtime_error("cannot create application test fixture");
+    }
+    application = std::move(*created);
+  }
+
+  ~ApplicationHarness() {
+    if (application && !shutdown_attempted) {
+      static_cast<void>(application->shutdown());
+    }
+    application.reset();
+  }
+
+  [[nodiscard]] app::Application &app() const { return *application; }
+
+  [[nodiscard]] bool shutdown() {
+    shutdown_attempted = true;
+    return application->shutdown();
+  }
+
+  [[nodiscard]] bool connect() {
+    application->set_device_path("/dev/null");
+    application->connect();
+    return tick_until(*application, [&] {
+      return application->snapshot().connection ==
+             app::ConnectionState::Connected;
+    });
+  }
+
+  [[nodiscard]] bool start_logging() {
+    application->toggle_log();
+    return tick_until(*application, [&] {
+      return application->snapshot().log == app::LogState::Recording;
+    });
+  }
+};
+
+auto read_session(const std::filesystem::path &directory) {
+  std::filesystem::path path;
+  for (const auto &entry : std::filesystem::directory_iterator{directory}) {
+    if (!entry.path().filename().string().starts_with("lazycom-session-"))
+      continue;
+    REQUIRE(path.empty());
+    path = entry.path();
+  }
+  REQUIRE_FALSE(path.empty());
+  std::ifstream input{path, std::ios::binary};
+  REQUIRE(input);
+  const std::string text{std::istreambuf_iterator<char>{input},
+                         std::istreambuf_iterator<char>{}};
+  auto document = logging::decode_ndjson(text);
+  REQUIRE(document);
+  return document;
+}
+
+void write_private(const std::filesystem::path &path, std::string_view text) {
+  std::ofstream output{path};
+  REQUIRE(output);
+  output << text;
+  output.close();
+  REQUIRE(output);
+  REQUIRE(::chmod(path.c_str(), S_IRUSR | S_IWUSR) == 0);
+}
 } // namespace
 
-TEST_CASE("application loads defaults and merges scanner completion") {
-  lazycom::serial::DeviceInfo fake_device;
-  fake_device.path = "/dev/ttyFAKE0";
-  fake_device.description = "fake";
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>(
-      std::vector<lazycom::serial::DeviceInfo>{std::move(fake_device)});
-  dependencies.paths = test_paths();
-  dependencies.log_directory =
-      std::filesystem::temp_directory_path() / "lazycom-application-logs";
-
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-  for (int attempt = 0; attempt < 100 && application.snapshot().scanning;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+TEST_CASE("application restores startup state and integrates device scans",
+          "[application]") {
+  SECTION("application loads defaults and merges scanner completion") {
+    serial::DeviceInfo fake_device;
+    fake_device.path = "/dev/ttyFAKE0";
+    fake_device.description = "fake";
+    ApplicationHarness harness{
+        std::make_unique<FakeBackend>(),
+        std::make_unique<FakeBackend>(
+            std::vector<serial::DeviceInfo>{std::move(fake_device)})};
+    auto &application = harness.app();
+    REQUIRE(tick_until(application,
+                       [&] { return !application.snapshot().scanning; }));
+    REQUIRE(application.snapshot().config.serial.baud == 115200);
+    REQUIRE(application.snapshot().devices.size() == 1U);
+    REQUIRE(application.snapshot().devices.front().path == "/dev/ttyFAKE0");
+    REQUIRE(application.apply_baud("230400"));
+    REQUIRE(application.snapshot().config.serial.baud == 230400);
+    REQUIRE(application.apply_data_format("8,1,none,none"));
+    REQUIRE_FALSE(application.apply_baud("0"));
+    REQUIRE(harness.shutdown());
   }
-  REQUIRE(application.snapshot().config.serial.baud == 115200);
-  REQUIRE(application.snapshot().devices.size() == 1U);
-  REQUIRE(application.snapshot().devices.front().path == "/dev/ttyFAKE0");
-  REQUIRE(application.apply_baud("230400"));
-  REQUIRE(application.snapshot().config.serial.baud == 230400);
-  REQUIRE(application.apply_data_format("8,1,none,none"));
-  REQUIRE_FALSE(application.apply_baud("0"));
-  REQUIRE(application.shutdown());
-}
-
-TEST_CASE("application restores receive visibility from state") {
-  const auto paths = test_paths();
-  const auto root = paths.config.parent_path();
-  REQUIRE(std::filesystem::create_directory(root));
-  REQUIRE(::chmod(root.c_str(), S_IRWXU) == 0);
-  {
-    std::ofstream output(paths.state);
-    REQUIRE(output);
-    output << "version = 1\nshow_rx = false\nshow_tx = true\n"
-              "show_system = false\nshow_error = true\n";
+  SECTION("application restores receive visibility from state") {
+    ApplicationHarness harness{
+        std::make_unique<FakeBackend>(), std::make_unique<FakeBackend>(),
+        "logs", [](const auto &paths) {
+          write_private(paths.state,
+                        "version = 1\nshow_rx = false\nshow_tx = "
+                        "true\nshow_system = false\nshow_error = true\n");
+        }};
+    auto &application = harness.app();
+    const auto &filter = application.snapshot().filter;
+    CHECK_FALSE(filter.rx);
+    CHECK(filter.tx);
+    CHECK_FALSE(filter.system);
+    CHECK(filter.error);
+    REQUIRE(harness.shutdown());
   }
-  REQUIRE(::chmod(paths.state.c_str(), S_IRUSR | S_IWUSR) == 0);
+  SECTION("port selection accepts only the latest scan result") {
+    serial::DeviceInfo device;
+    device.path = "/dev/null";
+    device.description = "test character device";
+    ApplicationHarness harness{
+        std::make_unique<FakeBackend>(),
+        std::make_unique<FakeBackend>(
+            std::vector<serial::DeviceInfo>{std::move(device)})};
+    auto &application = harness.app();
+    REQUIRE(tick_until(application,
+                       [&] { return !application.snapshot().scanning; }));
+    REQUIRE(application.apply_port("/dev/null"));
+    CHECK_FALSE(application.apply_port("/dev/zero"));
+    REQUIRE(harness.shutdown());
+  }
+  SECTION("startup scan publishes one alert when every device is denied") {
+    serial::DeviceInfo denied;
+    denied.path = "/dev/ttyDENIED0";
+    denied.description = "denied";
+    denied.permission.access = serial::DeviceAccess::PermissionDenied;
+    denied.permission.owner_uid = 0U;
+    denied.permission.owner_gid = 18U;
+    denied.permission.mode = 0660U;
+    denied.permission.group_name = "dialout";
 
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  const auto &filter = (*created)->snapshot().filter;
-  CHECK_FALSE(filter.rx);
-  CHECK(filter.tx);
-  CHECK_FALSE(filter.system);
-  CHECK(filter.error);
-  REQUIRE((*created)->shutdown());
-  created->reset();
-  std::filesystem::remove_all(root);
-}
-
-TEST_CASE("disconnected draft is retained and cannot create TX") {
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = test_paths();
-  dependencies.log_directory =
-      std::filesystem::temp_directory_path() / "lazycom-application-logs";
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-  application.set_draft("AT+INFO");
-  application.submit_draft();
-  REQUIRE(application.snapshot().draft == "AT+INFO");
-  REQUIRE(application.snapshot().tx_bytes == 0U);
-  REQUIRE(application.snapshot().notice.find("Not connected") !=
+    ApplicationHarness harness{
+        std::make_unique<FakeBackend>(),
+        std::make_unique<FakeBackend>(
+            std::vector<serial::DeviceInfo>{std::move(denied)})};
+    auto &application = harness.app();
+    REQUIRE(tick_until(
+        application, [&] { return bool(application.snapshot().alert); }, 100));
+    REQUIRE(application.snapshot().alert);
+    CHECK(application.snapshot().alert->code ==
+          lazycom::ErrorCode::SerialPermissionDenied);
+    CHECK(application.snapshot().alert->message.find("dialout") !=
           std::string::npos);
-  REQUIRE(application.shutdown());
-}
-
-TEST_CASE("port selection accepts only the latest scan result") {
-  lazycom::serial::DeviceInfo device;
-  device.path = "/dev/null";
-  device.description = "test character device";
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>(
-      std::vector<lazycom::serial::DeviceInfo>{std::move(device)});
-  dependencies.paths = test_paths();
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-  for (int attempt = 0; attempt < 100 && application.snapshot().scanning;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    application.dismiss_alert();
+    CHECK_FALSE(application.snapshot().alert);
+    application.request_scan();
+    REQUIRE(tick_until(
+        application, [&] { return !(application.snapshot().scanning); }, 100));
+    CHECK_FALSE(application.snapshot().alert);
+    REQUIRE(harness.shutdown());
   }
-  REQUIRE(application.apply_port("/dev/null"));
-  CHECK_FALSE(application.apply_port("/dev/zero"));
-  REQUIRE(application.shutdown());
-}
-
-TEST_CASE("receive data published with connect completion is retained") {
-  auto serial = std::make_unique<FakeBackend>();
-  serial->inject_rx_on_open("ready\n");
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(serial);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = test_paths();
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-  application.set_device_path("/dev/null");
-  application.connection_control();
-  for (int attempt = 0;
-       attempt < 200 && std::ranges::none_of(
-                            application.snapshot().records,
-                            [](const auto &record) {
-                              return record.direction ==
-                                     lazycom::app::RecordDirection::Rx;
-                            });
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  CHECK(std::ranges::any_of(
-      application.snapshot().records, [](const auto &record) {
-        return record.direction == lazycom::app::RecordDirection::Rx;
-      }));
-  REQUIRE(application.shutdown());
 }
 
 TEST_CASE(
-    "cancel intent converges when owner connect wins the submission race") {
-  const auto paths = test_paths();
-  const auto log_directory = paths.config.parent_path() / "logs";
-  auto serial = std::make_unique<FakeBackend>();
-  auto *const backend = serial.get();
-  backend->inject_rx_on_open("race");
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(serial);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = log_directory;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.toggle_log();
-  REQUIRE(application.snapshot().log == lazycom::app::LogState::Waiting);
-  application.set_device_path("/dev/null");
-  application.connect();
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connecting);
-  for (int attempt = 0; attempt < 200 && !backend->opened(); ++attempt) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    "draft admission rejects disconnected oversized and invalid UTF-8 input",
+    "[application]") {
+  SECTION("disconnected draft is retained and cannot create TX") {
+    ApplicationHarness harness;
+    auto &application = harness.app();
+    application.set_draft("AT+INFO");
+    application.submit_draft();
+    REQUIRE(application.snapshot().draft == "AT+INFO");
+    REQUIRE(application.snapshot().tx_bytes == 0U);
+    REQUIRE(application.snapshot().notice.find("Not connected") !=
+            std::string::npos);
+    REQUIRE(harness.shutdown());
   }
-  REQUIRE(backend->opened());
-  std::this_thread::sleep_for(std::chrono::milliseconds{10});
-  application.disconnect();
-  for (int attempt = 0;
-       attempt < 500 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Disconnected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+  SECTION("draft admission preserves valid UTF-8 and the previous contents") {
+    ApplicationHarness harness{
+        std::make_unique<FakeBackend>(), std::make_unique<FakeBackend>(),
+        "logs", [](const auto &paths) {
+          write_private(paths.config,
+                        "version = 1\n[send]\nmax_draft_bytes = 2\n");
+        }};
+    auto &application = harness.app();
+    application.set_draft("A");
+    application.set_draft("A\xE4\xB8\xAD");
+    CHECK(application.snapshot().draft == "A");
+    application.set_draft(std::string(1U, '\xE4'));
+    CHECK(application.snapshot().draft == "A");
+    application.set_draft("AB");
+    CHECK(application.snapshot().draft == "AB");
+    REQUIRE(harness.shutdown());
   }
-  CHECK(application.snapshot().connection ==
-        lazycom::app::ConnectionState::Disconnected);
-  CHECK_FALSE(application.snapshot().active_port_config);
-  REQUIRE(application.shutdown());
-  const auto session_file = std::ranges::find_if(
-      std::filesystem::directory_iterator{log_directory},
-      [](const auto &entry) {
-        return entry.path().filename().string().starts_with("lazycom-session-");
-      });
-  REQUIRE(session_file != std::filesystem::directory_iterator{});
-  std::ifstream input{session_file->path(), std::ios::binary};
-  REQUIRE(input);
-  const std::string document{std::istreambuf_iterator<char>{input},
-                             std::istreambuf_iterator<char>{}};
-  const auto decoded = lazycom::logging::decode_ndjson(document);
-  REQUIRE(decoded);
-  CHECK(std::ranges::any_of(decoded->records, [](const auto &record) {
-    return record.direction == lazycom::logging::Direction::Rx &&
-           record.payload.size() == 4U;
-  }));
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
 }
 
-TEST_CASE("send history enforces its configured byte limit") {
-  const auto paths = test_paths();
-  const auto root = paths.config.parent_path();
-  REQUIRE(std::filesystem::create_directory(root));
-  REQUIRE(::chmod(root.c_str(), S_IRWXU) == 0);
-  {
-    std::ofstream output(paths.config);
-    REQUIRE(output);
-    output << "version = 1\n[send]\nhistory_max_mib = 1\n";
+TEST_CASE("connection completion and cancellation preserve session data and "
+          "hardware state",
+          "[application]") {
+  SECTION("receive data published with connect completion is retained") {
+    auto serial = std::make_unique<FakeBackend>();
+    serial->inject_rx_on_open("ready\n");
+    ApplicationHarness harness{std::move(serial)};
+    auto &application = harness.app();
+    application.set_device_path("/dev/null");
+    application.connection_control();
+    REQUIRE(tick_until(
+        application,
+        [&] {
+          return !(std::ranges::none_of(
+              application.snapshot().records, [](const auto &record) {
+                return record.direction == app::RecordDirection::Rx;
+              }));
+        },
+        200));
+    CHECK(std::ranges::any_of(
+        application.snapshot().records, [](const auto &record) {
+          return record.direction == app::RecordDirection::Rx;
+        }));
+    REQUIRE(harness.shutdown());
   }
-  REQUIRE(::chmod(paths.config.c_str(), S_IRUSR | S_IWUSR) == 0);
+  SECTION("application exposes the active serial configuration snapshot") {
+    ApplicationHarness harness;
+    auto &application = harness.app();
+    REQUIRE_FALSE(application.snapshot().active_port_config);
+    application.set_device_path("/dev/null");
+    REQUIRE(application.apply_baud("230400"));
+    REQUIRE(application.apply_data_format("7,2,even,none"));
 
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-  application.set_device_path("/dev/null");
-  application.connection_control();
-  for (int attempt = 0;
-       attempt < 100 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    application.connection_control();
+    REQUIRE(application.snapshot().active_port_config);
+    CHECK(application.snapshot().active_port_config->baud == 230400);
+    CHECK(application.snapshot().active_port_config->data_bits == 7);
+    CHECK(application.snapshot().active_port_config->stop_bits == 2);
+    CHECK(application.snapshot().active_port_config->parity ==
+          config::Parity::Even);
+
+    REQUIRE(tick_until(
+        application,
+        [&] {
+          return application.snapshot().connection ==
+                 app::ConnectionState::Connected;
+        },
+        100));
+    REQUIRE(application.snapshot().connection ==
+            app::ConnectionState::Connected);
+    REQUIRE(application.snapshot().active_port_config);
+
+    application.connection_control();
+    REQUIRE(application.snapshot().active_port_config);
+    REQUIRE(tick_until(
+        application,
+        [&] {
+          return application.snapshot().connection ==
+                 app::ConnectionState::Disconnected;
+        },
+        100));
+    REQUIRE(application.snapshot().connection ==
+            app::ConnectionState::Disconnected);
+    REQUIRE_FALSE(application.snapshot().active_port_config);
+    REQUIRE(harness.shutdown());
   }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
+  SECTION(
+      "cancel intent converges when owner connect wins the submission race") {
+    auto serial = std::make_unique<FakeBackend>();
+    auto *const backend = serial.get();
+    backend->inject_rx_on_open("race");
+    ApplicationHarness harness{std::move(serial)};
+    auto &application = harness.app();
+    const auto log_directory = harness.directory.path() / "logs";
 
+    application.toggle_log();
+    REQUIRE(application.snapshot().log == app::LogState::Waiting);
+    application.set_device_path("/dev/null");
+    application.connect();
+    REQUIRE(application.snapshot().connection ==
+            app::ConnectionState::Connecting);
+    for (int attempt = 0; attempt < 200 && !backend->opened(); ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    REQUIRE(backend->opened());
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    application.disconnect();
+    REQUIRE(tick_until(application, [&] {
+      return application.snapshot().connection ==
+             app::ConnectionState::Disconnected;
+    }));
+    CHECK(application.snapshot().connection ==
+          app::ConnectionState::Disconnected);
+    CHECK_FALSE(application.snapshot().active_port_config);
+    REQUIRE(harness.shutdown());
+    const auto decoded = read_session(log_directory);
+    CHECK(std::ranges::any_of(decoded->records, [](const auto &record) {
+      return record.direction == logging::Direction::Rx &&
+             record.payload.size() == 4U;
+    }));
+  }
+}
+
+TEST_CASE(
+    "inactive logging settings validate directories and rebuild the writer",
+    "[application]") {
+  SECTION("logging defaults rebuild an inactive writer") {
+    ApplicationHarness harness;
+    auto &application = harness.app();
+    const auto default_logs = harness.directory.path() / "logs";
+    REQUIRE(application.apply_logging("|25|128|16"));
+    REQUIRE(application.snapshot().config.logging.directory.empty());
+    CHECK(application.snapshot().effective_log_directory ==
+          default_logs.string());
+    REQUIRE(application.snapshot().config.logging.max_files == 25U);
+    REQUIRE(application.snapshot().config.logging.max_total_size_mib == 128U);
+    REQUIRE(application.snapshot().config.logging.max_file_size_mib == 16U);
+    REQUIRE_FALSE(application.apply_logging("relative|25|128|16"));
+
+    REQUIRE(tick_until(application, [&] {
+      if (application.snapshot().log == app::LogState::Off)
+        application.toggle_log();
+      return application.snapshot().log == app::LogState::Waiting;
+    }));
+    application.toggle_log();
+    REQUIRE(tick_until(application, [&] {
+      return application.snapshot().log == app::LogState::Off;
+    }));
+    REQUIRE(harness.shutdown());
+  }
+  SECTION("logging settings require an existing safe directory") {
+    ApplicationHarness harness{std::make_unique<FakeBackend>(),
+                               std::make_unique<FakeBackend>(), "default-logs"};
+    auto &application = harness.app();
+    const auto root = harness.directory.path();
+    const auto missing = root / "missing";
+    REQUIRE_FALSE(
+        application.validate_logging(missing.string() + "|25|128|16"));
+    REQUIRE_FALSE(application.apply_logging(missing.string() + "|25|128|16"));
+
+    const auto regular_file = root / "not-a-directory";
+    {
+      std::ofstream output(regular_file);
+      REQUIRE(output);
+    }
+    REQUIRE(::chmod(regular_file.c_str(), S_IRUSR | S_IWUSR) == 0);
+    REQUIRE_FALSE(
+        application.validate_logging(regular_file.string() + "|25|128|16"));
+
+    const auto directory = root / "logs";
+    REQUIRE(std::filesystem::create_directory(directory));
+    REQUIRE(::chmod(directory.c_str(), S_IRWXU) == 0);
+    REQUIRE(application.validate_logging(directory.string() + "|25|128|16"));
+    REQUIRE(application.apply_logging(directory.string() + "|25|128|16",
+                                      app::LogApplyPolicy::NextSession));
+    CHECK(application.snapshot().config.logging.directory ==
+          directory.string());
+
+    REQUIRE(harness.shutdown());
+  }
+}
+
+TEST_CASE(
+    "configuration persistence serializes snapshots and gates visible changes",
+    "[application]") {
+  SECTION("rapid config edits persist the latest combined snapshot") {
+    ApplicationHarness harness;
+    auto &application = harness.app();
+
+    REQUIRE(application.apply_baud("230400"));
+    REQUIRE(application.apply_data_format("7,2,even,none"));
+    REQUIRE(application.apply_newline("crlf"));
+    bool persisted = false;
+    for (int attempt = 0; attempt < 200 && !persisted; ++attempt) {
+      application.tick();
+      const auto loaded = config::load_config_toml(harness.paths.config);
+      persisted = loaded.accepted && loaded.snapshot.serial.baud == 230400 &&
+                  loaded.snapshot.serial.data_bits == 7 &&
+                  loaded.snapshot.serial.stop_bits == 2 &&
+                  loaded.snapshot.serial.parity == config::Parity::Even &&
+                  loaded.snapshot.send.newline == config::Newline::CrLf;
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    CHECK(persisted);
+    REQUIRE(harness.shutdown());
+  }
+  SECTION("quick-send deletion changes memory only after persistence commits") {
+    ApplicationHarness harness;
+    auto &application = harness.app();
+
+    const config::QuickSendSlot slot{
+        3U,     "Ping", config::SendMode::Txt, "AT", config::Newline::CrLf,
+        "probe"};
+    REQUIRE(application.apply_quick_slot(3U, slot));
+    REQUIRE_FALSE(application.snapshot().quick_send.slots[2U]);
+    REQUIRE(tick_until(application, [&] {
+      return application.snapshot().quick_send.slots[2U].has_value();
+    }));
+    REQUIRE(application.snapshot().quick_send.slots[2U] == slot);
+
+    REQUIRE(application.apply_quick_slot(3U, std::nullopt));
+    REQUIRE(application.snapshot().quick_send.slots[2U]);
+    REQUIRE(tick_until(application, [&] {
+      return !application.snapshot().quick_send.slots[2U].has_value();
+    }));
+    REQUIRE(harness.shutdown());
+  }
+  SECTION(
+      "save completion never adopts an external replacement as its baseline") {
+    using namespace std::chrono_literals;
+    ApplicationHarness harness;
+    auto &application = harness.app();
+    const auto &paths = harness.paths;
+    REQUIRE(application.apply_baud("230400"));
+    bool committed = false;
+    const auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (!committed && std::chrono::steady_clock::now() < deadline) {
+      const auto loaded = config::load_config_toml(paths.config);
+      committed = loaded.accepted && loaded.snapshot.serial.baud == 230400;
+      if (!committed)
+        std::this_thread::sleep_for(1ms);
+    }
+    REQUIRE(committed);
+    const std::string external = "[invalid syntax\n";
+    {
+      std::ofstream output{paths.config};
+      output << external;
+    }
+    for (int attempt = 0; attempt < 50; ++attempt) {
+      application.tick();
+      std::this_thread::sleep_for(1ms);
+    }
+    REQUIRE(application.apply_baud("460800"));
+    REQUIRE(harness.shutdown());
+    const auto retained = config::read_safe_file(paths.config, 1024U);
+    REQUIRE(retained);
+    CHECK(retained->bytes == external);
+  }
+}
+
+TEST_CASE("pending log starts converge through reconnect and shutdown",
+          "[application]") {
+  SECTION("pending log start closes before logging a reconnected session") {
+    ApplicationHarness harness;
+    auto &application = harness.app();
+    REQUIRE(harness.connect());
+    application.toggle_log();
+    application.disconnect();
+    REQUIRE(tick_until(
+        application,
+        [&] {
+          return application.snapshot().connection ==
+                 app::ConnectionState::Disconnected;
+        },
+        500));
+    REQUIRE(application.snapshot().connection ==
+            app::ConnectionState::Disconnected);
+
+    application.connect();
+    for (int attempt = 0;
+         attempt < 500 &&
+         (application.snapshot().connection !=
+              app::ConnectionState::Connected ||
+          application.snapshot().log != app::LogState::Recording);
+         ++attempt) {
+      application.tick();
+      std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    CHECK(application.snapshot().connection == app::ConnectionState::Connected);
+    CHECK(application.snapshot().log == app::LogState::Recording);
+    REQUIRE(harness.shutdown());
+  }
+  SECTION("shutdown persists records queued behind a pending log start") {
+    ApplicationHarness harness;
+    auto &application = harness.app();
+    const auto log_directory = harness.directory.path() / "logs";
+    REQUIRE(harness.connect());
+    application.toggle_log();
+    REQUIRE(harness.shutdown());
+
+    const auto decoded = read_session(log_directory);
+    CHECK(std::ranges::any_of(decoded->records, [](const auto &record) {
+      return record.direction == logging::Direction::Sys &&
+             record.message == "Serial session closed";
+    }));
+  }
+}
+
+TEST_CASE("send history enforces its configured byte limit", "[application]") {
+  ApplicationHarness harness{
+      std::make_unique<FakeBackend>(), std::make_unique<FakeBackend>(), "logs",
+      [](const auto &paths) {
+        write_private(paths.config,
+                      "version = 1\n[send]\nhistory_max_mib = 1\n");
+      }};
+  auto &application = harness.app();
+  REQUIRE(harness.connect());
   for (const char marker : {'A', 'B'}) {
     application.set_draft(std::string(600'000U, marker));
     application.submit_draft();
     CHECK(application.snapshot().draft.empty());
-    for (int attempt = 0;
-         attempt < 200 && application.snapshot().tx_pending != 0U; ++attempt) {
-      application.tick();
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
+    REQUIRE(tick_until(
+        application, [&] { return application.snapshot().tx_pending == 0U; },
+        200));
     REQUIRE(application.snapshot().tx_pending == 0U);
   }
   application.set_draft("sentinel");
@@ -463,267 +752,87 @@ TEST_CASE("send history enforces its configured byte limit") {
   application.history_previous();
   CHECK(application.snapshot().draft.front() == 'B');
 
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(root);
+  REQUIRE(harness.shutdown());
 }
 
-TEST_CASE("rapid config edits persist the latest combined snapshot") {
-  const auto paths = test_paths();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  REQUIRE(application.apply_baud("230400"));
-  REQUIRE(application.apply_data_format("7,2,even,none"));
-  REQUIRE(application.apply_newline("crlf"));
-  bool persisted = false;
-  for (int attempt = 0; attempt < 200 && !persisted; ++attempt) {
-    application.tick();
-    const auto loaded = lazycom::config::load_config_toml(paths.config);
-    persisted =
-        loaded.accepted && loaded.snapshot.serial.baud == 230400 &&
-        loaded.snapshot.serial.data_bits == 7 &&
-        loaded.snapshot.serial.stop_bits == 2 &&
-        loaded.snapshot.serial.parity == lazycom::config::Parity::Even &&
-        loaded.snapshot.send.newline == lazycom::config::Newline::CrLf;
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  CHECK(persisted);
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
-}
-
-TEST_CASE("startup scan publishes one alert when every device is denied") {
-  lazycom::serial::DeviceInfo denied;
-  denied.path = "/dev/ttyDENIED0";
-  denied.description = "denied";
-  denied.permission.access = lazycom::serial::DeviceAccess::PermissionDenied;
-  denied.permission.owner_uid = 0U;
-  denied.permission.owner_gid = 18U;
-  denied.permission.mode = 0660U;
-  denied.permission.group_name = "dialout";
-
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>(
-      std::vector<lazycom::serial::DeviceInfo>{std::move(denied)});
-  dependencies.paths = test_paths();
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  for (int attempt = 0; attempt < 100 && !application.snapshot().alert;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().alert);
-  CHECK(application.snapshot().alert->code ==
-        lazycom::ErrorCode::SerialPermissionDenied);
-  CHECK(application.snapshot().alert->message.find("dialout") !=
-        std::string::npos);
-  application.dismiss_alert();
-  CHECK_FALSE(application.snapshot().alert);
-  application.request_scan();
-  for (int attempt = 0; attempt < 100 && application.snapshot().scanning;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  CHECK_FALSE(application.snapshot().alert);
-  REQUIRE(application.shutdown());
-}
-
-TEST_CASE("logging defaults rebuild an inactive writer") {
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = test_paths();
-  dependencies.log_directory = std::filesystem::temp_directory_path() /
-                               "lazycom-application-reconfigured-logs";
-  const auto default_logs = *dependencies.log_directory;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  REQUIRE(application.apply_logging("|25|128|16"));
-  REQUIRE(application.snapshot().config.logging.directory.empty());
-  CHECK(application.snapshot().effective_log_directory ==
-        default_logs.string());
-  REQUIRE(application.snapshot().config.logging.max_files == 25U);
-  REQUIRE(application.snapshot().config.logging.max_total_size_mib == 128U);
-  REQUIRE(application.snapshot().config.logging.max_file_size_mib == 16U);
-  REQUIRE_FALSE(application.apply_logging("relative|25|128|16"));
-
-  for (int attempt = 0; attempt < 100 && application.snapshot().log ==
-                                             lazycom::app::LogState::Off;
-       ++attempt) {
-    application.tick();
-    application.toggle_log();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().log == lazycom::app::LogState::Waiting);
-  application.toggle_log();
-  for (int attempt = 0; attempt < 100 && application.snapshot().log !=
-                                             lazycom::app::LogState::Off;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().log == lazycom::app::LogState::Off);
-  REQUIRE(application.shutdown());
-}
-
-TEST_CASE("logging settings roll an active file onto the new snapshot") {
-  const auto paths = test_paths();
-  const auto root = paths.config.parent_path();
-  REQUIRE(std::filesystem::create_directory(root));
-  REQUIRE(::chmod(root.c_str(), S_IRWXU) == 0);
-  const auto old_logs = root / "old-logs";
-  const auto new_logs = root / "new-logs";
-
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = old_logs;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connection_control();
-  for (int attempt = 0;
-       attempt < 100 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
-
-  application.toggle_log();
-  for (int attempt = 0; attempt < 100 && application.snapshot().log !=
-                                             lazycom::app::LogState::Recording;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().log == lazycom::app::LogState::Recording);
-  REQUIRE(std::filesystem::exists(old_logs));
-
-  REQUIRE(std::filesystem::create_directory(new_logs));
-  REQUIRE(::chmod(new_logs.c_str(), S_IRWXU) == 0);
-  REQUIRE(application.apply_logging(new_logs.string() + "|25|128|16"));
-  for (int attempt = 0;
-       attempt < 200 &&
-       (application.snapshot().log != lazycom::app::LogState::Recording ||
-        !std::filesystem::exists(new_logs));
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().log == lazycom::app::LogState::Recording);
-  REQUIRE(std::filesystem::exists(new_logs));
-  const auto session_file_count = [](const std::filesystem::path &directory) {
-    return static_cast<std::size_t>(std::ranges::count_if(
-        std::filesystem::directory_iterator{directory}, [](const auto &entry) {
-          return entry.path().filename().string().starts_with(
-              "lazycom-session-");
-        }));
-  };
-  REQUIRE(session_file_count(old_logs) == 1U);
-  REQUIRE(session_file_count(new_logs) == 1U);
-
-  const auto final_logs = root / "final-logs";
-  REQUIRE(std::filesystem::create_directory(final_logs));
-  REQUIRE(::chmod(final_logs.c_str(), S_IRWXU) == 0);
-  REQUIRE(application.apply_logging(final_logs.string() + "|25|128|16"));
-  application.disconnect();
-  for (int attempt = 0;
-       attempt < 500 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Disconnected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Disconnected);
-  const auto final_session = std::ranges::find_if(
-      std::filesystem::directory_iterator{final_logs}, [](const auto &entry) {
-        return entry.path().filename().string().starts_with("lazycom-session-");
+TEST_CASE("search direction is independent from the display filter",
+          "[application]") {
+  auto serial = std::make_unique<FakeBackend>();
+  auto *const serial_backend = serial.get();
+  ApplicationHarness harness{std::move(serial)};
+  auto &application = harness.app();
+  const auto &paths = harness.paths;
+  REQUIRE(harness.connect());
+  serial_backend->inject_rx("needle\n");
+  REQUIRE(tick_until(
+      application,
+      [&] {
+        return !(std::ranges::none_of(
+            application.snapshot().records, [](const auto &record) {
+              return record.direction == app::RecordDirection::Rx;
+            }));
+      },
+      200));
+  REQUIRE(application.apply_view("txt,hex,0,1,1,1"));
+  REQUIRE_FALSE(application.apply_view("txt,hex,0,0,0,0"));
+  const app::DirectionFilter rx_only{true, false, false, false};
+  const app::DirectionFilter tx_only{false, true, false, false};
+  const auto rx_matches = application.search("needle", rx_only);
+  REQUIRE(rx_matches.size() == 1U);
+  const auto rx_record = std::ranges::find_if(
+      application.snapshot().records, [](const auto &record) {
+        return record.direction == app::RecordDirection::Rx;
       });
-  REQUIRE(final_session != std::filesystem::directory_iterator{});
-  std::ifstream input{final_session->path(), std::ios::binary};
-  REQUIRE(input);
-  const std::string document{std::istreambuf_iterator<char>{input},
-                             std::istreambuf_iterator<char>{}};
-  const auto decoded = lazycom::logging::decode_ndjson(document);
-  REQUIRE(decoded);
-  CHECK(std::ranges::any_of(decoded->records, [](const auto &record) {
-    return record.direction == lazycom::logging::Direction::Sys &&
-           record.message == "Serial session closed";
-  }));
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(root);
+  REQUIRE(rx_record != application.snapshot().records.end());
+  REQUIRE(rx_matches.front() == rx_record->record_id);
+  REQUIRE(application.search("needle", tx_only).empty());
+
+  REQUIRE(application.apply_view("hex,mixed,1,0,1,0"));
+  CHECK(application.render_record(*rx_record).find("6E 65 65 64 6C 65") !=
+        std::string::npos);
+  app::VisibleRecord tx_record;
+  tx_record.direction = app::RecordDirection::Tx;
+  tx_record.payload = {std::byte{0x41}};
+  CHECK(application.render_record(tx_record).find("A | 41") !=
+        std::string::npos);
+  app::VisibleRecord system_record;
+  system_record.direction = app::RecordDirection::System;
+  system_record.message = "connected";
+  CHECK(application.render_record(system_record).ends_with("connected"));
+  REQUIRE(harness.shutdown());
+  const auto persisted_state = config::load_state_toml(paths.state);
+  REQUIRE(persisted_state.accepted);
+  CHECK(persisted_state.snapshot.show_rx);
+  CHECK_FALSE(persisted_state.snapshot.show_tx);
+  CHECK(persisted_state.snapshot.show_system);
+  CHECK_FALSE(persisted_state.snapshot.show_error);
 }
 
 TEST_CASE("shutdown completes an active log rotation before disconnecting",
-          "[application][shutdown][logging]") {
-  const auto paths = test_paths();
-  const auto root = paths.config.parent_path();
-  REQUIRE(std::filesystem::create_directory(root));
-  REQUIRE(::chmod(root.c_str(), S_IRWXU) == 0);
-  const auto old_logs = root / "old-logs";
-  const auto new_logs = root / "new-logs";
-
-  lazycom::app::ApplicationDependencies dependencies;
+          "[application][logging][shutdown]") {
   auto backend = std::make_unique<FakeBackend>();
   auto *const serial_backend = backend.get();
-  dependencies.serial_backend = std::move(backend);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = old_logs;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0;
-       attempt < 200 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
+  ApplicationHarness harness{std::move(backend),
+                             std::make_unique<FakeBackend>(), "old-logs"};
+  auto &application = harness.app();
+  const auto new_logs = harness.directory.path() / "new-logs";
+  REQUIRE(harness.connect());
   application.toggle_log();
   bool disconnect_before_shutdown = false;
   SECTION("rotation begins after the initial session start completes") {
-    for (int attempt = 0;
-         attempt < 200 &&
-         application.snapshot().log != lazycom::app::LogState::Recording;
+    for (int attempt = 0; attempt < 200 && application.snapshot().log !=
+                                               app::LogState::Recording;
          ++attempt) {
       application.tick();
       std::this_thread::sleep_for(std::chrono::milliseconds{1});
     }
-    REQUIRE(application.snapshot().log == lazycom::app::LogState::Recording);
+    REQUIRE(application.snapshot().log == app::LogState::Recording);
   }
   SECTION("rotation is requested while the initial start is still pending") {
-    REQUIRE(application.snapshot().log == lazycom::app::LogState::Waiting);
+    REQUIRE(application.snapshot().log == app::LogState::Waiting);
   }
   SECTION("disconnect precedes shutdown while the initial start is pending") {
-    REQUIRE(application.snapshot().log == lazycom::app::LogState::Waiting);
+    REQUIRE(application.snapshot().log == app::LogState::Waiting);
     disconnect_before_shutdown = true;
   }
 
@@ -739,307 +848,52 @@ TEST_CASE("shutdown completes an active log rotation before disconnecting",
   if (disconnect_before_shutdown) {
     application.disconnect();
     REQUIRE(application.snapshot().connection ==
-            lazycom::app::ConnectionState::Disconnecting);
+            app::ConnectionState::Disconnecting);
   }
-  REQUIRE(application.shutdown());
+  REQUIRE(harness.shutdown());
 
-  const auto session_file = std::ranges::find_if(
-      std::filesystem::directory_iterator{new_logs}, [](const auto &entry) {
-        return entry.path().filename().string().starts_with("lazycom-session-");
-      });
-  REQUIRE(session_file != std::filesystem::directory_iterator{});
-  std::ifstream input{session_file->path(), std::ios::binary};
-  REQUIRE(input);
-  const std::string document{std::istreambuf_iterator<char>{input},
-                             std::istreambuf_iterator<char>{}};
-  const auto decoded = lazycom::logging::decode_ndjson(document);
-  REQUIRE(decoded);
+  const auto decoded = read_session(new_logs);
   CHECK(std::ranges::any_of(decoded->records, [](const auto &record) {
-    return record.direction == lazycom::logging::Direction::Rx &&
+    return record.direction == logging::Direction::Rx &&
            record.payload.size() == 8U;
   }));
   CHECK(std::ranges::any_of(decoded->records, [](const auto &record) {
-    return record.direction == lazycom::logging::Direction::Sys &&
+    return record.direction == logging::Direction::Sys &&
            record.message == "Serial session closed";
   }));
-
-  created->reset();
-  std::filesystem::remove_all(root);
 }
 
-TEST_CASE("logging settings require an existing safe directory") {
-  const auto paths = test_paths();
-  const auto root = paths.config.parent_path();
-  REQUIRE(std::filesystem::create_directory(root));
-  REQUIRE(::chmod(root.c_str(), S_IRWXU) == 0);
-
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = root / "default-logs";
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  const auto missing = root / "missing";
-  REQUIRE_FALSE(application.validate_logging(missing.string() + "|25|128|16"));
-  REQUIRE_FALSE(application.apply_logging(missing.string() + "|25|128|16"));
-
-  const auto regular_file = root / "not-a-directory";
-  {
-    std::ofstream output(regular_file);
-    REQUIRE(output);
-  }
-  REQUIRE(::chmod(regular_file.c_str(), S_IRUSR | S_IWUSR) == 0);
-  REQUIRE_FALSE(
-      application.validate_logging(regular_file.string() + "|25|128|16"));
-
-  const auto directory = root / "logs";
-  REQUIRE(std::filesystem::create_directory(directory));
-  REQUIRE(::chmod(directory.c_str(), S_IRWXU) == 0);
-  REQUIRE(application.validate_logging(directory.string() + "|25|128|16"));
-  REQUIRE(application.apply_logging(directory.string() + "|25|128|16",
-                                    lazycom::app::LogApplyPolicy::NextSession));
-  CHECK(application.snapshot().config.logging.directory == directory.string());
-
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(root);
-}
-
-TEST_CASE("application exposes the active serial configuration snapshot") {
-  const auto paths = test_paths();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = paths.config.parent_path() / "logs";
-
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  REQUIRE_FALSE(application.snapshot().active_port_config);
-  application.set_device_path("/dev/null");
-  REQUIRE(application.apply_baud("230400"));
-  REQUIRE(application.apply_data_format("7,2,even,none"));
-
-  application.connection_control();
-  REQUIRE(application.snapshot().active_port_config);
-  CHECK(application.snapshot().active_port_config->baud == 230400);
-  CHECK(application.snapshot().active_port_config->data_bits == 7);
-  CHECK(application.snapshot().active_port_config->stop_bits == 2);
-  CHECK(application.snapshot().active_port_config->parity ==
-        lazycom::config::Parity::Even);
-
-  for (int attempt = 0;
-       attempt < 100 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
-  REQUIRE(application.snapshot().active_port_config);
-
-  application.connection_control();
-  REQUIRE(application.snapshot().active_port_config);
-  for (int attempt = 0;
-       attempt < 100 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Disconnected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Disconnected);
-  REQUIRE_FALSE(application.snapshot().active_port_config);
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
-}
-
-TEST_CASE("quick-send deletion changes memory only after persistence commits") {
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = test_paths();
-  dependencies.log_directory =
-      std::filesystem::temp_directory_path() / "lazycom-application-logs";
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  const lazycom::config::QuickSendSlot slot{3U,
-                                            "Ping",
-                                            lazycom::config::SendMode::Txt,
-                                            "AT",
-                                            lazycom::config::Newline::CrLf,
-                                            "probe"};
-  REQUIRE(application.apply_quick_slot(3U, slot));
-  REQUIRE_FALSE(application.snapshot().quick_send.slots[2U]);
-  for (int attempt = 0;
-       attempt < 100 && !application.snapshot().quick_send.slots[2U];
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().quick_send.slots[2U]);
-  REQUIRE(application.snapshot().quick_send.slots[2U] == slot);
-
-  REQUIRE(application.apply_quick_slot(3U, std::nullopt));
-  REQUIRE(application.snapshot().quick_send.slots[2U]);
-  for (int attempt = 0;
-       attempt < 100 && application.snapshot().quick_send.slots[2U];
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE_FALSE(application.snapshot().quick_send.slots[2U]);
-  REQUIRE(application.shutdown());
-}
-
-TEST_CASE("search direction is independent from the display filter") {
+TEST_CASE("unexpected serial loss invalidates a periodic task before reconnect",
+          "[application]") {
   auto serial = std::make_unique<FakeBackend>();
   auto *const serial_backend = serial.get();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(serial);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  const auto paths = test_paths();
-  dependencies.paths = paths;
-  dependencies.log_directory =
-      std::filesystem::temp_directory_path() / "lazycom-application-logs";
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connection_control();
-  for (int attempt = 0;
-       attempt < 100 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
-
-  serial_backend->inject_rx("needle\n");
-  for (int attempt = 0;
-       attempt < 200 && std::ranges::none_of(
-                            application.snapshot().records,
-                            [](const auto &record) {
-                              return record.direction ==
-                                     lazycom::app::RecordDirection::Rx;
-                            });
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.apply_view("txt,hex,0,1,1,1"));
-  REQUIRE_FALSE(application.apply_view("txt,hex,0,0,0,0"));
-  const lazycom::app::DirectionFilter rx_only{true, false, false, false};
-  const lazycom::app::DirectionFilter tx_only{false, true, false, false};
-  const auto rx_matches = application.search("needle", rx_only);
-  REQUIRE(rx_matches.size() == 1U);
-  const auto rx_record = std::ranges::find_if(
-      application.snapshot().records, [](const auto &record) {
-        return record.direction == lazycom::app::RecordDirection::Rx;
-      });
-  REQUIRE(rx_record != application.snapshot().records.end());
-  REQUIRE(rx_matches.front() == rx_record->record_id);
-  REQUIRE(application.search("needle", tx_only).empty());
-
-  REQUIRE(application.apply_view("hex,mixed,1,0,1,0"));
-  CHECK(application.render_record(*rx_record).find("6E 65 65 64 6C 65") !=
-        std::string::npos);
-  lazycom::app::VisibleRecord tx_record;
-  tx_record.direction = lazycom::app::RecordDirection::Tx;
-  tx_record.payload = {std::byte{0x41}};
-  CHECK(application.render_record(tx_record).find("A | 41") !=
-        std::string::npos);
-  lazycom::app::VisibleRecord system_record;
-  system_record.direction = lazycom::app::RecordDirection::System;
-  system_record.message = "connected";
-  CHECK(application.render_record(system_record).ends_with("connected"));
-  REQUIRE(application.shutdown());
-  created->reset();
-  const auto persisted_state = lazycom::config::load_state_toml(paths.state);
-  REQUIRE(persisted_state.accepted);
-  CHECK(persisted_state.snapshot.show_rx);
-  CHECK_FALSE(persisted_state.snapshot.show_tx);
-  CHECK(persisted_state.snapshot.show_system);
-  CHECK_FALSE(persisted_state.snapshot.show_error);
-  std::filesystem::remove_all(paths.config.parent_path());
-}
-
-TEST_CASE(
-    "unexpected serial loss invalidates a periodic task before reconnect") {
-  auto serial = std::make_unique<FakeBackend>();
-  auto *const serial_backend = serial.get();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(serial);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  const auto paths = test_paths();
-  dependencies.paths = paths;
-  dependencies.log_directory =
-      std::filesystem::temp_directory_path() / "lazycom-application-logs";
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
+  ApplicationHarness harness{std::move(serial)};
+  auto &application = harness.app();
 
   REQUIRE(application.apply_quick_slot(
-      1U, lazycom::config::QuickSendSlot{1U, "Probe",
-                                         lazycom::config::SendMode::Txt, "AT",
-                                         lazycom::config::Newline::None, ""}));
-  for (int attempt = 0;
-       attempt < 100 && !application.snapshot().quick_send.slots[0U];
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().quick_send.slots[0U]);
-  application.set_device_path("/dev/null");
-  application.connection_control();
-  for (int attempt = 0;
-       attempt < 100 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
+      1U, config::QuickSendSlot{1U, "Probe", config::SendMode::Txt, "AT",
+                                config::Newline::None, ""}));
+  REQUIRE(tick_until(application, [&] {
+    return application.snapshot().quick_send.slots[0U].has_value();
+  }));
+  REQUIRE(harness.connect());
   REQUIRE(application.execute_quick(1U, 1000U));
   REQUIRE(application.snapshot().task.state ==
           lazycom::scheduler::SchedulerState::Running);
 
   serial_backend->fail_next_read();
-  for (int attempt = 0;
-       attempt < 200 && (application.snapshot().connection !=
-                             lazycom::app::ConnectionState::Disconnected ||
-                         application.snapshot().task.state !=
-                             lazycom::scheduler::SchedulerState::Idle);
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
+  REQUIRE(tick_until(application, [&] {
+    return application.snapshot().connection ==
+               app::ConnectionState::Disconnected &&
+           application.snapshot().task.state ==
+               lazycom::scheduler::SchedulerState::Idle;
+  }));
   REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Disconnected);
+          app::ConnectionState::Disconnected);
   REQUIRE(application.snapshot().task.state ==
           lazycom::scheduler::SchedulerState::Idle);
 
-  application.connection_control();
-  for (int attempt = 0;
-       attempt < 100 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
+  REQUIRE(harness.connect());
   REQUIRE(application.snapshot().task.state ==
           lazycom::scheduler::SchedulerState::Idle);
   for (std::size_t index = 1U; index < application.snapshot().records.size();
@@ -1047,34 +901,17 @@ TEST_CASE(
     REQUIRE(application.snapshot().records[index - 1U].record_id <
             application.snapshot().records[index].record_id);
   }
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
+  REQUIRE(harness.shutdown());
 }
 
-TEST_CASE("disconnect drains more than 512 ordered RX events through cleanup") {
+TEST_CASE("disconnect drains more than 512 ordered RX events through cleanup",
+          "[application]") {
   auto serial = std::make_unique<FakeBackend>();
   auto *const backend = serial.get();
   backend->set_maximum_read_size(1U);
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(serial);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = test_paths();
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0;
-       attempt < 200 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
+  ApplicationHarness harness{std::move(serial)};
+  auto &application = harness.app();
+  REQUIRE(harness.connect());
 
   const std::string payload(600U, 'r');
   backend->inject_rx(payload);
@@ -1084,48 +921,30 @@ TEST_CASE("disconnect drains more than 512 ordered RX events through cleanup") {
   }
   REQUIRE(backend->read_bytes() == payload.size());
   application.disconnect();
-  for (int attempt = 0;
-       attempt < 500 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Disconnected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
+  REQUIRE(tick_until(application, [&] {
+    return application.snapshot().connection ==
+           app::ConnectionState::Disconnected;
+  }));
 
   CHECK(application.snapshot().rx_bytes == payload.size());
   std::size_t received{};
   for (const auto &record : application.snapshot().records) {
-    if (record.direction == lazycom::app::RecordDirection::Rx) {
+    if (record.direction == app::RecordDirection::Rx) {
       received += record.payload.size();
     }
   }
   CHECK(received == payload.size());
-  REQUIRE(application.shutdown());
+  REQUIRE(harness.shutdown());
 }
 
-TEST_CASE("disconnect retains the written prefix of a partial TX") {
+TEST_CASE("disconnect retains the written prefix of a partial TX",
+          "[application]") {
   auto serial = std::make_unique<FakeBackend>();
   auto *const backend = serial.get();
   backend->set_write_limit(7U);
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(serial);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = test_paths();
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0;
-       attempt < 200 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
+  ApplicationHarness harness{std::move(serial)};
+  auto &application = harness.app();
+  REQUIRE(harness.connect());
   application.set_draft(std::string(1024U, 'T'));
   application.submit_draft();
   for (int attempt = 0; attempt < 200 && backend->written_bytes() != 7U;
@@ -1134,74 +953,51 @@ TEST_CASE("disconnect retains the written prefix of a partial TX") {
   }
   REQUIRE(backend->written_bytes() == 7U);
   application.disconnect();
-  for (int attempt = 0;
-       attempt < 500 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Disconnected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
+  REQUIRE(tick_until(application, [&] {
+    return application.snapshot().connection ==
+           app::ConnectionState::Disconnected;
+  }));
 
   CHECK(application.snapshot().tx_bytes == 7U);
   CHECK(std::ranges::any_of(
       application.snapshot().records, [](const auto &record) {
-        return record.direction == lazycom::app::RecordDirection::Tx &&
+        return record.direction == app::RecordDirection::Tx &&
                record.payload.size() == 7U;
       }));
-  REQUIRE(application.shutdown());
+  REQUIRE(harness.shutdown());
 }
 
-TEST_CASE("TX errors retain their code and operation identifier") {
-  const auto paths = test_paths();
-  const auto log_directory = paths.config.parent_path() / "logs";
+TEST_CASE("TX errors retain their code and operation identifier",
+          "[application]") {
   auto serial = std::make_unique<FakeBackend>();
   auto *const backend = serial.get();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(serial);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = log_directory;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0;
-       attempt < 200 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
-  application.toggle_log();
-  for (int attempt = 0; attempt < 200 && application.snapshot().log !=
-                                             lazycom::app::LogState::Recording;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().log == lazycom::app::LogState::Recording);
+  ApplicationHarness harness{std::move(serial)};
+  auto &application = harness.app();
+  const auto log_directory = harness.paths.config.parent_path() / "logs";
+  REQUIRE(std::filesystem::create_directory(log_directory));
+  REQUIRE(::chmod(log_directory.c_str(), S_IRWXU) == 0);
+  REQUIRE(application.apply_logging(log_directory.string() + "|25|128|16"));
+  REQUIRE(tick_until(application, [&] {
+    return application.snapshot().effective_log_directory ==
+           log_directory.string();
+  }));
+  REQUIRE(harness.connect());
+  REQUIRE(harness.start_logging());
   backend->fail_after_write_limit(3U);
   application.set_draft("failure");
   application.submit_draft();
-  for (int attempt = 0;
-       attempt < 500 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Disconnected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
+  REQUIRE(tick_until(application, [&] {
+    return application.snapshot().connection ==
+           app::ConnectionState::Disconnected;
+  }));
   const auto tx = std::ranges::find_if(
       application.snapshot().records, [](const auto &record) {
-        return record.direction == lazycom::app::RecordDirection::Tx &&
+        return record.direction == app::RecordDirection::Tx &&
                record.payload.size() == 3U;
       });
   const auto error = std::ranges::find_if(
       application.snapshot().records, [](const auto &record) {
-        return record.direction == lazycom::app::RecordDirection::Error &&
+        return record.direction == app::RecordDirection::Error &&
                record.operation_id.has_value();
       });
   REQUIRE(tx != application.snapshot().records.end());
@@ -1211,71 +1007,41 @@ TEST_CASE("TX errors retain their code and operation identifier") {
   CHECK(error->operation_id->value != 0U);
   CHECK(std::ranges::count_if(
             application.snapshot().records, [&](const auto &record) {
-              return record.direction == lazycom::app::RecordDirection::Error &&
+              return record.direction == app::RecordDirection::Error &&
                      record.operation_id == error->operation_id;
             }) == 1);
-  REQUIRE(application.shutdown());
-  const auto session_file = std::ranges::find_if(
-      std::filesystem::directory_iterator{log_directory},
-      [](const auto &entry) {
-        return entry.path().filename().string().starts_with("lazycom-session-");
-      });
-  REQUIRE(session_file != std::filesystem::directory_iterator{});
-  std::ifstream input{session_file->path(), std::ios::binary};
-  REQUIRE(input);
-  const std::string document{std::istreambuf_iterator<char>{input},
-                             std::istreambuf_iterator<char>{}};
-  const auto decoded = lazycom::logging::decode_ndjson(document);
-  REQUIRE(decoded);
+  REQUIRE(harness.shutdown());
+  const auto decoded = read_session(log_directory);
   const auto logged_tx =
       std::ranges::find_if(decoded->records, [](const auto &record) {
-        return record.direction == lazycom::logging::Direction::Tx &&
+        return record.direction == logging::Direction::Tx &&
                record.payload.size() == 3U;
       });
   const auto logged_error =
       std::ranges::find_if(decoded->records, [](const auto &record) {
-        return record.direction == lazycom::logging::Direction::Err &&
+        return record.direction == logging::Direction::Err &&
                record.code == "LC-SER-2003";
       });
   REQUIRE(logged_tx != decoded->records.end());
   REQUIRE(logged_error != decoded->records.end());
   CHECK(logged_tx->seq < logged_error->seq);
   CHECK(std::ranges::count_if(decoded->records, [](const auto &record) {
-          return record.direction == lazycom::logging::Direction::Err &&
+          return record.direction == logging::Direction::Err &&
                  record.code == "LC-SER-2003";
         }) == 1);
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
 }
 
-TEST_CASE("fatal worker signal stops accepting operations and fails shutdown") {
+TEST_CASE("fatal worker signal stops accepting operations and fails shutdown",
+          "[application][shutdown]") {
   auto serial = std::make_unique<FakeBackend>();
   auto *const backend = serial.get();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(serial);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = test_paths();
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0;
-       attempt < 200 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
+  ApplicationHarness harness{std::move(serial)};
+  auto &application = harness.app();
+  REQUIRE(harness.connect());
   backend->throw_next_read();
-  for (int attempt = 0; attempt < 500 && !application.snapshot().fatal_stopping;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
+  REQUIRE(tick_until(
+      application, [&] { return bool(application.snapshot().fatal_stopping); },
+      500));
   REQUIRE(application.snapshot().fatal_stopping);
   REQUIRE(application.snapshot().shutting_down);
   CHECK_FALSE(application.apply_newline("lf"));
@@ -1284,17 +1050,19 @@ TEST_CASE("fatal worker signal stops accepting operations and fails shutdown") {
   application.disconnect();
   CHECK(application.snapshot().connection ==
         connection_before_rejected_operation);
-  CHECK_FALSE(application.shutdown());
+  CHECK_FALSE(harness.shutdown());
 }
 
 TEST_CASE("normal shutdown aborts instead of joining a timed-out scanner",
           "[application][shutdown]") {
-  const auto paths = test_paths();
+  lazycom::test::TemporaryDirectory temporary;
+  const auto root = temporary.path() / "app";
+  const config::PersistencePaths paths{
+      root / "config.toml", root / "quick_send.toml", root / "state.toml"};
   const pid_t child = ::fork();
   REQUIRE(child >= 0);
   if (child == 0) {
     static_cast<void>(std::signal(SIGABRT, SIG_DFL));
-    const auto root = paths.config.parent_path();
     if (!std::filesystem::create_directory(root) ||
         ::chmod(root.c_str(), S_IRWXU) != 0) {
       ::_exit(10);
@@ -1310,14 +1078,14 @@ TEST_CASE("normal shutdown aborts instead of joining a timed-out scanner",
     if (::chmod(paths.config.c_str(), S_IRUSR | S_IWUSR) != 0) {
       ::_exit(12);
     }
-    auto scanner = std::make_unique<FakeBackend>(
-        std::vector<lazycom::serial::DeviceInfo>{}, true);
+    auto scanner =
+        std::make_unique<FakeBackend>(std::vector<serial::DeviceInfo>{}, true);
     auto *const scanner_backend = scanner.get();
-    lazycom::app::ApplicationDependencies dependencies;
+    app::ApplicationDependencies dependencies;
     dependencies.serial_backend = std::make_unique<FakeBackend>();
     dependencies.scanner_backend = std::move(scanner);
     dependencies.paths = paths;
-    auto created = lazycom::app::Application::create(std::move(dependencies));
+    auto created = app::Application::create(std::move(dependencies));
     if (!created) {
       ::_exit(13);
     }
@@ -1349,219 +1117,26 @@ TEST_CASE("normal shutdown aborts instead of joining a timed-out scanner",
     static_cast<void>(::kill(child, SIGKILL));
     static_cast<void>(::waitpid(child, &status, 0));
   }
-  std::filesystem::remove_all(paths.config.parent_path());
   REQUIRE(exited);
   REQUIRE(WIFSIGNALED(status));
   CHECK(WTERMSIG(status) == SIGABRT);
 }
 
-TEST_CASE("pending log start closes before logging a reconnected session") {
-  const auto paths = test_paths();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = paths.config.parent_path() / "logs";
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0;
-       attempt < 200 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
-  application.toggle_log();
-  application.disconnect();
-  for (int attempt = 0;
-       attempt < 500 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Disconnected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Disconnected);
-
-  application.connect();
-  for (int attempt = 0;
-       attempt < 500 &&
-       (application.snapshot().connection !=
-            lazycom::app::ConnectionState::Connected ||
-        application.snapshot().log != lazycom::app::LogState::Recording);
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  CHECK(application.snapshot().connection ==
-        lazycom::app::ConnectionState::Connected);
-  CHECK(application.snapshot().log == lazycom::app::LogState::Recording);
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
-}
-
-TEST_CASE("shutdown persists records queued behind a pending log start",
-          "[application][shutdown][logging]") {
-  const auto paths = test_paths();
-  const auto log_directory = paths.config.parent_path() / "logs";
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = log_directory;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0;
-       attempt < 200 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
-
-  application.toggle_log();
-  REQUIRE(application.shutdown());
-
-  const auto session_file = std::ranges::find_if(
-      std::filesystem::directory_iterator{log_directory},
-      [](const auto &entry) {
-        return entry.path().filename().string().starts_with("lazycom-session-");
-      });
-  REQUIRE(session_file != std::filesystem::directory_iterator{});
-  std::ifstream input{session_file->path(), std::ios::binary};
-  REQUIRE(input);
-  const std::string document{std::istreambuf_iterator<char>{input},
-                             std::istreambuf_iterator<char>{}};
-  const auto decoded = lazycom::logging::decode_ndjson(document);
-  REQUIRE(decoded);
-  CHECK(std::ranges::any_of(decoded->records, [](const auto &record) {
-    return record.direction == lazycom::logging::Direction::Sys &&
-           record.message == "Serial session closed";
-  }));
-
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
-}
-
-TEST_CASE("draft admission preserves valid UTF-8 and the previous contents") {
-  const auto paths = test_paths();
-  REQUIRE(std::filesystem::create_directory(paths.config.parent_path()));
-  REQUIRE(::chmod(paths.config.parent_path().c_str(), S_IRWXU) == 0);
-  lazycom::config::ConfigSnapshot config;
-  config.send.max_draft_bytes = 2U;
-  const auto document = lazycom::config::serialize_config_toml(config);
-  REQUIRE(document);
-  {
-    std::ofstream output{paths.config};
-    output << *document;
-  }
-  REQUIRE(::chmod(paths.config.c_str(), S_IRUSR | S_IWUSR) == 0);
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-  application.set_draft("A");
-  application.set_draft("A\xE4\xB8\xAD");
-  CHECK(application.snapshot().draft == "A");
-  application.set_draft(std::string(1U, '\xE4'));
-  CHECK(application.snapshot().draft == "A");
-  application.set_draft("AB");
-  CHECK(application.snapshot().draft == "AB");
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
-}
-
-TEST_CASE(
-    "save completion never adopts an external replacement as its baseline") {
+TEST_CASE("busy manual sending keeps periodic requests behind all manual work",
+          "[application]") {
   using namespace std::chrono_literals;
-  const auto paths = test_paths();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::make_unique<FakeBackend>();
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-  REQUIRE(application.apply_baud("230400"));
-  bool committed = false;
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (!committed && std::chrono::steady_clock::now() < deadline) {
-    const auto loaded = lazycom::config::load_config_toml(paths.config);
-    committed = loaded.accepted && loaded.snapshot.serial.baud == 230400;
-    if (!committed)
-      std::this_thread::sleep_for(1ms);
-  }
-  REQUIRE(committed);
-  const std::string external = "[invalid syntax\n";
-  {
-    std::ofstream output{paths.config};
-    output << external;
-  }
-  for (int attempt = 0; attempt < 50; ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(1ms);
-  }
-  REQUIRE(application.apply_baud("460800"));
-  REQUIRE(application.shutdown());
-  const auto retained = lazycom::config::read_safe_file(paths.config, 1024U);
-  REQUIRE(retained);
-  CHECK(retained->bytes == external);
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
-}
-
-TEST_CASE(
-    "busy manual sending keeps periodic requests behind all manual work") {
-  using namespace std::chrono_literals;
-  const auto paths = test_paths();
   auto backend = std::make_unique<FakeBackend>();
   auto *const serial_backend = backend.get();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(backend);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
+  ApplicationHarness harness{std::move(backend)};
+  auto &application = harness.app();
   REQUIRE(application.apply_quick_slot(
-      1U, lazycom::config::QuickSendSlot{1U, "Quick",
-                                         lazycom::config::SendMode::Txt, "Q",
-                                         lazycom::config::Newline::None, ""}));
-  for (int attempt = 0;
-       attempt < 500 && !application.snapshot().quick_send.slots[0];
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(1ms);
-  }
+      1U, config::QuickSendSlot{1U, "Quick", config::SendMode::Txt, "Q",
+                                config::Newline::None, ""}));
+  REQUIRE(tick_until(
+      application,
+      [&] { return bool(application.snapshot().quick_send.slots[0]); }, 500));
   REQUIRE(application.snapshot().quick_send.slots[0]);
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0;
-       attempt < 500 && application.snapshot().connection !=
-                            lazycom::app::ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(1ms);
-  }
-  REQUIRE(application.snapshot().connection ==
-          lazycom::app::ConnectionState::Connected);
+  REQUIRE(harness.connect());
   serial_backend->set_write_limit(0U);
   application.set_draft("A");
   REQUIRE(application.submit_draft());
@@ -1570,67 +1145,48 @@ TEST_CASE(
   application.set_draft("B");
   REQUIRE(application.submit_draft());
   serial_backend->set_write_limit(100U);
-  for (int attempt = 0;
-       attempt < 500 && serial_backend->written_payload().size() < 3U;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(1ms);
-  }
+  REQUIRE(tick_until(
+      application,
+      [&] { return !(serial_backend->written_payload().size() < 3U); }, 500));
   CHECK(serial_backend->written_payload() == "ABQ");
-  REQUIRE(application.shutdown());
-  created->reset();
-  std::filesystem::remove_all(paths.config.parent_path());
+  REQUIRE(harness.shutdown());
 }
 
 TEST_CASE("repeated logging updates preserve a pending rotation and its tail",
           "[application][logging]") {
   using namespace std::chrono_literals;
-  using lazycom::app::ConnectionState;
-  using lazycom::app::LogApplyPolicy;
-  using lazycom::app::LogState;
-  const auto paths = test_paths();
-  const auto root = paths.config.parent_path();
-  REQUIRE(std::filesystem::create_directory(root));
+  using app::ConnectionState;
+  using app::LogApplyPolicy;
+  using app::LogState;
+  auto backend = std::make_unique<FakeBackend>();
+  auto *const serial_backend = backend.get();
+  ApplicationHarness harness{std::move(backend)};
+  auto &application = harness.app();
+  const auto root = harness.paths.config.parent_path();
+  REQUIRE(std::filesystem::exists(root));
   REQUIRE(::chmod(root.c_str(), S_IRWXU) == 0);
   const auto old_logs = root / "old-logs";
   const auto next_logs = root / "next-logs";
   const auto final_logs = root / "final-logs";
-  for (const auto &directory : {next_logs, final_logs}) {
+  for (const auto &directory : {old_logs, next_logs, final_logs}) {
     REQUIRE(std::filesystem::create_directory(directory));
     REQUIRE(::chmod(directory.c_str(), S_IRWXU) == 0);
   }
-  auto backend = std::make_unique<FakeBackend>();
-  auto *const serial_backend = backend.get();
-  lazycom::app::ApplicationDependencies dependencies;
-  dependencies.serial_backend = std::move(backend);
-  dependencies.scanner_backend = std::make_unique<FakeBackend>();
-  dependencies.paths = paths;
-  dependencies.log_directory = old_logs;
-  auto created = lazycom::app::Application::create(std::move(dependencies));
-  REQUIRE(created);
-  auto &application = **created;
-  application.set_device_path("/dev/null");
-  application.connect();
-  for (int attempt = 0; attempt < 500 && application.snapshot().connection !=
-                                             ConnectionState::Connected;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(1ms);
-  }
-  REQUIRE(application.snapshot().connection == ConnectionState::Connected);
-  application.toggle_log();
-  for (int attempt = 0;
-       attempt < 500 && application.snapshot().log != LogState::Recording;
-       ++attempt) {
-    application.tick();
-    std::this_thread::sleep_for(1ms);
-  }
-  REQUIRE(application.snapshot().log == LogState::Recording);
+  REQUIRE(application.apply_logging(old_logs.string() + "|25|128|16"));
+  REQUIRE(harness.connect());
+  REQUIRE(harness.start_logging());
   REQUIRE(application.apply_logging(next_logs.string() + "|25|128|16"));
 
   enum class CloseKind { Disconnect, DeviceFault, Shutdown };
   auto close_kind = CloseKind::Disconnect;
   auto second_policy = LogApplyPolicy::RotateNow;
+  bool first_rotation_completed = false;
+  SECTION("the first rotation completes before the second update") {
+    REQUIRE(tick_until(application, [&] {
+      return application.snapshot().log == LogState::Recording;
+    }));
+    first_rotation_completed = true;
+  }
   SECTION("another immediate rotation followed by disconnect") {}
   SECTION("next-session settings cannot cancel an accepted rotation") {
     second_policy = LogApplyPolicy::NextSession;
@@ -1650,44 +1206,32 @@ TEST_CASE("repeated logging updates preserve a pending rotation and its tail",
   }
   REQUIRE(serial_backend->read_bytes() == 12U);
   if (close_kind == CloseKind::Shutdown) {
-    REQUIRE(application.shutdown());
+    REQUIRE(harness.shutdown());
   } else {
     if (close_kind == CloseKind::DeviceFault) {
       serial_backend->fail_next_read();
     } else {
       application.disconnect();
     }
-    for (int attempt = 0; attempt < 500 && application.snapshot().connection !=
-                                               ConnectionState::Disconnected;
-         ++attempt) {
-      application.tick();
-      std::this_thread::sleep_for(1ms);
-    }
+    REQUIRE(tick_until(application, [&] {
+      return application.snapshot().connection == ConnectionState::Disconnected;
+    }));
     CHECK(application.snapshot().connection == ConnectionState::Disconnected);
     CHECK(application.snapshot().log == LogState::Waiting);
-    REQUIRE(application.shutdown());
+    REQUIRE(harness.shutdown());
   }
-  const auto session_file = std::ranges::find_if(
-      std::filesystem::directory_iterator{final_logs}, [](const auto &entry) {
-        return entry.path().filename().string().starts_with("lazycom-session-");
-      });
-  REQUIRE(session_file != std::filesystem::directory_iterator{});
-  std::ifstream input{session_file->path(), std::ios::binary};
-  REQUIRE(input);
-  const std::string document{std::istreambuf_iterator<char>{input},
-                             std::istreambuf_iterator<char>{}};
-  const auto decoded = lazycom::logging::decode_ndjson(document);
-  REQUIRE(decoded);
+  CHECK_FALSE(read_session(old_logs)->incomplete_tail);
+  if (first_rotation_completed)
+    CHECK_FALSE(read_session(next_logs)->incomplete_tail);
+  const auto decoded = read_session(final_logs);
   CHECK(std::ranges::any_of(decoded->records, [](const auto &record) {
-    return record.direction == lazycom::logging::Direction::Rx &&
+    return record.direction == logging::Direction::Rx &&
            record.payload.size() == 12U;
   }));
   CHECK(std::ranges::any_of(decoded->records, [close_kind](const auto &record) {
     return close_kind == CloseKind::DeviceFault
-               ? record.direction == lazycom::logging::Direction::Err
-               : record.direction == lazycom::logging::Direction::Sys &&
+               ? record.direction == logging::Direction::Err
+               : record.direction == logging::Direction::Sys &&
                      record.message == "Serial session closed";
   }));
-  created->reset();
-  std::filesystem::remove_all(root);
 }

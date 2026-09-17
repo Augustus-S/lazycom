@@ -8,7 +8,8 @@
 using namespace lazycom;
 using namespace lazycom::app;
 
-TEST_CASE("connection state machine rejects illegal and stale transitions",
+TEST_CASE("connection lifecycle rejects stale identities through disconnect "
+          "and reconnect",
           "[state]") {
   ConnectionStateMachine state;
 
@@ -34,32 +35,24 @@ TEST_CASE("connection state machine rejects illegal and stale transitions",
       SendCommand{OperationId{3}, ConnectionGeneration{1}, SessionId{11}, {}}));
   REQUIRE(state.accepts(
       SendCommand{OperationId{3}, ConnectionGeneration{1}, SessionId{10}, {}}));
-}
-
-TEST_CASE("disconnect keeps its session until matching completion", "[state]") {
-  ConnectionStateMachine state;
-  REQUIRE(state.begin_connect({OperationId{1}, ConnectionGeneration{1}}) ==
-          StateChange::Applied);
-  REQUIRE(state.connect_succeeded({OperationId{1}, ConnectionGeneration{1},
-                                   SessionId{20}}) == StateChange::Applied);
   REQUIRE(state.begin_disconnect({OperationId{2}, ConnectionGeneration{1},
-                                  SessionId{20}}) == StateChange::Applied);
+                                  SessionId{10}}) == StateChange::Applied);
 
-  REQUIRE(state.session_id() == SessionId{20});
-  REQUIRE(state.accepts({ConnectionGeneration{1}, SessionId{20},
+  REQUIRE(state.session_id() == SessionId{10});
+  REQUIRE(state.accepts({ConnectionGeneration{1}, SessionId{10},
                          SessionEventOrigin::Normal, SessionEventKind::Rx}));
   REQUIRE(
-      state.accepts({ConnectionGeneration{1}, SessionId{20},
+      state.accepts({ConnectionGeneration{1}, SessionId{10},
                      SessionEventOrigin::Cleanup, SessionEventKind::System}));
   REQUIRE_FALSE(
       state.accepts({ConnectionGeneration{1}, SessionId{19},
                      SessionEventOrigin::Cleanup, SessionEventKind::Rx}));
   REQUIRE(state.disconnect_completed(
-              {OperationId{99}, ConnectionGeneration{1}, SessionId{20},
+              {OperationId{99}, ConnectionGeneration{1}, SessionId{10},
                OperationOutcome::Succeeded}) == StateChange::IgnoredStale);
-  REQUIRE(state.session_id() == SessionId{20});
+  REQUIRE(state.session_id() == SessionId{10});
   REQUIRE(state.disconnect_completed(
-              {OperationId{2}, ConnectionGeneration{1}, SessionId{20},
+              {OperationId{2}, ConnectionGeneration{1}, SessionId{10},
                OperationOutcome::Succeeded}) == StateChange::Applied);
   REQUIRE_FALSE(state.session_id().has_value());
   REQUIRE(state.state() == ConnectionState::Disconnected);
@@ -71,82 +64,78 @@ TEST_CASE("disconnect keeps its session until matching completion", "[state]") {
   REQUIRE(state.connect_succeeded({OperationId{3}, ConnectionGeneration{2},
                                    SessionId{21}}) == StateChange::Applied);
   REQUIRE_FALSE(
-      state.accepts({ConnectionGeneration{1}, SessionId{20},
+      state.accepts({ConnectionGeneration{1}, SessionId{10},
                      SessionEventOrigin::Normal, SessionEventKind::Rx}));
   REQUIRE_FALSE(
-      state.accepts({ConnectionGeneration{2}, SessionId{20},
+      state.accepts({ConnectionGeneration{2}, SessionId{10},
                      SessionEventOrigin::Normal, SessionEventKind::Rx}));
   REQUIRE(state.accepts({ConnectionGeneration{2}, SessionId{21},
                          SessionEventOrigin::Normal, SessionEventKind::Rx}));
 }
 
-TEST_CASE("connection errors must clean up through disconnecting", "[state]") {
-  ConnectionStateMachine state;
-  REQUIRE(state.begin_connect({OperationId{1}, ConnectionGeneration{1}}) ==
-          StateChange::Applied);
-  REQUIRE(state.connect_failed({OperationId{1}, ConnectionGeneration{1}}) ==
-          StateChange::Applied);
-  REQUIRE(state.state() == ConnectionState::Error);
-  REQUIRE(state.begin_connect({OperationId{2}, ConnectionGeneration{2}}) ==
-          StateChange::InvalidTransition);
-  REQUIRE(state.begin_disconnect({OperationId{2}, ConnectionGeneration{1},
-                                  std::nullopt}) == StateChange::Applied);
-  REQUIRE(state.disconnect_completed(
-              {OperationId{2}, ConnectionGeneration{1}, std::nullopt,
-               OperationOutcome::Succeeded}) == StateChange::Applied);
-}
-
-TEST_CASE("cancelled connect retains a racing successful session until cleanup",
+TEST_CASE("connect failures and cancellation converge through matching cleanup",
           "[state]") {
   ConnectionStateMachine state;
-  REQUIRE(state.begin_connect({OperationId{1}, ConnectionGeneration{1}}) ==
+  REQUIRE(state.begin_connect({OperationId{1}, ConnectionGeneration{4}}) ==
           StateChange::Applied);
-  REQUIRE(state.cancel_connect({OperationId{2}, ConnectionGeneration{1}}) ==
-          StateChange::Applied);
-  REQUIRE(state.connect_operation() == OperationId{1});
-  REQUIRE(state.cleanup_operation() == OperationId{2});
+  SECTION("connection errors must clean up through disconnecting") {
+    REQUIRE(state.connect_failed({OperationId{1}, ConnectionGeneration{4}}) ==
+            StateChange::Applied);
+    REQUIRE(state.state() == ConnectionState::Error);
+    REQUIRE(state.begin_connect({OperationId{2}, ConnectionGeneration{5}}) ==
+            StateChange::InvalidTransition);
+    REQUIRE(state.begin_disconnect({OperationId{2}, ConnectionGeneration{4},
+                                    std::nullopt}) == StateChange::Applied);
+    REQUIRE(state.disconnect_completed(
+                {OperationId{2}, ConnectionGeneration{4}, std::nullopt,
+                 OperationOutcome::Succeeded}) == StateChange::Applied);
+  }
+  SECTION(
+      "cancelled connect retains a racing successful session until cleanup") {
+    REQUIRE(state.cancel_connect({OperationId{2}, ConnectionGeneration{4}}) ==
+            StateChange::Applied);
+    REQUIRE(state.connect_operation() == OperationId{1});
+    REQUIRE(state.cleanup_operation() == OperationId{2});
 
-  REQUIRE(state.connect_succeeded({OperationId{1}, ConnectionGeneration{1},
-                                   SessionId{30}}) == StateChange::Applied);
-  REQUIRE(state.state() == ConnectionState::Disconnecting);
-  REQUIRE(state.session_id() == SessionId{30});
-  REQUIRE_FALSE(state.connect_operation().has_value());
-  REQUIRE(
-      state.accepts({ConnectionGeneration{1}, SessionId{30},
-                     SessionEventOrigin::Cleanup, SessionEventKind::System}));
+    REQUIRE(state.connect_succeeded({OperationId{1}, ConnectionGeneration{4},
+                                     SessionId{30}}) == StateChange::Applied);
+    REQUIRE(state.state() == ConnectionState::Disconnecting);
+    REQUIRE(state.session_id() == SessionId{30});
+    REQUIRE_FALSE(state.connect_operation().has_value());
+    REQUIRE(
+        state.accepts({ConnectionGeneration{4}, SessionId{30},
+                       SessionEventOrigin::Cleanup, SessionEventKind::System}));
 
-  REQUIRE(state.disconnect_completed(
-              {OperationId{2}, ConnectionGeneration{1}, std::nullopt,
-               OperationOutcome::Succeeded}) == StateChange::InvalidTransition);
-  REQUIRE(state.begin_disconnect({OperationId{3}, ConnectionGeneration{1},
-                                  SessionId{30}}) == StateChange::Applied);
-  REQUIRE(state.cleanup_operation() == OperationId{3});
-  REQUIRE(state.disconnect_completed(
-              {OperationId{2}, ConnectionGeneration{1}, SessionId{30},
-               OperationOutcome::Succeeded}) == StateChange::IgnoredStale);
-  REQUIRE(state.disconnect_completed(
-              {OperationId{3}, ConnectionGeneration{1}, SessionId{30},
-               OperationOutcome::Succeeded}) == StateChange::Applied);
-  REQUIRE(state.state() == ConnectionState::Disconnected);
-}
-
-TEST_CASE("cancelled connect failure still waits for matching cleanup",
-          "[state]") {
-  ConnectionStateMachine state;
-  REQUIRE(state.begin_connect({OperationId{10}, ConnectionGeneration{4}}) ==
-          StateChange::Applied);
-  REQUIRE(state.cancel_connect({OperationId{11}, ConnectionGeneration{4}}) ==
-          StateChange::Applied);
-  REQUIRE(state.connect_failed({OperationId{10}, ConnectionGeneration{4}}) ==
-          StateChange::Applied);
-  REQUIRE(state.state() == ConnectionState::Disconnecting);
-  REQUIRE_FALSE(state.session_id().has_value());
-  REQUIRE(state.disconnect_completed(
-              {OperationId{11}, ConnectionGeneration{3}, std::nullopt,
-               OperationOutcome::Succeeded}) == StateChange::InvalidTransition);
-  REQUIRE(state.disconnect_completed(
-              {OperationId{11}, ConnectionGeneration{4}, std::nullopt,
-               OperationOutcome::Succeeded}) == StateChange::Applied);
+    REQUIRE(state.disconnect_completed({OperationId{2}, ConnectionGeneration{4},
+                                        std::nullopt,
+                                        OperationOutcome::Succeeded}) ==
+            StateChange::InvalidTransition);
+    REQUIRE(state.begin_disconnect({OperationId{3}, ConnectionGeneration{4},
+                                    SessionId{30}}) == StateChange::Applied);
+    REQUIRE(state.cleanup_operation() == OperationId{3});
+    REQUIRE(state.disconnect_completed(
+                {OperationId{2}, ConnectionGeneration{4}, SessionId{30},
+                 OperationOutcome::Succeeded}) == StateChange::IgnoredStale);
+    REQUIRE(state.disconnect_completed(
+                {OperationId{3}, ConnectionGeneration{4}, SessionId{30},
+                 OperationOutcome::Succeeded}) == StateChange::Applied);
+    REQUIRE(state.state() == ConnectionState::Disconnected);
+  }
+  SECTION("cancelled connect failure still waits for matching cleanup") {
+    REQUIRE(state.cancel_connect({OperationId{2}, ConnectionGeneration{4}}) ==
+            StateChange::Applied);
+    REQUIRE(state.connect_failed({OperationId{1}, ConnectionGeneration{4}}) ==
+            StateChange::Applied);
+    REQUIRE(state.state() == ConnectionState::Disconnecting);
+    REQUIRE_FALSE(state.session_id().has_value());
+    REQUIRE(state.disconnect_completed({OperationId{2}, ConnectionGeneration{3},
+                                        std::nullopt,
+                                        OperationOutcome::Succeeded}) ==
+            StateChange::InvalidTransition);
+    REQUIRE(state.disconnect_completed(
+                {OperationId{2}, ConnectionGeneration{4}, std::nullopt,
+                 OperationOutcome::Succeeded}) == StateChange::Applied);
+  }
 }
 
 TEST_CASE("interaction and logging states are independent strict machines",
@@ -167,7 +156,7 @@ TEST_CASE("interaction and logging states are independent strict machines",
   REQUIRE(interaction.state() == InteractionState::SendEdit);
 }
 
-TEST_CASE("only the creating thread identity may enter fatal stopping",
+TEST_CASE("fatal guard and worker registry enforce shutdown ownership",
           "[state]") {
   MainThreadFatalGuard guard;
   REQUIRE(guard.enter_fatal_stopping_from(std::thread::id{}) ==
@@ -175,9 +164,6 @@ TEST_CASE("only the creating thread identity may enter fatal stopping",
   REQUIRE(guard.state() == ProcessLifecycle::Running);
   REQUIRE(guard.enter_fatal_stopping() == StateChange::Applied);
   REQUIRE(guard.enter_fatal_stopping() == StateChange::NoChange);
-}
-
-TEST_CASE("all five workers follow the fixed lifecycle", "[state]") {
   WorkerLifecycleRegistry workers;
   constexpr std::array kinds{WorkerKind::Serial, WorkerKind::SessionLog,
                              WorkerKind::Scanner, WorkerKind::Persistence,

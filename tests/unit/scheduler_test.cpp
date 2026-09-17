@@ -1,7 +1,5 @@
 #include <lazycom/scheduler/scheduler.hpp>
 
-#include <support/fake_clock.hpp>
-
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
@@ -9,10 +7,10 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
-
 using namespace std::chrono_literals;
 using lazycom::TaskGeneration;
 using lazycom::config::Newline;
@@ -20,6 +18,13 @@ using lazycom::config::QuickSendSlot;
 using lazycom::config::QuickSendSnapshot;
 using lazycom::config::SendMode;
 using namespace lazycom::scheduler;
+
+static_assert(Scheduler::valid_interval(0U));
+static_assert(!Scheduler::valid_interval(1U));
+static_assert(!Scheduler::valid_interval(9U));
+static_assert(Scheduler::valid_interval(10U));
+static_assert(Scheduler::valid_interval(86'400'000U));
+static_assert(!Scheduler::valid_interval(86'400'001U));
 
 [[nodiscard]] Scheduler::TimePoint at(const std::int64_t milliseconds) {
   return Scheduler::TimePoint{} + std::chrono::milliseconds{milliseconds};
@@ -36,84 +41,66 @@ using namespace lazycom::scheduler;
   return TaskRequest{execution(slot), interval_ms};
 }
 
+Scheduler running(std::uint64_t interval = 10U) {
+  Scheduler scheduler;
+  REQUIRE(scheduler.start(request(interval), at(0)).status ==
+          TaskStartStatus::Started);
+  return scheduler;
+}
 } // namespace
 
-TEST_CASE("TXT and HEX parsing is atomic and appends resolved newlines",
+TEST_CASE("payload policy resolves suffixes and fails atomically",
           "[scheduler]") {
-  const auto text =
-      parse_payload(SendMode::Txt, "A\nB", Newline::Session, Newline::CrLf);
-  REQUIRE(text);
-  REQUIRE(text.bytes == std::vector<std::byte>{std::byte{'A'}, std::byte{'\n'},
-                                               std::byte{'B'}, std::byte{'\r'},
-                                               std::byte{'\n'}});
-
-  const auto hex =
-      parse_payload(SendMode::Hex, " 0x00\tFF\r0X7a\n 01 ", Newline::Lf);
+  struct Suffix {
+    Newline policy;
+    std::string_view expected;
+  };
+  for (const auto &[policy, expected] : {Suffix{Newline::None, "x"},
+                                         {Newline::Lf, "x\n"},
+                                         {Newline::Cr, "x\r"},
+                                         {Newline::CrLf, "x\r\n"},
+                                         {Newline::Session, "x\r\n"}}) {
+    CAPTURE(policy);
+    const auto parsed =
+        parse_payload(SendMode::Txt, "x", policy, Newline::CrLf);
+    REQUIRE(parsed);
+    CHECK(std::string(reinterpret_cast<const char *>(parsed.bytes.data()),
+                      parsed.bytes.size()) == expected);
+  }
+  const auto hex = parse_payload(SendMode::Hex, "41 54", Newline::Lf);
   REQUIRE(hex);
-  REQUIRE(hex.bytes == std::vector<std::byte>{std::byte{0x00}, std::byte{0xFF},
-                                              std::byte{0x7A}, std::byte{0x01},
-                                              std::byte{'\n'}});
-
-  for (const std::string malformed :
-       {"0", "0001", "0x", "0x0", "gg", "01\v02", "0xx1", "01,02"}) {
-    const auto parsed = parse_payload(SendMode::Hex, malformed, Newline::None);
-    REQUIRE_FALSE(parsed);
-    REQUIRE(parsed.status == PayloadParseStatus::InvalidHex);
-    REQUIRE(parsed.bytes.empty());
+  CHECK(hex.bytes == std::vector<std::byte>{std::byte{'A'}, std::byte{'T'},
+                                            std::byte{'\n'}});
+  struct Rejected {
+    SendMode mode;
+    std::string text;
+    Newline newline;
+    PayloadParseStatus status;
+  };
+  const Rejected rejected[]{
+      {SendMode::Hex, "0x0g", Newline::None, PayloadParseStatus::InvalidHex},
+      {SendMode::Txt, "\xC0\x80", Newline::CrLf,
+       PayloadParseStatus::InvalidText},
+      {SendMode::Txt, "x", Newline::Session,
+       PayloadParseStatus::InvalidNewline},
+      {static_cast<SendMode>(99), "x", Newline::None,
+       PayloadParseStatus::InvalidMode},
+      {SendMode::Txt, std::string(lazycom::config::kMaximumPayloadBytes, 'x'),
+       Newline::Lf, PayloadParseStatus::TooLarge},
+      {SendMode::Txt,
+       std::string(lazycom::config::kMaximumPayloadBytes, 'x') + '\xff',
+       Newline::None, PayloadParseStatus::InvalidText},
+  };
+  for (const auto &input : rejected) {
+    CAPTURE(input.mode, input.newline, input.status);
+    const auto parsed =
+        parse_payload(input.mode, input.text, input.newline, Newline::Session);
+    CHECK(parsed.status == input.status);
+    CHECK(parsed.bytes.empty());
   }
 }
 
-TEST_CASE("payload failures always have zero output", "[scheduler]") {
-  const auto invalid_text =
-      parse_payload(SendMode::Txt, std::string{"\xC0\x80", 2}, Newline::CrLf);
-  REQUIRE(invalid_text.status == PayloadParseStatus::InvalidText);
-  REQUIRE(invalid_text.bytes.empty());
-
-  const auto unresolved =
-      parse_payload(SendMode::Txt, "x", Newline::Session, Newline::Session);
-  REQUIRE(unresolved.status == PayloadParseStatus::InvalidNewline);
-  REQUIRE(unresolved.bytes.empty());
-
-  const auto invalid_mode = parse_payload(static_cast<SendMode>(99), "x",
-                                          Newline::None, Newline::None);
-  REQUIRE(invalid_mode.status == PayloadParseStatus::InvalidMode);
-  REQUIRE(invalid_mode.bytes.empty());
-
-  const std::string maximum(lazycom::config::kMaximumPayloadBytes, 'x');
-  const auto too_large =
-      parse_payload(SendMode::Txt, maximum, Newline::Lf, Newline::None);
-  REQUIRE(too_large.status == PayloadParseStatus::TooLarge);
-  REQUIRE(too_large.bytes.empty());
-
-  std::string oversized_invalid(lazycom::config::kMaximumPayloadBytes + 1U,
-                                'x');
-  oversized_invalid.back() = static_cast<char>(0xFF);
-  const auto invalid_before_size = parse_payload(
-      SendMode::Txt, oversized_invalid, Newline::None, Newline::None);
-  REQUIRE(invalid_before_size.status == PayloadParseStatus::InvalidText);
-  REQUIRE(invalid_before_size.bytes.empty());
-}
-
-TEST_CASE("every newline policy resolves to its exact byte suffix",
-          "[scheduler]") {
-  const auto none =
-      parse_payload(SendMode::Txt, "x", Newline::None, Newline::CrLf);
-  const auto lf = parse_payload(SendMode::Txt, "x", Newline::Lf);
-  const auto cr = parse_payload(SendMode::Txt, "x", Newline::Cr);
-  const auto crlf = parse_payload(SendMode::Txt, "x", Newline::CrLf);
-  const auto session =
-      parse_payload(SendMode::Txt, "x", Newline::Session, Newline::Lf);
-
-  REQUIRE(none.bytes == std::vector<std::byte>{std::byte{'x'}});
-  REQUIRE(lf.bytes == std::vector<std::byte>{std::byte{'x'}, std::byte{'\n'}});
-  REQUIRE(cr.bytes == std::vector<std::byte>{std::byte{'x'}, std::byte{'\r'}});
-  REQUIRE(crlf.bytes == std::vector<std::byte>{std::byte{'x'}, std::byte{'\r'},
-                                               std::byte{'\n'}});
-  REQUIRE(session.bytes ==
-          std::vector<std::byte>{std::byte{'x'}, std::byte{'\n'}});
-}
-
-TEST_CASE("quick send builds an owned execution from one of twenty slots",
+TEST_CASE("quick send owns its execution and validates the selected slot",
           "[scheduler]") {
   QuickSendSnapshot slots;
   QuickSendSlot slot;
@@ -143,24 +130,12 @@ TEST_CASE("quick send builds an owned execution from one of twenty slots",
           QuickSendBuildStatus::EmptySlot);
 }
 
-TEST_CASE("scheduler accepts only zero or 10ms through one day",
+TEST_CASE("scheduler validates intervals and retires a one-shot task",
           "[scheduler]") {
-  STATIC_REQUIRE(Scheduler::valid_interval(0U));
-  STATIC_REQUIRE_FALSE(Scheduler::valid_interval(1U));
-  STATIC_REQUIRE_FALSE(Scheduler::valid_interval(9U));
-  STATIC_REQUIRE(Scheduler::valid_interval(10U));
-  STATIC_REQUIRE(Scheduler::valid_interval(86'400'000U));
-  STATIC_REQUIRE_FALSE(Scheduler::valid_interval(86'400'001U));
-
   Scheduler scheduler;
   REQUIRE(scheduler.start(request(9U), at(0)).status ==
           TaskStartStatus::InvalidInterval);
   REQUIRE(scheduler.snapshot().state == SchedulerState::Idle);
-}
-
-TEST_CASE("zero interval emits immediately once at a TX boundary",
-          "[scheduler]") {
-  Scheduler scheduler;
   const auto started = scheduler.start(request(0U), at(0));
   REQUIRE(started.status == TaskStartStatus::Started);
   REQUIRE_FALSE(scheduler.next_deadline());
@@ -177,30 +152,9 @@ TEST_CASE("zero interval emits immediately once at a TX boundary",
   REQUIRE_FALSE(scheduler.accepts(send->token.generation));
 }
 
-TEST_CASE("busy immediate send waits for one boundary and misses later ticks",
-          "[scheduler]") {
-  lazycom::test::FakeClock clock;
-  Scheduler scheduler;
-  const auto started = scheduler.start(request(10U), clock.now());
-  REQUIRE(started.status == TaskStartStatus::Started);
-
-  clock.advance(35ms);
-  scheduler.on_deadline(clock.now());
-  REQUIRE(scheduler.snapshot().missed_count == 3U);
-  REQUIRE(scheduler.next_deadline() == at(40));
-
-  const auto send = scheduler.on_tx_boundary(clock.now());
-  REQUIRE(send);
-  REQUIRE(send->token.sequence == 1U);
-  clock.advance(1ms);
-  REQUIRE_FALSE(scheduler.on_tx_boundary(clock.now()));
-}
-
 TEST_CASE("fixed rate deadlines do not drift or accumulate requests",
           "[scheduler]") {
-  Scheduler scheduler;
-  REQUIRE(scheduler.start(request(10U), at(0)).status ==
-          TaskStartStatus::Started);
+  auto scheduler = running();
   const auto first = scheduler.on_tx_boundary(at(0));
   REQUIRE(first);
 
@@ -227,26 +181,44 @@ TEST_CASE("fixed rate deadlines do not drift or accumulate requests",
   REQUIRE(scheduler.snapshot().sent_count == 1U);
 }
 
-TEST_CASE("manual requests win only when the writer reaches a boundary",
+TEST_CASE("manual priority preserves only the initial pending trigger",
           "[scheduler]") {
-  Scheduler scheduler;
-  REQUIRE(scheduler.start(request(10U), at(0)).status ==
-          TaskStartStatus::Started);
-
-  REQUIRE_FALSE(
-      scheduler.on_tx_boundary(at(0), TxBoundary{std::nullopt, false, true}));
-  REQUIRE(scheduler.snapshot().trigger_pending);
-  const auto first = scheduler.on_tx_boundary(at(1));
-  REQUIRE(first);
-
-  scheduler.on_deadline(at(10));
-  REQUIRE(scheduler.snapshot().missed_count == 1U);
-  REQUIRE_FALSE(
-      scheduler.on_tx_boundary(at(11), TxBoundary{first->token, true, true}));
-  REQUIRE_FALSE(scheduler.snapshot().trigger_pending);
+  for (const auto [initial, explicit_deadline] :
+       {std::pair{true, false}, std::pair{true, true},
+        std::pair{false, false}}) {
+    CAPTURE(initial, explicit_deadline);
+    auto scheduler = running();
+    if (!initial) {
+      const auto first = scheduler.on_tx_boundary(at(0));
+      REQUIRE(first);
+      REQUIRE_FALSE(scheduler.on_tx_boundary(
+          at(1), TxBoundary{first->token, true, false}));
+    }
+    if (explicit_deadline)
+      scheduler.on_deadline(at(35));
+    REQUIRE_FALSE(scheduler.on_tx_boundary(
+        at(35), TxBoundary{std::nullopt, false, true}));
+    CHECK(scheduler.snapshot().missed_count == 3U);
+    CHECK(scheduler.snapshot().trigger_pending == initial);
+    CHECK(scheduler.next_deadline() == at(40));
+    const auto boundary = scheduler.on_tx_boundary(at(36));
+    if (initial) {
+      REQUIRE(boundary);
+      CHECK(boundary->token.sequence == 1U);
+      scheduler.on_deadline(at(40));
+      CHECK_FALSE(scheduler.on_tx_boundary(
+          at(41), TxBoundary{boundary->token, true, true}));
+      CHECK_FALSE(scheduler.snapshot().trigger_pending);
+    } else {
+      CHECK_FALSE(boundary);
+      const auto next = scheduler.on_tx_boundary(at(40));
+      REQUIRE(next);
+      CHECK(next->token.sequence == 2U);
+    }
+  }
 }
 
-TEST_CASE("replacement requires confirmation and old generation stops first",
+TEST_CASE("replacement requires confirmation and rejects stale completion",
           "[scheduler]") {
   Scheduler scheduler;
   const auto old = scheduler.start(request(10U, 1U), at(0));
@@ -311,110 +283,49 @@ TEST_CASE("stop and disconnect invalidate generation until owner confirms",
   REQUIRE_FALSE(scheduler.accepts(TaskGeneration{2U}));
 }
 
-TEST_CASE("generation overflow rejects activation without wrapping",
+TEST_CASE("scheduler exhaustion fails activation or requests an explicit stop",
           "[scheduler]") {
-  Scheduler scheduler{
-      TaskGeneration{std::numeric_limits<std::uint64_t>::max()}};
-  REQUIRE(scheduler.start(request(10U), at(0)).status ==
-          TaskStartStatus::GenerationOverflow);
-  REQUIRE(scheduler.snapshot().state == SchedulerState::Idle);
-}
-
-TEST_CASE("unrepresentable scheduler deadlines fail or request a stop",
-          "[scheduler]") {
-  Scheduler scheduler;
-  const auto rejected =
-      scheduler.start(request(10U), Scheduler::TimePoint::max());
-  REQUIRE(rejected.status == TaskStartStatus::DeadlineOverflow);
-  REQUIRE(scheduler.snapshot().state == SchedulerState::Idle);
-
-  const auto period = std::chrono::duration_cast<Scheduler::Clock::duration>(
-      std::chrono::milliseconds{10});
-  const auto started =
-      scheduler.start(request(10U), Scheduler::TimePoint::max() - period);
-  REQUIRE(started.status == TaskStartStatus::Started);
-  REQUIRE(scheduler.next_deadline() == Scheduler::TimePoint::max());
-
-  scheduler.on_deadline(Scheduler::TimePoint::max());
-  REQUIRE(scheduler.snapshot().state == SchedulerState::Stopping);
-  const auto stop = scheduler.take_automatic_stop_request();
-  REQUIRE(stop);
-  REQUIRE(stop->generation == started.started_generation);
-  REQUIRE(stop->reason == AutomaticStopReason::DeadlineOverflow);
-  REQUIRE_FALSE(scheduler.take_automatic_stop_request());
-  REQUIRE(scheduler
-              .confirm_stopped(*started.started_generation,
-                               Scheduler::TimePoint::max())
-              .status == StopConfirmationStatus::Stopped);
-  REQUIRE(scheduler.snapshot().state == SchedulerState::Idle);
-}
-
-TEST_CASE("deadline accounting is safe across the full clock range",
-          "[scheduler]") {
-  Scheduler scheduler;
-  const auto started =
-      scheduler.start(request(10U), Scheduler::TimePoint::min());
-  REQUIRE(started.status == TaskStartStatus::Started);
-
-  scheduler.on_deadline(Scheduler::TimePoint::max());
-  const auto snapshot = scheduler.snapshot();
-  REQUIRE(snapshot.state == SchedulerState::Stopping);
-  REQUIRE(snapshot.missed_count > 0U);
-  const auto stop = scheduler.take_automatic_stop_request();
-  REQUIRE(stop);
-  REQUIRE(stop->reason == AutomaticStopReason::DeadlineOverflow);
-}
-
-TEST_CASE("request sequence exhaustion emits an explicit stop request",
-          "[scheduler]") {
-  Scheduler scheduler{TaskGeneration{},
-                      std::numeric_limits<std::uint64_t>::max()};
-  const auto started = scheduler.start(request(10U), at(0));
-  REQUIRE(started.status == TaskStartStatus::Started);
-  REQUIRE_FALSE(scheduler.on_tx_boundary(at(0)));
-  REQUIRE(scheduler.snapshot().state == SchedulerState::Stopping);
-
-  const auto stop = scheduler.take_automatic_stop_request();
-  REQUIRE(stop);
-  REQUIRE(stop->generation == started.started_generation);
-  REQUIRE(stop->reason == AutomaticStopReason::SequenceOverflow);
-  REQUIRE_FALSE(scheduler.accepts(*started.started_generation));
-  REQUIRE(
-      scheduler.confirm_stopped(*started.started_generation, at(1)).status ==
-      StopConfirmationStatus::Stopped);
-}
-
-TEST_CASE("periodic deadlines skip manual work without deferring another send",
-          "[scheduler]") {
-  Scheduler scheduler;
-  REQUIRE(scheduler.start(request(10U), at(0)).status ==
-          TaskStartStatus::Started);
-  const auto first = scheduler.on_tx_boundary(at(0));
-  REQUIRE(first);
-  REQUIRE_FALSE(
-      scheduler.on_tx_boundary(at(1), TxBoundary{first->token, true, false}));
-
-  REQUIRE_FALSE(
-      scheduler.on_tx_boundary(at(35), TxBoundary{std::nullopt, false, true}));
-  CHECK(scheduler.snapshot().missed_count == 3U);
-  CHECK_FALSE(scheduler.snapshot().trigger_pending);
-  CHECK(scheduler.next_deadline() == at(40));
-  CHECK_FALSE(scheduler.on_tx_boundary(at(36)));
-  const auto next = scheduler.on_tx_boundary(at(40));
-  REQUIRE(next);
-  CHECK(next->token.sequence == 2U);
-}
-
-TEST_CASE("busy deadlines retain the task's first immediate trigger",
-          "[scheduler]") {
-  Scheduler scheduler;
-  REQUIRE(scheduler.start(request(10U), at(0)).status ==
-          TaskStartStatus::Started);
-  REQUIRE_FALSE(
-      scheduler.on_tx_boundary(at(35), TxBoundary{std::nullopt, false, true}));
-  CHECK(scheduler.snapshot().missed_count == 3U);
-  CHECK(scheduler.snapshot().trigger_pending);
-  const auto first = scheduler.on_tx_boundary(at(36));
-  REQUIRE(first);
-  CHECK(first->token.sequence == 1U);
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  Scheduler exhausted{TaskGeneration{maximum}};
+  CHECK(exhausted.start(request(10U), at(0)).status ==
+        TaskStartStatus::GenerationOverflow);
+  CHECK(exhausted.snapshot().state == SchedulerState::Idle);
+  Scheduler rejected;
+  CHECK(rejected.start(request(10U), Scheduler::TimePoint::max()).status ==
+        TaskStartStatus::DeadlineOverflow);
+  CHECK(rejected.snapshot().state == SchedulerState::Idle);
+  const auto period =
+      std::chrono::duration_cast<Scheduler::Clock::duration>(10ms);
+  for (const auto scenario :
+       {"last deadline", "full clock range", "sequence"}) {
+    CAPTURE(scenario);
+    const bool sequence = std::string_view{scenario} == "sequence";
+    const bool full_range = std::string_view{scenario} == "full clock range";
+    Scheduler scheduler{TaskGeneration{}, sequence ? maximum : 0U};
+    const auto start = sequence     ? at(0)
+                       : full_range ? Scheduler::TimePoint::min()
+                                    : Scheduler::TimePoint::max() - period;
+    const auto started = scheduler.start(request(10U), start);
+    REQUIRE(started.status == TaskStartStatus::Started);
+    if (sequence) {
+      REQUIRE_FALSE(scheduler.on_tx_boundary(start));
+    } else {
+      if (!full_range)
+        CHECK(scheduler.next_deadline() == Scheduler::TimePoint::max());
+      scheduler.on_deadline(Scheduler::TimePoint::max());
+      CHECK(scheduler.snapshot().missed_count > 0U);
+    }
+    CHECK(scheduler.snapshot().state == SchedulerState::Stopping);
+    const auto stop = scheduler.take_automatic_stop_request();
+    REQUIRE(stop);
+    CHECK(stop->generation == started.started_generation);
+    CHECK(stop->reason == (sequence ? AutomaticStopReason::SequenceOverflow
+                                    : AutomaticStopReason::DeadlineOverflow));
+    CHECK_FALSE(scheduler.take_automatic_stop_request());
+    CHECK_FALSE(scheduler.accepts(*started.started_generation));
+    CHECK(
+        scheduler.confirm_stopped(stop->generation, Scheduler::TimePoint::max())
+            .status == StopConfirmationStatus::Stopped);
+    CHECK(scheduler.snapshot().state == SchedulerState::Idle);
+  }
 }

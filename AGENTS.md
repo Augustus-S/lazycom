@@ -190,6 +190,16 @@ ctest --preset gcc-debug
 ctest --preset gcc-debug -R "<test-name-regex>"
 ```
 
+快速迭代可复用已构建的 GCC Debug 产物：
+
+```bash
+ctest --preset gcc-debug-fast
+```
+
+该入口只排除 `build`（依赖重建）与 `extended`（NDJSON 全文档硬上限）标签。
+安全、并发、PTY 和近期回归仍在快速集合中。完整 preset 保持全量，阶段验收与
+下述验证策略不得以快速入口替代。定向慢测可用 `-L build` 或 `-L extended`。
+
 其他支持的 presets：
 
 ```bash

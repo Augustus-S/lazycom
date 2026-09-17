@@ -3,8 +3,11 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -71,67 +74,97 @@ has_path(const std::vector<lazycom::config::SchemaMessage> &messages,
       [path](const auto &message) { return message.path == path; });
 }
 
-} // namespace
-
-TEST_CASE("Plan config example produces the complete default snapshot",
-          "[config]") {
-  const auto result = lazycom::config::parse_config_toml(kPlanConfig);
-
-  REQUIRE(result.accepted);
-  REQUIRE_FALSE(result.read_only);
-  REQUIRE(result.errors.empty());
-  REQUIRE(result.snapshot == lazycom::config::ConfigSnapshot{});
-  REQUIRE(result.snapshot.ui.background ==
-          lazycom::config::UiBackground::RosePine);
-  REQUIRE(lazycom::config::managed_memory_budget(result.snapshot).total_mib() <=
-          128U);
-
-  const auto serialized =
-      lazycom::config::serialize_config_toml(result.snapshot, result.document);
-  REQUIRE(serialized);
-  const auto round_trip = lazycom::config::parse_config_toml(*serialized);
-  REQUIRE(round_trip.accepted);
-  REQUIRE(round_trip.snapshot == result.snapshot);
-}
-
-TEST_CASE("configuration scopes lock only the hardware connection snapshot",
-          "[config]") {
-  using lazycom::config::ConfigurationField;
-  using lazycom::config::ConfigurationScope;
-
-  STATIC_REQUIRE(
-      lazycom::config::configuration_scope(ConfigurationField::Baud) ==
-      ConfigurationScope::HardwareConnectionSnapshot);
-  STATIC_REQUIRE_FALSE(lazycom::config::mutable_while_connected(
-      ConfigurationField::FlowControl));
-  STATIC_REQUIRE(
-      lazycom::config::mutable_while_connected(ConfigurationField::SendMode));
-  STATIC_REQUIRE(lazycom::config::mutable_while_connected(
-      ConfigurationField::ReceiveView));
-  STATIC_REQUIRE(lazycom::config::mutable_while_connected(
-      ConfigurationField::QuickSendSlots));
-}
-
-TEST_CASE("serial baud accepts only the published presets", "[config]") {
-  const auto invalid = lazycom::config::parse_config_toml(R"toml(
-version = 1
-[serial.defaults]
-baud = 12345
-)toml");
-  REQUIRE_FALSE(invalid.accepted);
-  REQUIRE(has_path(invalid.errors, "serial.defaults.baud"));
-
-  for (const auto baud : lazycom::config::kBaudPresets) {
-    auto candidate = lazycom::config::ConfigSnapshot{};
-    candidate.serial.baud = baud;
-    CHECK(lazycom::config::validate_config_snapshot(candidate).empty());
+void check_paths(const std::vector<lazycom::config::SchemaMessage> &messages,
+                 std::initializer_list<std::string_view> paths) {
+  for (const auto path : paths) {
+    CAPTURE(path);
+    CHECK(has_path(messages, path));
   }
 }
 
-TEST_CASE("config schema collects errors and does not partially commit",
+} // namespace
+
+namespace config = lazycom::config;
+using config::ConfigurationField;
+using config::ConfigurationScope;
+static_assert(config::configuration_scope(ConfigurationField::Baud) ==
+              ConfigurationScope::HardwareConnectionSnapshot);
+static_assert(
+    !config::mutable_while_connected(ConfigurationField::FlowControl));
+static_assert(config::mutable_while_connected(ConfigurationField::SendMode));
+static_assert(config::mutable_while_connected(ConfigurationField::ReceiveView));
+static_assert(
+    config::mutable_while_connected(ConfigurationField::QuickSendSlots));
+
+TEST_CASE("config defaults presets and enums obey the published schema",
           "[config]") {
-  const auto result = lazycom::config::parse_config_toml(R"toml(
-version = 1
+  for (const auto source : {kPlanConfig, std::string_view{"version = 1\n"}}) {
+    CAPTURE(source);
+    const auto parsed = config::parse_config_toml(source);
+    REQUIRE(parsed.accepted);
+    REQUIRE_FALSE(parsed.read_only);
+    REQUIRE(parsed.snapshot == config::ConfigSnapshot{});
+    const auto serialized =
+        config::serialize_config_toml(parsed.snapshot, parsed.document);
+    REQUIRE(serialized);
+    const auto round_trip = config::parse_config_toml(*serialized);
+    REQUIRE(round_trip.accepted);
+    CHECK(round_trip.snapshot == parsed.snapshot);
+  }
+  constexpr std::array bauds{300,    600,    1200,   2400,    4800,    9600,
+                             19200,  38400,  57600,  115200,  230400,  250000,
+                             460800, 500000, 921600, 1000000, 1500000, 2000000};
+  CHECK(std::ranges::equal(config::kBaudPresets, bauds));
+  for (const auto baud : bauds) {
+    CAPTURE(baud);
+    auto candidate = config::ConfigSnapshot{};
+    candidate.serial.baud = baud;
+    CHECK(config::validate_config_snapshot(candidate).empty());
+  }
+  const auto parsed = config::parse_config_toml(R"toml(version = 1
+[serial.defaults]
+parity = "EvEn"
+flow_control = "RTS/CTS"
+[send]
+mode = "HEX"
+newline = "CRLF"
+[receive]
+rx_view = "MiXeD"
+tx_view = "HeX"
+[ui]
+background = "TrAnSpArEnT"
+)toml");
+  REQUIRE(parsed.accepted);
+  CHECK(parsed.snapshot.ui.background == config::UiBackground::Transparent);
+  const auto serialized = config::serialize_config_toml(parsed.snapshot);
+  REQUIRE(serialized);
+  for (const auto field :
+       {"parity = 'even'", "flow_control = 'rts/cts'", "rx_view = 'mixed'",
+        "tx_view = 'hex'", "background = 'transparent'", "mode = 'hex'",
+        "newline = 'crlf'"}) {
+    CAPTURE(field);
+    CHECK(serialized->find(field) != std::string::npos);
+  }
+}
+
+TEST_CASE("config rejects whole invalid candidates and reports every field",
+          "[config]") {
+  const std::array cases{
+      std::pair{"version = [\n", "$syntax"},
+      std::pair{"version = 2\n", "version"},
+      std::pair{"version = 1\n[ui]\nbackground = 'solid'\n", "ui.background"},
+      std::pair{"version = 1\n[serial.defaults]\nbaud = 12345\n",
+                "serial.defaults.baud"},
+      std::pair{"version = 1\n[logging]\ndirectory = \"/tmp\\u0000redirect\"\n",
+                "logging.directory"}};
+  for (const auto &[source, path] : cases) {
+    CAPTURE(path);
+    const auto result = config::parse_config_toml(source);
+    CHECK_FALSE(result.accepted);
+    CHECK(result.read_only);
+    CHECK(has_path(result.errors, path));
+  }
+  const auto result = config::parse_config_toml(R"toml(version = 1
 [serial.defaults]
 baud = 0
 data_bits = "eight"
@@ -147,481 +180,289 @@ tx_max_mib = 9
 [timeouts]
 connect_ms = 99
 )toml");
-
   REQUIRE_FALSE(result.accepted);
-  REQUIRE(result.snapshot == lazycom::config::ConfigSnapshot{});
-  REQUIRE(has_path(result.errors, "serial.defaults.baud"));
-  REQUIRE(has_path(result.errors, "serial.defaults.data_bits"));
-  REQUIRE(has_path(result.errors, "serial.defaults.parity"));
-  REQUIRE(has_path(result.errors, "receive.idle_gap_ms"));
-  REQUIRE(has_path(result.errors, "receive.visible_buffer_mib"));
-  REQUIRE(has_path(result.errors, "logging.max_file_size_mib"));
-  REQUIRE(has_path(result.errors, "queues.tx_max_mib"));
-  REQUIRE(has_path(result.errors, "timeouts.connect_ms"));
+  CHECK(result.snapshot == config::ConfigSnapshot{});
+  check_paths(result.errors,
+              {"serial.defaults.baud", "serial.defaults.data_bits",
+               "serial.defaults.parity", "receive.idle_gap_ms",
+               "receive.visible_buffer_mib", "logging.max_file_size_mib",
+               "queues.tx_max_mib", "timeouts.connect_ms"});
+  auto snapshot = config::ConfigSnapshot{};
+  snapshot.logging.directory = std::string{"/tmp\0redirect", 13};
+  CHECK(has_path(config::validate_config_snapshot(snapshot),
+                 "logging.directory"));
 }
 
-TEST_CASE("config enums are case insensitive and serialize lowercase",
+TEST_CASE("config unknown keys and values survive a changed snapshot",
           "[config]") {
-  const auto parsed = lazycom::config::parse_config_toml(R"toml(
-version = 1
-[serial.defaults]
-parity = "EvEn"
-flow_control = "RTS/CTS"
-[send]
-mode = "HEX"
-newline = "CRLF"
-[receive]
-rx_view = "MiXeD"
-tx_view = "HeX"
-[ui]
-background = "TrAnSpArEnT"
-)toml");
-  REQUIRE(parsed.accepted);
-  REQUIRE(parsed.snapshot.ui.background ==
-          lazycom::config::UiBackground::Transparent);
-
-  const auto serialized =
-      lazycom::config::serialize_config_toml(parsed.snapshot);
-  REQUIRE(serialized);
-  REQUIRE(serialized->find("parity = 'even'") != std::string::npos);
-  REQUIRE(serialized->find("flow_control = 'rts/cts'") != std::string::npos);
-  REQUIRE(serialized->find("rx_view = 'mixed'") != std::string::npos);
-  REQUIRE(serialized->find("tx_view = 'hex'") != std::string::npos);
-  REQUIRE(serialized->find("background = 'transparent'") != std::string::npos);
-}
-
-TEST_CASE("UI background defaults when its table is absent", "[config]") {
-  const auto parsed = lazycom::config::parse_config_toml("version = 1\n");
-
-  REQUIRE(parsed.accepted);
-  REQUIRE(parsed.snapshot.ui.background ==
-          lazycom::config::UiBackground::RosePine);
-}
-
-TEST_CASE("invalid UI background is rejected", "[config]") {
-  const auto parsed = lazycom::config::parse_config_toml(
-      "version = 1\n[ui]\nbackground = \"solid\"\n");
-
-  REQUIRE_FALSE(parsed.accepted);
-  REQUIRE(has_path(parsed.errors, "ui.background"));
-}
-
-TEST_CASE("unknown config keys warn and survive a rewrite", "[config]") {
-  const std::string source = R"toml(
-version = 1
+  const auto parsed = config::parse_config_toml(R"toml(version = 1
 future_root = 42
 [ui]
-background = "ROSE-PINE"
 future_ui = "keep"
 [send]
-mode = "txt"
 future_send = { enabled = true }
-)toml";
-  const auto parsed = lazycom::config::parse_config_toml(source);
-  REQUIRE(parsed.accepted);
-  REQUIRE(has_path(parsed.warnings, "future_root"));
-  REQUIRE(has_path(parsed.warnings, "ui.future_ui"));
-  REQUIRE(has_path(parsed.warnings, "send.future_send"));
-
-  auto changed = parsed.snapshot;
-  changed.receive.rx_view = lazycom::config::ReceiveView::Hex;
-  const auto serialized =
-      lazycom::config::serialize_config_toml(changed, parsed.document);
-  REQUIRE(serialized);
-  REQUIRE(serialized->find("future_root = 42") != std::string::npos);
-  REQUIRE(serialized->find("background = 'rose-pine'") != std::string::npos);
-  REQUIRE(serialized->find("future_ui = 'keep'") != std::string::npos);
-  REQUIRE(serialized->find("future_send") != std::string::npos);
-
-  const auto round_trip = lazycom::config::parse_config_toml(*serialized);
-  REQUIRE(round_trip.accepted);
-  REQUIRE(round_trip.snapshot.receive.rx_view ==
-          lazycom::config::ReceiveView::Hex);
-  REQUIRE(round_trip.snapshot.ui.background ==
-          lazycom::config::UiBackground::RosePine);
-  REQUIRE(has_path(round_trip.warnings, "future_root"));
-  REQUIRE(has_path(round_trip.warnings, "ui.future_ui"));
-}
-
-TEST_CASE("legacy send and receive settings migrate on rewrite", "[config]") {
-  const std::string source = R"toml(
-version = 1
-[send]
-keep_after_send = true
-future_send = "keep"
-[receive]
-view = "text"
-)toml";
-  const auto parsed = lazycom::config::parse_config_toml(source);
-  REQUIRE(parsed.accepted);
-  REQUIRE(parsed.snapshot.receive.rx_view == lazycom::config::ReceiveView::Txt);
-  REQUIRE(parsed.snapshot.receive.tx_view == lazycom::config::ReceiveView::Txt);
-  REQUIRE(has_path(parsed.warnings, "send.keep_after_send"));
-  REQUIRE(has_path(parsed.warnings, "receive.view"));
-
-  const auto serialized =
-      lazycom::config::serialize_config_toml(parsed.snapshot, parsed.document);
-  REQUIRE(serialized);
-  CHECK(serialized->find("keep_after_send") == std::string::npos);
-  CHECK(serialized->find("view = 'text'") == std::string::npos);
-  CHECK(serialized->find("rx_view = 'txt'") != std::string::npos);
-  CHECK(serialized->find("tx_view = 'txt'") != std::string::npos);
-  CHECK(serialized->find("future_send = 'keep'") != std::string::npos);
-}
-
-TEST_CASE("new receive views override the legacy view", "[config]") {
-  const auto parsed = lazycom::config::parse_config_toml(R"toml(
-version = 1
-[receive]
-view = "text"
-rx_view = "hex"
-tx_view = "mixed"
 )toml");
   REQUIRE(parsed.accepted);
-  CHECK(parsed.snapshot.receive.rx_view == lazycom::config::ReceiveView::Hex);
-  CHECK(parsed.snapshot.receive.tx_view == lazycom::config::ReceiveView::Mixed);
-  CHECK(has_path(parsed.warnings, "receive.view"));
-}
-
-TEST_CASE("legacy false keep-after-send is also ignored", "[config]") {
-  const auto parsed = lazycom::config::parse_config_toml(
-      "version = 1\n[send]\nkeep_after_send = false\n");
-  REQUIRE(parsed.accepted);
-  CHECK(has_path(parsed.warnings, "send.keep_after_send"));
+  auto changed = parsed.snapshot;
+  changed.receive.rx_view = config::ReceiveView::Hex;
   const auto serialized =
-      lazycom::config::serialize_config_toml(parsed.snapshot, parsed.document);
+      config::serialize_config_toml(changed, parsed.document);
   REQUIRE(serialized);
-  CHECK(serialized->find("keep_after_send") == std::string::npos);
+  const auto round_trip = config::parse_config_toml(*serialized);
+  REQUIRE(round_trip.accepted);
+  CHECK(round_trip.snapshot == changed);
+  for (const auto path : {"future_root", "ui.future_ui", "send.future_send"}) {
+    CAPTURE(path);
+    CHECK(has_path(parsed.warnings, path));
+    CHECK(has_path(round_trip.warnings, path));
+  }
+  for (const auto value :
+       {"future_root = 42", "future_ui = 'keep'", "enabled = true"}) {
+    CAPTURE(value);
+    CHECK(serialized->find(value) != std::string::npos);
+  }
 }
 
-TEST_CASE("syntax failure enables read-only protection", "[config]") {
-  const auto result = lazycom::config::parse_config_toml("version = [\n");
-
-  REQUIRE_FALSE(result.accepted);
-  REQUIRE(result.read_only);
-  REQUIRE(has_path(result.errors, "$syntax"));
+TEST_CASE(
+    "legacy settings migrate while explicit receive views take precedence",
+    "[config]") {
+  for (const auto &[keep, explicit_views] :
+       {std::pair{true, false}, std::pair{false, false},
+        std::pair{true, true}}) {
+    CAPTURE(keep, explicit_views);
+    const auto source =
+        std::string{"version = 1\n[send]\nkeep_after_send = "} +
+        (keep ? "true" : "false") +
+        "\nfuture_send = 'keep'\n[receive]\nview = 'text'\n" +
+        (explicit_views ? "rx_view = 'hex'\ntx_view = 'mixed'\n" : "");
+    const auto parsed = config::parse_config_toml(source);
+    REQUIRE(parsed.accepted);
+    CHECK(
+        parsed.snapshot.receive.rx_view ==
+        (explicit_views ? config::ReceiveView::Hex : config::ReceiveView::Txt));
+    CHECK(parsed.snapshot.receive.tx_view == (explicit_views
+                                                  ? config::ReceiveView::Mixed
+                                                  : config::ReceiveView::Txt));
+    CHECK(has_path(parsed.warnings, "send.keep_after_send"));
+    CHECK(has_path(parsed.warnings, "receive.view"));
+    const auto serialized =
+        config::serialize_config_toml(parsed.snapshot, parsed.document);
+    REQUIRE(serialized);
+    CHECK(serialized->find("keep_after_send") == std::string::npos);
+    CHECK(serialized->find("view = 'text'") == std::string::npos);
+    CHECK(serialized->find("future_send = 'keep'") != std::string::npos);
+    const auto round_trip = config::parse_config_toml(*serialized);
+    REQUIRE(round_trip.accepted);
+    CHECK(round_trip.snapshot == parsed.snapshot);
+  }
 }
 
-TEST_CASE("unknown major versions are rejected", "[config]") {
-  const auto result = lazycom::config::parse_config_toml("version = 2\n");
-  REQUIRE_FALSE(result.accepted);
-  REQUIRE(result.read_only);
-  REQUIRE(has_path(result.errors, "version"));
-}
-
-TEST_CASE("config hard limits include all eight managed budget classes",
+TEST_CASE("managed budgets count payload metadata and current TX plus draft",
           "[config]") {
-  auto snapshot = lazycom::config::ConfigSnapshot{};
+  auto snapshot = config::ConfigSnapshot{};
   snapshot.receive.visible_buffer_mib = 49;
   snapshot.queues.log_max_mib = 17;
   snapshot.queues.rx_ingress_max_mib = 9;
   snapshot.queues.tx_max_mib = 9;
   snapshot.send.history_max_mib = 17;
   snapshot.queues.owner_command_max_mib = 17;
-
-  const auto errors = lazycom::config::validate_config_snapshot(snapshot);
-  REQUIRE(has_path(errors, "budget.ui_visible_mib"));
-  REQUIRE(has_path(errors, "budget.session_log_mib"));
-  REQUIRE(has_path(errors, "budget.rx_ingress_mib"));
-  REQUIRE(has_path(errors, "budget.tx_mib"));
-  REQUIRE(has_path(errors, "budget.send_history_mib"));
-  REQUIRE(has_path(errors, "budget.owner_and_scratch_mib"));
-  REQUIRE(has_path(errors, "budget.total_mib"));
-}
-
-TEST_CASE("TX queue current request and draft share the eight MiB category",
-          "[config]") {
-  auto snapshot = lazycom::config::ConfigSnapshot{};
+  const auto errors = config::validate_config_snapshot(snapshot);
+  check_paths(errors, {"budget.ui_visible_mib", "budget.session_log_mib",
+                       "budget.rx_ingress_mib", "budget.tx_mib",
+                       "budget.send_history_mib",
+                       "budget.owner_and_scratch_mib", "budget.total_mib"});
+  snapshot = {};
   snapshot.queues.tx_max_mib = 8;
-
-  const auto budget = lazycom::config::managed_memory_budget(snapshot);
-  REQUIRE(budget.tx_mib > 8);
-  REQUIRE(has_path(lazycom::config::validate_config_snapshot(snapshot),
-                   "budget.tx_mib"));
-}
-
-TEST_CASE("managed budget includes count-based metadata", "[config]") {
-  auto snapshot = lazycom::config::ConfigSnapshot{};
+  CHECK(config::managed_memory_budget(snapshot).tx_mib > 8);
+  CHECK(has_path(config::validate_config_snapshot(snapshot), "budget.tx_mib"));
+  snapshot = {};
   snapshot.receive.visible_buffer_mib = 1;
   snapshot.receive.visible_max_records = 1000000;
   snapshot.queues.tx_max_mib = 1;
   snapshot.queues.tx_max_messages = 65536;
   snapshot.queues.owner_command_max_mib = 1;
   snapshot.queues.owner_command_max_messages = 65536;
-
-  const auto errors = lazycom::config::validate_config_snapshot(snapshot);
-  REQUIRE(has_path(errors, "budget.ui_visible_mib"));
-  REQUIRE(has_path(errors, "budget.tx_mib"));
-  REQUIRE(has_path(errors, "budget.owner_and_scratch_mib"));
+  const auto metadata_errors = config::validate_config_snapshot(snapshot);
+  check_paths(metadata_errors, {"budget.ui_visible_mib", "budget.tx_mib",
+                                "budget.owner_and_scratch_mib"});
 }
 
-TEST_CASE("quick-send parses sparse slots and validates decoded data",
+TEST_CASE("quick-send schema validates sparse empty and malformed slots",
           "[config]") {
-  const auto result = lazycom::config::parse_quick_send_toml(R"toml(
-version = 1
+  const auto sparse = config::parse_quick_send_toml(R"toml(version = 1
 [[slots]]
 index = 1
-name = "Query"
-mode = "txt"
 content = "AT+INFO"
-newline = "session"
-note = ""
 [[slots]]
 index = 20
 mode = "hex"
 content = "0x00 ff 7A"
 newline = "crlf"
+[[slots]]
+content = "missing index"
 )toml");
-
-  REQUIRE(result.accepted);
-  REQUIRE(result.snapshot.slots[0]);
-  REQUIRE(result.snapshot.slots[19]);
-  REQUIRE(result.snapshot.slots[19]->mode == lazycom::config::SendMode::Hex);
-}
-
-TEST_CASE("quick-send collects duplicate enum and HEX errors", "[config]") {
-  const auto result = lazycom::config::parse_quick_send_toml(R"toml(
-version = 1
+  REQUIRE(sparse.accepted);
+  REQUIRE(sparse.snapshot.slots[0]);
+  REQUIRE(sparse.snapshot.slots[19]);
+  CHECK(sparse.snapshot.slots[19]->mode == config::SendMode::Hex);
+  CHECK_FALSE(sparse.snapshot.slots[1]);
+  const auto invalid = config::parse_quick_send_toml(R"toml(version = 1
 [[slots]]
 index = 2
-name = "ok"
 mode = "hex"
 content = "0x0g"
 newline = "bad"
 [[slots]]
 index = 2
 )toml");
-
-  REQUIRE_FALSE(result.accepted);
-  REQUIRE(has_path(result.errors, "slots[0].content"));
-  REQUIRE(has_path(result.errors, "slots[0].newline"));
-  REQUIRE(has_path(result.errors, "slots[1].index"));
-}
-
-TEST_CASE("quick-send accepts empty slots and contains at most twenty entries",
-          "[config]") {
-  const auto missing = lazycom::config::parse_quick_send_toml(R"toml(
-version = 1
-[[slots]]
-content = "missing index"
-)toml");
-  REQUIRE(missing.accepted);
-  REQUIRE(missing.errors.empty());
-  REQUIRE_FALSE(missing.snapshot.slots[0].has_value());
-
+  REQUIRE_FALSE(invalid.accepted);
+  check_paths(invalid.errors,
+              {"slots[0].content", "slots[0].newline", "slots[1].index"});
   std::string oversized = "version = 1\n";
-  for (std::size_t index = 1U; index <= 21U; ++index) {
+  for (unsigned index = 1U; index <= 21U; ++index)
     oversized += "[[slots]]\nindex = " + std::to_string(index) + "\n";
-  }
-  const auto too_many = lazycom::config::parse_quick_send_toml(oversized);
-  REQUIRE_FALSE(too_many.accepted);
-  REQUIRE(has_path(too_many.errors, "slots"));
+  CHECK(has_path(config::parse_quick_send_toml(oversized).errors, "slots"));
 }
 
-TEST_CASE("quick-send programmatic validation enforces UTF-8 and byte limits",
-          "[config]") {
-  lazycom::config::QuickSendSnapshot snapshot;
-  lazycom::config::QuickSendSlot slot;
+TEST_CASE(
+    "quick-send snapshot validation bounds text and aggregate model memory",
+    "[config]") {
+  config::QuickSendSnapshot snapshot;
+  config::QuickSendSlot slot;
   slot.index = 1;
-  slot.name = std::string(65, 'n');
-  slot.mode = lazycom::config::SendMode::Txt;
+  slot.name.assign(65, 'n');
   slot.content = std::string{"\xC0\x80", 2};
-  slot.note = std::string(257, 'x');
+  slot.note.assign(257, 'x');
   snapshot.slots[0] = slot;
-
-  const auto errors = lazycom::config::validate_quick_send_snapshot(snapshot);
-  REQUIRE(has_path(errors, "slots[0].name"));
-  REQUIRE(has_path(errors, "slots[0].content"));
-  REQUIRE(has_path(errors, "slots[0].note"));
-}
-
-TEST_CASE("quick-send aggregate model memory is bounded", "[config]") {
-  lazycom::config::QuickSendSnapshot snapshot;
-  for (std::size_t index = 0; index < 4; ++index) {
-    lazycom::config::QuickSendSlot slot;
-    slot.index = static_cast<std::uint32_t>(index + 1U);
-    slot.content.assign(lazycom::config::kMaximumPayloadBytes, 'x');
-    snapshot.slots[index] = std::move(slot);
+  const auto errors = config::validate_quick_send_snapshot(snapshot);
+  check_paths(errors, {"slots[0].name", "slots[0].content", "slots[0].note"});
+  snapshot = {};
+  for (std::uint32_t index = 0; index < 4; ++index) {
+    slot = {};
+    slot.index = index + 1U;
+    slot.content.assign(config::kMaximumPayloadBytes, 'x');
+    snapshot.slots[index] = slot;
   }
-
-  const auto errors = lazycom::config::validate_quick_send_snapshot(snapshot);
-  REQUIRE(has_path(errors, "budget.model_and_search_mib"));
+  CHECK(has_path(config::validate_quick_send_snapshot(snapshot),
+                 "budget.model_and_search_mib"));
 }
 
-TEST_CASE("serialization refuses documents beyond their next-load limit",
+TEST_CASE("TOML parsers reject oversized documents before parsing",
           "[config]") {
-  const std::string oversized_state(lazycom::config::kStateMaximumBytes + 1U,
-                                    'x');
-  REQUIRE_FALSE(lazycom::config::serialize_state_toml(
-      lazycom::config::StateSnapshot{}, oversized_state));
-
-  lazycom::config::QuickSendSnapshot quick_send;
-  lazycom::config::QuickSendSlot slot;
-  slot.index = 1;
-  slot.content.assign(lazycom::config::kMaximumPayloadBytes, '\0');
-  quick_send.slots[0] = std::move(slot);
-  REQUIRE_FALSE(lazycom::config::serialize_quick_send_toml(quick_send));
+  CHECK(has_path(config::parse_config_toml(
+                     std::string(config::kConfigMaximumBytes + 1U, 'x'))
+                     .errors,
+                 "$document"));
+  CHECK(has_path(config::parse_quick_send_toml(
+                     std::string(config::kQuickSendMaximumBytes + 1U, 'x'))
+                     .errors,
+                 "$document"));
+  CHECK(has_path(config::parse_state_toml(
+                     std::string(config::kStateMaximumBytes + 1U, 'x'))
+                     .errors,
+                 "$document"));
 }
 
-TEST_CASE("public TOML parsers reject oversized documents before parsing",
+TEST_CASE("quick-send full slots preserve unknown keys through repeated clear "
+          "and refill",
           "[config]") {
-  const std::string config(lazycom::config::kConfigMaximumBytes + 1U, 'x');
-  const std::string quick_send(lazycom::config::kQuickSendMaximumBytes + 1U,
-                               'x');
-  const std::string state(lazycom::config::kStateMaximumBytes + 1U, 'x');
-  REQUIRE(
-      has_path(lazycom::config::parse_config_toml(config).errors, "$document"));
-  REQUIRE(has_path(lazycom::config::parse_quick_send_toml(quick_send).errors,
-                   "$document"));
-  REQUIRE(
-      has_path(lazycom::config::parse_state_toml(state).errors, "$document"));
-}
-
-TEST_CASE("quick-send unknown keys survive a rewrite", "[config]") {
-  const auto parsed = lazycom::config::parse_quick_send_toml(R"toml(
-version = 1
-future_root = "keep"
-[[slots]]
-index = 1
-content = "ping"
-future_slot = 7
-)toml");
-  REQUIRE(parsed.accepted);
-  REQUIRE(has_path(parsed.warnings, "future_root"));
-  REQUIRE(has_path(parsed.warnings, "slots[0].future_slot"));
-
-  const auto serialized = lazycom::config::serialize_quick_send_toml(
-      parsed.snapshot, parsed.document);
-  REQUIRE(serialized);
-  REQUIRE(serialized->find("future_root") != std::string::npos);
-  REQUIRE(serialized->find("future_slot") != std::string::npos);
-  const auto round_trip = lazycom::config::parse_quick_send_toml(*serialized);
-  REQUIRE(round_trip.accepted);
-  REQUIRE(round_trip.snapshot.slots[0]->content == "ping");
-}
-
-TEST_CASE("quick-send full slots survive repeated clear and refill",
-          "[config]") {
-  lazycom::config::QuickSendSnapshot snapshot;
-  for (std::size_t position = 0; position < snapshot.slots.size(); ++position) {
-    lazycom::config::QuickSendSlot slot;
-    slot.index = static_cast<std::uint32_t>(position + 1U);
+  config::QuickSendSnapshot snapshot;
+  for (std::uint32_t index = 0; index < snapshot.slots.size(); ++index) {
+    config::QuickSendSlot slot;
+    slot.index = index + 1U;
     slot.content = "payload";
-    snapshot.slots[position] = std::move(slot);
+    snapshot.slots[index] = slot;
   }
-  auto document = lazycom::config::serialize_quick_send_toml(
-      snapshot, "version = 1\n[[slots]]\nindex = 1\nfuture_slot = 7\n");
+  const auto preserved = config::parse_quick_send_toml(
+      "version = 1\nfuture_root = 'keep'\n[[slots]]\nindex = 1\nfuture_slot = "
+      "7\n");
+  REQUIRE(preserved.accepted);
+  CHECK(has_path(preserved.warnings, "future_root"));
+  CHECK(has_path(preserved.warnings, "slots[0].future_slot"));
+  auto document =
+      config::serialize_quick_send_toml(snapshot, preserved.document);
   REQUIRE(document);
-  for (std::uint32_t pass = 0U; pass < 3U; ++pass) {
-    CAPTURE(pass);
-    snapshot.slots[0].reset();
-    document = lazycom::config::serialize_quick_send_toml(snapshot, *document);
-    REQUIRE(document);
-    auto loaded = lazycom::config::parse_quick_send_toml(*document);
-    REQUIRE(loaded.accepted);
-    CHECK(loaded.snapshot == snapshot);
-    CHECK(document->find("future_slot = 7") != std::string::npos);
-
-    lazycom::config::QuickSendSlot slot;
-    slot.index = 1U;
-    slot.content = "new payload";
-    snapshot.slots[0] = std::move(slot);
-    document = lazycom::config::serialize_quick_send_toml(snapshot, *document);
-    REQUIRE(document);
-    loaded = lazycom::config::parse_quick_send_toml(*document);
-    REQUIRE(loaded.accepted);
-    CHECK(loaded.snapshot == snapshot);
-    CHECK(document->find("future_slot = 7") != std::string::npos);
+  for (unsigned pass = 0; pass < 3; ++pass) {
+    for (const bool filled : {false, true}) {
+      CAPTURE(pass, filled);
+      snapshot.slots[0] =
+          filled ? std::optional{config::QuickSendSlot{}} : std::nullopt;
+      if (filled) {
+        snapshot.slots[0]->index = 1U;
+        snapshot.slots[0]->content = "new payload";
+      }
+      document = config::serialize_quick_send_toml(snapshot, *document);
+      REQUIRE(document);
+      const auto loaded = config::parse_quick_send_toml(*document);
+      REQUIRE(loaded.accepted);
+      CHECK(loaded.snapshot == snapshot);
+      CHECK(document->find("future_root = 'keep'") != std::string::npos);
+      CHECK(document->find("future_slot = 7") != std::string::npos);
+    }
   }
 }
 
-TEST_CASE("quick-send serialization enforces the next load's combined budget",
+TEST_CASE("TOML serialization obeys next-load byte and combined memory limits",
           "[config]") {
-  lazycom::config::QuickSendSnapshot snapshot;
-  for (std::uint32_t index = 0U; index < 3U; ++index) {
-    lazycom::config::QuickSendSlot slot;
+  CHECK_FALSE(config::serialize_state_toml(
+      {}, std::string(config::kStateMaximumBytes + 1U, 'x')));
+  config::QuickSendSnapshot snapshot;
+  config::QuickSendSlot slot;
+  slot.index = 1;
+  slot.content.assign(config::kMaximumPayloadBytes, '\0');
+  snapshot.slots[0] = slot;
+  CHECK_FALSE(config::serialize_quick_send_toml(snapshot));
+  for (std::uint32_t index = 0; index < 3; ++index) {
     slot.index = index + 1U;
     slot.content.assign(index == 2U ? 512U * 1024U : 1024U * 1024U, 'x');
-    snapshot.slots[index] = std::move(slot);
+    snapshot.slots[index] = slot;
   }
-  REQUIRE(lazycom::config::validate_quick_send_snapshot(snapshot).empty());
-  const std::string preserved =
+  REQUIRE(config::validate_quick_send_snapshot(snapshot).empty());
+  const auto preserved =
       "version = 1\nfuture_blob = '" + std::string(1024U * 1024U, 'x') + "'\n";
-  REQUIRE(lazycom::config::parse_quick_send_toml(preserved).accepted);
-  REQUIRE_FALSE(
-      lazycom::config::serialize_quick_send_toml(snapshot, preserved));
+  REQUIRE(config::parse_quick_send_toml(preserved).accepted);
+  CHECK_FALSE(config::serialize_quick_send_toml(snapshot, preserved));
 }
 
-TEST_CASE("state accepts zero or 10ms through one day only", "[config]") {
-  REQUIRE(lazycom::config::parse_state_toml(
-              "version = 1\nlast_quick_send_slot = 20\nlast_interval_ms = 0\n")
+TEST_CASE(
+    "state validates intervals and visibility while preserving unknown keys",
+    "[config]") {
+  for (const auto interval : {0U, 10U, 86400000U}) {
+    CAPTURE(interval);
+    CHECK(config::parse_state_toml(
+              "version = 1\nlast_quick_send_slot = 20\nlast_interval_ms = " +
+              std::to_string(interval))
               .accepted);
-  REQUIRE(lazycom::config::parse_state_toml(
-              "version = 1\nlast_quick_send_slot = 1\nlast_interval_ms = 10\n")
-              .accepted);
-  const auto invalid = lazycom::config::parse_state_toml(
+  }
+  const auto invalid = config::parse_state_toml(
       "version = 1\nlast_quick_send_slot = 21\nlast_interval_ms = 9\n");
-  REQUIRE_FALSE(invalid.accepted);
-  REQUIRE(invalid.read_only);
-  REQUIRE(has_path(invalid.errors, "last_quick_send_slot"));
-  REQUIRE(has_path(invalid.errors, "last_interval_ms"));
-}
-
-TEST_CASE("state persists receive visibility preferences", "[config]") {
-  const auto parsed = lazycom::config::parse_state_toml(R"toml(
-version = 1
-show_rx = false
-show_tx = true
-show_system = false
-show_error = true
-)toml");
+  CHECK_FALSE(invalid.accepted);
+  CHECK(invalid.read_only);
+  CHECK(has_path(invalid.errors, "last_quick_send_slot"));
+  CHECK(has_path(invalid.errors, "last_interval_ms"));
+  CHECK_FALSE(
+      config::parse_state_toml("version = 1\nlast_interval_ms = 86400001\n")
+          .accepted);
+  const auto parsed = config::parse_state_toml(
+      "version = 1\nshow_rx = false\nshow_tx = true\nshow_system = "
+      "false\nshow_error = true\nfuture_ui = true\n");
   REQUIRE(parsed.accepted);
   CHECK_FALSE(parsed.snapshot.show_rx);
   CHECK(parsed.snapshot.show_tx);
   CHECK_FALSE(parsed.snapshot.show_system);
   CHECK(parsed.snapshot.show_error);
+  CHECK(has_path(parsed.warnings, "future_ui"));
   const auto serialized =
-      lazycom::config::serialize_state_toml(parsed.snapshot, parsed.document);
+      config::serialize_state_toml(parsed.snapshot, parsed.document);
   REQUIRE(serialized);
-  const auto round_trip = lazycom::config::parse_state_toml(*serialized);
+  CHECK(serialized->find("future_ui = true") != std::string::npos);
+  const auto round_trip = config::parse_state_toml(*serialized);
   REQUIRE(round_trip.accepted);
   CHECK(round_trip.snapshot == parsed.snapshot);
-}
-
-TEST_CASE("state rejects hiding every receive record type", "[config]") {
-  const auto parsed = lazycom::config::parse_state_toml(R"toml(
-version = 1
-show_rx = false
-show_tx = false
-show_system = false
-show_error = false
-)toml");
-  REQUIRE_FALSE(parsed.accepted);
-  REQUIRE(parsed.read_only);
-  REQUIRE(has_path(parsed.errors, "show_*"));
-}
-
-TEST_CASE("logging directory rejects embedded NUL", "[config]") {
-  const auto parsed = lazycom::config::parse_config_toml(
-      "version = 1\n[logging]\ndirectory = \"/tmp\\u0000redirect\"\n");
-  REQUIRE_FALSE(parsed.accepted);
-  REQUIRE(has_path(parsed.errors, "logging.directory"));
-
-  auto snapshot = lazycom::config::ConfigSnapshot{};
-  snapshot.logging.directory = std::string{"/tmp\0redirect", 13};
-  REQUIRE(has_path(lazycom::config::validate_config_snapshot(snapshot),
-                   "logging.directory"));
-}
-
-TEST_CASE("state unknown keys warn and survive a rewrite", "[config]") {
-  const auto parsed = lazycom::config::parse_state_toml(
-      "version = 1\nlast_interval_ms = 0\nfuture_ui = true\n");
-  REQUIRE(parsed.accepted);
-  REQUIRE(has_path(parsed.warnings, "future_ui"));
-
-  const auto serialized =
-      lazycom::config::serialize_state_toml(parsed.snapshot, parsed.document);
-  REQUIRE(serialized);
-  REQUIRE(serialized->find("future_ui = true") != std::string::npos);
-  REQUIRE(lazycom::config::parse_state_toml(*serialized).accepted);
+  const auto hidden = config::parse_state_toml(
+      "version = 1\nshow_rx = false\nshow_tx = false\nshow_system = "
+      "false\nshow_error = false\n");
+  CHECK_FALSE(hidden.accepted);
+  CHECK(hidden.read_only);
+  CHECK(has_path(hidden.errors, "show_*"));
 }

@@ -12,25 +12,52 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 namespace {
-
 using namespace std::chrono_literals;
 using namespace lazycom;
 using namespace lazycom::app;
 using namespace lazycom::serial;
 
+class Gate {
+public:
+  void block() {
+    std::lock_guard lock(mutex_);
+    blocked_ = true;
+  }
+  void enter() {
+    std::unique_lock lock(mutex_);
+    entered_ = true;
+    condition_.notify_all();
+    condition_.wait(lock, [this] { return !blocked_; });
+  }
+  bool wait() {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, 1s, [this] { return entered_; });
+  }
+  void release() {
+    std::lock_guard lock(mutex_);
+    blocked_ = false;
+    condition_.notify_all();
+  }
+
+private:
+  std::mutex mutex_;
+  std::condition_variable condition_;
+  bool blocked_{}, entered_{};
+};
+
 class FakeSerialBackend final : public ISerialBackend {
 public:
   FakeSerialBackend() {
-    int descriptors[2]{-1, -1};
+    int descriptors[2]{};
     if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0,
                      descriptors) != 0) {
       throw std::system_error(errno, std::generic_category(), "socketpair");
@@ -38,1149 +65,679 @@ public:
     owner_fd_ = descriptors[0];
     peer_fd_ = descriptors[1];
   }
-
   ~FakeSerialBackend() override {
-    if (owner_fd_ >= 0) {
-      static_cast<void>(::close(owner_fd_));
-    }
-    if (peer_fd_ >= 0) {
+    static_cast<void>(::close(owner_fd_));
+    if (peer_fd_ >= 0)
       static_cast<void>(::close(peer_fd_));
-    }
   }
-
   Result<std::vector<DeviceInfo>> enumerate() override {
-    std::unique_lock lock(mutex_);
-    enumerate_entered_ = true;
-    condition_.notify_all();
-    condition_.wait(lock,
-                    [this] { return !block_enumerate_ || release_enumerate_; });
+    enumerate_gate.enter();
     DeviceInfo device;
     device.path = "/dev/fake";
     device.description = "fake serial device";
     device.transport = DeviceTransport::Native;
     return std::vector<DeviceInfo>{std::move(device)};
   }
-
   Status open(const DevicePath &, const PortConfig &) override {
-    std::unique_lock lock(mutex_);
-    open_entered_ = true;
-    condition_.notify_all();
-    condition_.wait(lock, [this] { return !block_open_ || release_open_; });
-    if (open_error_) {
-      return tl::unexpected(*open_error_);
-    }
-    open_ = true;
+    open_gate.enter();
     return {};
   }
-
   Result<int> native_wait_handle() const override { return owner_fd_; }
-
   Result<std::size_t> read_some(std::span<std::byte> destination) override {
     const auto amount =
         ::read(owner_fd_, destination.data(), destination.size());
-    if (amount >= 0) {
+    if (amount >= 0)
       return static_cast<std::size_t>(amount);
-    }
-    if (errno == EAGAIN) {
+    if (errno == EAGAIN)
       return 0U;
-    }
     return tl::unexpected(make_error(
         ErrorCode::SerialDeviceGone, Operation::ReadSerial, "fake read failed",
         std::error_code{errno, std::generic_category()}));
   }
-
-  Result<std::size_t>
-  write_some(const std::span<const std::byte> source) override {
-    std::unique_lock lock(mutex_);
-    ++write_calls_;
-    condition_.notify_all();
-    condition_.wait(lock, [this] { return !block_writes_ || release_writes_; });
-    std::ptrdiff_t step = static_cast<std::ptrdiff_t>(source.size());
-    if (stall_writes_) {
+  Result<std::size_t> write_some(std::span<const std::byte> source) override {
+    write_gate.enter();
+    std::lock_guard lock(mutex_);
+    auto step = static_cast<std::ptrdiff_t>(source.size());
+    if (stall_)
       step = 0;
-    } else if (!write_steps_.empty()) {
-      step = write_steps_.front();
-      write_steps_.pop_front();
-      if (write_steps_.empty() && stall_after_steps_) {
-        stall_writes_ = true;
-      }
+    else if (!steps_.empty()) {
+      step = steps_.front();
+      steps_.pop_front();
+      if (steps_.empty() && stall_after_steps_)
+        stall_ = true;
     }
-    if (step < 0) {
+    if (step < 0)
       return tl::unexpected(make_error(ErrorCode::SerialDeviceGone,
                                        Operation::WriteSerial,
                                        "injected device disappearance"));
-    }
-    const auto requested = static_cast<std::size_t>(step);
-    const auto amount = std::min(requested, source.size());
+    const auto amount = std::min(static_cast<std::size_t>(step), source.size());
     written_.insert(written_.end(), source.begin(),
                     source.begin() + static_cast<std::ptrdiff_t>(amount));
     return amount;
   }
-
   Status close() override {
-    std::unique_lock lock(mutex_);
-    close_entered_ = true;
-    condition_.notify_all();
-    condition_.wait(lock, [this] { return !block_close_ || release_close_; });
-    open_ = false;
-    ++close_calls_;
-    condition_.notify_all();
+    close_gate.enter();
     return {};
   }
-
-  void block_open() {
-    std::lock_guard lock(mutex_);
-    block_open_ = true;
-  }
-
-  void block_enumerate() {
-    std::lock_guard lock(mutex_);
-    block_enumerate_ = true;
-  }
-
-  [[nodiscard]] bool
-  wait_for_enumerate_entry(const std::chrono::milliseconds limit) {
-    std::unique_lock lock(mutex_);
-    return condition_.wait_for(lock, limit,
-                               [this] { return enumerate_entered_; });
-  }
-
-  void release_enumerate() {
-    std::lock_guard lock(mutex_);
-    release_enumerate_ = true;
-    condition_.notify_all();
-  }
-
-  [[nodiscard]] bool
-  wait_for_open_entry(const std::chrono::milliseconds limit) {
-    std::unique_lock lock(mutex_);
-    return condition_.wait_for(lock, limit, [this] { return open_entered_; });
-  }
-
-  void release_open() {
-    std::lock_guard lock(mutex_);
-    release_open_ = true;
-    condition_.notify_all();
-  }
-
   void set_write_steps(std::initializer_list<std::ptrdiff_t> steps) {
     std::lock_guard lock(mutex_);
-    write_steps_.assign(steps);
+    steps_.assign(steps);
   }
-
   void stall_writes() {
     std::lock_guard lock(mutex_);
-    stall_writes_ = true;
+    stall_ = true;
   }
-
-  void block_writes() {
-    std::lock_guard lock(mutex_);
-    block_writes_ = true;
-  }
-
-  void release_writes() {
-    std::lock_guard lock(mutex_);
-    release_writes_ = true;
-    condition_.notify_all();
-  }
-
-  void block_close() {
-    std::lock_guard lock(mutex_);
-    block_close_ = true;
-  }
-
-  [[nodiscard]] bool
-  wait_for_close_entry(const std::chrono::milliseconds limit) {
-    std::unique_lock lock(mutex_);
-    return condition_.wait_for(lock, limit, [this] { return close_entered_; });
-  }
-
-  void release_close() {
-    std::lock_guard lock(mutex_);
-    release_close_ = true;
-    condition_.notify_all();
-  }
-
   void resume_writes() {
     std::lock_guard lock(mutex_);
-    stall_writes_ = false;
-    stall_after_steps_ = false;
+    stall_ = stall_after_steps_ = false;
   }
-
-  void write_prefix_then_stall(const std::ptrdiff_t prefix) {
+  void write_prefix_then_stall(std::ptrdiff_t prefix) {
     std::lock_guard lock(mutex_);
-    write_steps_ = {prefix};
+    steps_ = {prefix};
     stall_after_steps_ = true;
   }
-
-  [[nodiscard]] bool
-  wait_for_write_calls(const std::size_t count,
-                       const std::chrono::milliseconds limit) {
-    std::unique_lock lock(mutex_);
-    return condition_.wait_for(lock, limit,
-                               [this, count] { return write_calls_ >= count; });
-  }
-
-  [[nodiscard]] std::vector<std::byte> written() const {
+  std::vector<std::byte> written() const {
     std::lock_guard lock(mutex_);
     return written_;
   }
-
-  void inject_rx(const std::span<const std::byte> bytes) const {
-    const auto amount = ::write(peer_fd_, bytes.data(), bytes.size());
-    if (amount != static_cast<ssize_t>(bytes.size())) {
-      throw std::system_error(errno, std::generic_category(),
-                              "fake RX injection failed");
+  void inject_rx(std::span<const std::byte> bytes) const {
+    if (::write(peer_fd_, bytes.data(), bytes.size()) !=
+        static_cast<ssize_t>(bytes.size())) {
+      throw std::runtime_error("fake RX injection failed");
     }
   }
-
-  void disappear() {
-    std::lock_guard lock(mutex_);
-    if (peer_fd_ >= 0) {
-      static_cast<void>(::close(std::exchange(peer_fd_, -1)));
-    }
+  void disappear() { static_cast<void>(::close(std::exchange(peer_fd_, -1))); }
+  void release_all() {
+    open_gate.release();
+    enumerate_gate.release();
+    write_gate.release();
+    close_gate.release();
   }
+  Gate open_gate, enumerate_gate, write_gate, close_gate;
 
 private:
-  int owner_fd_{-1};
-  int peer_fd_{-1};
+  int owner_fd_{-1}, peer_fd_{-1};
   mutable std::mutex mutex_;
-  std::condition_variable condition_;
-  bool block_open_{};
-  bool release_open_{};
-  bool open_entered_{};
-  bool block_enumerate_{};
-  bool release_enumerate_{};
-  bool enumerate_entered_{};
-  bool open_{};
-  std::optional<Error> open_error_;
-  std::deque<std::ptrdiff_t> write_steps_;
-  bool block_writes_{};
-  bool release_writes_{};
-  bool block_close_{};
-  bool release_close_{};
-  bool close_entered_{};
-  bool stall_writes_{};
-  bool stall_after_steps_{};
+  std::deque<std::ptrdiff_t> steps_;
+  bool stall_{}, stall_after_steps_{};
   std::vector<std::byte> written_;
-  std::size_t write_calls_{};
-  std::size_t close_calls_{};
 };
 
-[[nodiscard]] DevicePath fake_path() {
+DevicePath fake_path() {
   return {.requested = "/dev/fake",
           .canonical = "/dev/fake",
           .identity = {.device = 1U, .inode = 2U, .special_device = 3U}};
 }
-
-[[nodiscard]] std::unique_ptr<SerialService>
-make_service(FakeSerialBackend *&backend,
-             const SerialServiceOptions &options = {}) {
-  auto fake = std::make_unique<FakeSerialBackend>();
-  backend = fake.get();
-  auto created = SerialService::create(std::move(fake), options);
-  if (!created) {
-    throw std::runtime_error(created.error().detail);
-  }
-  return std::move(*created);
+std::vector<std::byte> bytes(std::string_view text) {
+  std::vector<std::byte> result;
+  for (const auto value : text)
+    result.push_back(static_cast<std::byte>(value));
+  return result;
 }
-
-[[nodiscard]] bool wait_until(const auto &predicate,
-                              const std::chrono::milliseconds timeout = 1s) {
+bool wait_until(const auto &predicate, std::chrono::milliseconds timeout = 1s) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (predicate()) {
-      return true;
-    }
+  while (!predicate()) {
+    if (std::chrono::steady_clock::now() >= deadline)
+      return false;
     std::this_thread::sleep_for(1ms);
   }
-  return predicate();
+  return true;
 }
-
-[[nodiscard]] std::vector<SerialCompletion>
-wait_completions(SerialService &service, const std::size_t count) {
-  std::vector<SerialCompletion> result;
-  static_cast<void>(wait_until([&] {
-    auto current = service.drain_completions();
-    result.insert(result.end(), std::make_move_iterator(current.begin()),
-                  std::make_move_iterator(current.end()));
-    return result.size() >= count;
-  }));
-  return result;
+std::size_t retained_event_bytes(const SerialDataEvent &event) {
+  return sizeof(SerialDataEvent) + event.bytes.capacity() +
+         (event.error ? event.error->detail.capacity() : 0U);
 }
-
-[[nodiscard]] std::size_t retained_event_bytes(const SerialDataEvent &event) {
-  std::size_t result = sizeof(SerialDataEvent) + event.bytes.capacity();
-  if (event.error) {
-    result += event.error->detail.capacity();
-  }
-  return result;
-}
-
-[[nodiscard]] std::size_t
-retained_event_bytes(const std::vector<SerialDataEvent> &events) {
+std::size_t retained_event_bytes(const std::vector<SerialDataEvent> &events) {
   std::size_t result = 0U;
   for (const auto &event : events) {
     result += retained_event_bytes(event);
   }
   return result;
 }
-
-[[nodiscard]] ConnectCompletion connect(SerialService &service,
-                                        const std::uint64_t operation = 1U,
-                                        const std::uint64_t generation = 1U) {
-  auto accepted = service.submit_connect(
-      {{OperationId{operation}, ConnectionGeneration{generation}},
-       fake_path(),
-       {}});
-  if (!accepted) {
-    throw std::runtime_error(accepted.error().detail);
-  }
-  const auto completions = wait_completions(service, 1U);
-  if (completions.empty() ||
-      !std::holds_alternative<ConnectCompletion>(completions.front())) {
-    throw std::runtime_error("connect completion was not published");
-  }
-  return std::get<ConnectCompletion>(completions.front());
+const TxCompletion &tx_result(const SerialCompletion &value, std::uint64_t id,
+                              OperationOutcome outcome) {
+  REQUIRE(std::holds_alternative<TxCompletion>(value));
+  const auto &tx = std::get<TxCompletion>(value);
+  CHECK(tx.operation_id == OperationId{id});
+  CHECK(tx.outcome == outcome);
+  return tx;
 }
 
+struct SerialFixture {
+  explicit SerialFixture(SerialServiceOptions options = {}) {
+    auto fake = std::make_unique<FakeSerialBackend>();
+    backend = fake.get();
+    auto created = SerialService::create(std::move(fake), options);
+    REQUIRE(created);
+    service = std::move(*created);
+  }
+  ~SerialFixture() {
+    backend->release_all();
+    service->request_stop();
+    if (!service->wait_until_stopped(std::chrono::steady_clock::now() + 2s))
+      std::terminate();
+  }
+  std::vector<SerialCompletion> completions(std::size_t count) {
+    std::vector<SerialCompletion> result;
+    REQUIRE(wait_until([&] {
+      auto batch = service->drain_completions();
+      result.insert(result.end(), std::make_move_iterator(batch.begin()),
+                    std::make_move_iterator(batch.end()));
+      return result.size() >= count;
+    }));
+    REQUIRE(result.size() == count);
+    return result;
+  }
+  void connect(std::uint64_t operation = 1U, std::uint64_t generation = 1U) {
+    REQUIRE(service->submit_connect(
+        {{OperationId{operation}, ConnectionGeneration{generation}},
+         fake_path(),
+         {}}));
+    const auto result = completions(1U);
+    REQUIRE(std::holds_alternative<ConnectCompletion>(result.front()));
+    connected = std::get<ConnectCompletion>(result.front());
+    REQUIRE(connected.outcome == OperationOutcome::Succeeded);
+    REQUIRE(connected.session_id);
+  }
+  Result<OperationId> send(std::uint64_t id, std::vector<std::byte> payload,
+                           std::optional<TaskGeneration> task = std::nullopt) {
+    return service->submit_tx(
+        {{OperationId{id}, connected.generation, *connected.session_id, task},
+         std::move(payload)});
+  }
+  auto disconnect(std::uint64_t id) {
+    return service->request_disconnect(
+        {OperationId{id}, connected.generation, connected.session_id});
+  }
+  std::vector<SerialDataEvent> drain_events(std::size_t count) {
+    const auto queued = service->queued_data_bytes();
+    auto result = service->drain_data(8U);
+    REQUIRE(result.size() == count);
+    CHECK(queued == retained_event_bytes(result));
+    CHECK(service->queued_data_bytes() == 0U);
+    for (std::size_t i = 1U; i < result.size(); ++i)
+      CHECK(result[i - 1U].owner_order < result[i].owner_order);
+    return result;
+  }
+  FakeSerialBackend *backend{};
+  std::unique_ptr<SerialService> service;
+  ConnectCompletion connected;
+};
 } // namespace
 
-TEST_CASE("normal queue saturation cannot block connect cancellation",
+TEST_CASE("open cancellation and stop settle accepted work under saturation",
           "[serial][owner]") {
   SerialServiceOptions options;
   options.command_max_messages = 1U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  backend->block_open();
-
-  REQUIRE(service->submit_connect(
+  SerialFixture test{options};
+  test.backend->open_gate.block();
+  REQUIRE(test.service->submit_connect(
       {{OperationId{1}, ConnectionGeneration{1}}, fake_path(), {}}));
-  REQUIRE(backend->wait_for_open_entry(1s));
-  const auto rejected = service->submit_connect(
+  REQUIRE(test.backend->open_gate.wait());
+  const auto rejected = test.service->submit_connect(
       {{OperationId{2}, ConnectionGeneration{2}}, fake_path(), {}});
   REQUIRE_FALSE(rejected);
-  REQUIRE(rejected.error().detail == "serial command queue is full");
-
-  REQUIRE(service->request_cancel_connect(
-      {OperationId{3}, ConnectionGeneration{1}}));
-  backend->release_open();
-  const auto completions = wait_completions(*service, 2U);
-  REQUIRE(completions.size() == 2U);
-  const auto connect_result =
-      std::find_if(completions.begin(), completions.end(),
-                   [](const SerialCompletion &value) {
-                     return std::holds_alternative<ConnectCompletion>(value);
-                   });
-  REQUIRE(connect_result != completions.end());
-  REQUIRE(std::get<ConnectCompletion>(*connect_result).outcome ==
-          OperationOutcome::Cancelled);
-  REQUIRE(std::any_of(completions.begin(), completions.end(),
-                      [](const SerialCompletion &value) {
-                        return std::holds_alternative<DisconnectCompletion>(
-                            value);
-                      }));
+  CHECK(rejected.error().detail == "serial command queue is full");
+  std::size_t count = 1U;
+  SECTION("cancel has a reserved control completion") {
+    REQUIRE(test.service->request_cancel_connect(
+        {OperationId{3}, ConnectionGeneration{1}}));
+    count = 2U;
+  }
+  SECTION("stop closes all connect producers") {
+    test.service->request_stop();
+    REQUIRE_FALSE(test.service->submit_connect(
+        {{OperationId{4}, ConnectionGeneration{2}}, fake_path(), {}}));
+    REQUIRE_FALSE(test.service->request_cancel_connect(
+        {OperationId{3}, ConnectionGeneration{1}}));
+  }
+  test.backend->open_gate.release();
+  const auto result = test.completions(count);
+  REQUIRE(std::holds_alternative<ConnectCompletion>(result[0]));
+  CHECK(std::get<ConnectCompletion>(result[0]).outcome ==
+        OperationOutcome::Cancelled);
+  if (count == 2U)
+    REQUIRE(std::holds_alternative<DisconnectCompletion>(result[1]));
+  else
+    REQUIRE(test.service->wait_until_stopped(std::chrono::steady_clock::now() +
+                                             1s));
 }
 
-TEST_CASE("stop during open rejects new work and settles the accepted connect",
-          "[serial][owner]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  backend->block_open();
-  REQUIRE(service->submit_connect(
-      {{OperationId{1}, ConnectionGeneration{1}}, fake_path(), {}}));
-  REQUIRE(backend->wait_for_open_entry(1s));
-
-  service->request_stop();
-  REQUIRE_FALSE(service->submit_connect(
-      {{OperationId{2}, ConnectionGeneration{2}}, fake_path(), {}}));
-  REQUIRE_FALSE(service->request_cancel_connect(
-      {OperationId{3}, ConnectionGeneration{1}}));
-  backend->release_open();
-  REQUIRE(service->wait_until_stopped(std::chrono::steady_clock::now() + 1s));
-
-  const auto completions = service->drain_completions();
-  REQUIRE(completions.size() == 1U);
-  REQUIRE(std::holds_alternative<ConnectCompletion>(completions.front()));
-  REQUIRE(std::get<ConnectCompletion>(completions.front()).outcome ==
-          OperationOutcome::Cancelled);
-}
-
-TEST_CASE("persistent scanner keeps value results and one bounded pending scan",
+TEST_CASE("scanner bounds pending work and settles active work during stop",
           "[serial][scanner]") {
-  auto backend = std::make_unique<FakeSerialBackend>();
-  auto scanner_result = DeviceScanner::create(std::move(backend));
-  REQUIRE(scanner_result);
-  auto scanner = std::move(*scanner_result);
+  auto fake = std::make_unique<FakeSerialBackend>();
+  auto *backend = fake.get();
+  backend->enumerate_gate.block();
+  auto created = DeviceScanner::create(std::move(fake));
+  REQUIRE(created);
+  auto scanner = std::move(*created);
+  struct Cleanup {
+    FakeSerialBackend &backend;
+    DeviceScanner &scanner;
+    ~Cleanup() {
+      backend.release_all();
+      scanner.request_stop();
+      if (!scanner.wait_until_stopped(std::chrono::steady_clock::now() + 2s))
+        std::terminate();
+    }
+  } cleanup{*backend, *scanner};
   REQUIRE(scanner->submit_scan(OperationId{1}, ScanGeneration{1}));
-  REQUIRE(scanner->submit_scan(OperationId{2}, ScanGeneration{2}));
-  REQUIRE_FALSE(scanner->submit_scan(OperationId{3}, ScanGeneration{3}));
-
-  std::vector<ScanCompletion> completions;
+  REQUIRE(backend->enumerate_gate.wait());
+  std::size_t count = 1U;
+  SECTION("one pending request is retained and the third is rejected") {
+    REQUIRE(scanner->submit_scan(OperationId{2}, ScanGeneration{2}));
+    REQUIRE_FALSE(scanner->submit_scan(OperationId{3}, ScanGeneration{3}));
+    count = 2U;
+  }
+  SECTION("stop rejects new work before enumerate returns") {
+    scanner->request_stop();
+    REQUIRE_FALSE(scanner->submit_scan(OperationId{2}, ScanGeneration{2}));
+  }
+  backend->enumerate_gate.release();
+  std::vector<ScanCompletion> results;
   REQUIRE(wait_until([&] {
     auto batch = scanner->drain_completions();
-    completions.insert(completions.end(),
-                       std::make_move_iterator(batch.begin()),
-                       std::make_move_iterator(batch.end()));
-    return completions.size() == 2U;
+    results.insert(results.end(), std::make_move_iterator(batch.begin()),
+                   std::make_move_iterator(batch.end()));
+    return results.size() >= count;
   }));
-  REQUIRE(completions[0].generation == ScanGeneration{1});
-  REQUIRE(completions[1].generation == ScanGeneration{2});
-  REQUIRE(completions[0].devices.front().path == "/dev/fake");
+  REQUIRE(results.size() == count);
+  CHECK(results[0].operation_id == OperationId{1});
+  CHECK(results[0].generation == ScanGeneration{1});
+  if (count == 1U)
+    CHECK(results[0].outcome == OperationOutcome::Cancelled);
+  else {
+    CHECK(results[1].generation == ScanGeneration{2});
+    REQUIRE_FALSE(results[0].devices.empty());
+    CHECK(results[0].devices.front().path == "/dev/fake");
+  }
   scanner->request_stop();
   REQUIRE(scanner->wait_until_stopped(std::chrono::steady_clock::now() + 1s));
   REQUIRE(scanner->worker_stopped_signal());
 }
 
-TEST_CASE("scanner stop settles an active request and cannot lose its wakeup",
-          "[serial][scanner]") {
-  auto backend = std::make_unique<FakeSerialBackend>();
-  auto *const fake = backend.get();
-  fake->block_enumerate();
-  auto scanner_result = DeviceScanner::create(std::move(backend));
-  REQUIRE(scanner_result);
-  auto scanner = std::move(*scanner_result);
-  REQUIRE(scanner->submit_scan(OperationId{1}, ScanGeneration{1}));
-  REQUIRE(fake->wait_for_enumerate_entry(1s));
-
-  scanner->request_stop();
-  REQUIRE_FALSE(scanner->submit_scan(OperationId{2}, ScanGeneration{2}));
-  fake->release_enumerate();
-  REQUIRE(scanner->wait_until_stopped(std::chrono::steady_clock::now() + 1s));
-  const auto completions = scanner->drain_completions();
-  REQUIRE(completions.size() == 1U);
-  REQUIRE(completions.front().operation_id == OperationId{1});
-  REQUIRE(completions.front().outcome == OperationOutcome::Cancelled);
+TEST_CASE("partial TX never interleaves and manual TX wins the next boundary",
+          "[serial][owner][scheduler]") {
+  SerialFixture test;
+  test.connect();
+  test.backend->set_write_steps({2, 0, 1, 64, 1, 64, 1, 64});
+  test.backend->write_gate.block();
+  REQUIRE(test.send(2U, bytes("Abcd")));
+  REQUIRE(test.backend->write_gate.wait());
+  REQUIRE(test.send(3U, bytes("Qq"), TaskGeneration{7}));
+  REQUIRE(test.send(4U, bytes("Bb")));
+  test.backend->write_gate.release();
+  const auto result = test.completions(3U);
+  tx_result(result[0], 2U, OperationOutcome::Succeeded);
+  tx_result(result[1], 4U, OperationOutcome::Succeeded);
+  tx_result(result[2], 3U, OperationOutcome::Succeeded);
+  CHECK(test.backend->written() == bytes("AbcdBbQq"));
+  CHECK_FALSE(test.service->fatal_signal());
 }
 
-TEST_CASE("TX writes are partial nonblocking and never interleave requests",
-          "[serial][owner]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->set_write_steps({2, 0, 1, 64, 1, 64});
-
-  const std::vector<std::byte> first{std::byte{'a'}, std::byte{'b'},
-                                     std::byte{'c'}, std::byte{'d'}};
-  const std::vector<std::byte> second{std::byte{'X'}, std::byte{'Y'}};
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              first}));
-  REQUIRE(service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              second}));
-  const auto completions = wait_completions(*service, 2U);
-  REQUIRE(completions.size() == 2U);
-  REQUIRE(std::all_of(completions.begin(), completions.end(),
-                      [](const SerialCompletion &value) {
-                        return std::get<TxCompletion>(value).outcome ==
-                               OperationOutcome::Succeeded;
-                      }));
-  auto expected = first;
-  expected.insert(expected.end(), second.begin(), second.end());
-  REQUIRE(backend->written() == expected);
-}
-
-TEST_CASE("TX saturation still permits reliable disconnect control",
-          "[serial][owner]") {
+TEST_CASE(
+    "disconnect and stop interrupt partial TX despite saturated admission",
+    "[serial][owner]") {
   SerialServiceOptions options;
   options.tx_max_messages = 1U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->stall_writes();
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{1}, std::byte{2}}}));
-  REQUIRE(backend->wait_for_write_calls(1U, 1s));
-  REQUIRE_FALSE(service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
-                                     *connected.session_id, std::nullopt},
-                                    {std::byte{3}}}));
-  REQUIRE(service->request_disconnect(
-      {OperationId{4}, ConnectionGeneration{1}, connected.session_id}));
-
-  const auto completions = wait_completions(*service, 2U);
-  REQUIRE(completions.size() == 2U);
-  REQUIRE(std::any_of(completions.begin(), completions.end(),
-                      [](const SerialCompletion &value) {
-                        return std::holds_alternative<TxCompletion>(value) &&
-                               std::get<TxCompletion>(value).outcome ==
-                                   OperationOutcome::Cancelled;
-                      }));
-  REQUIRE(std::any_of(completions.begin(), completions.end(),
-                      [](const SerialCompletion &value) {
-                        return std::holds_alternative<DisconnectCompletion>(
-                            value);
-                      }));
-  const auto data = service->drain_data(8U);
-  REQUIRE(
-      std::any_of(data.begin(), data.end(), [](const SerialDataEvent &event) {
-        return event.kind == SerialDataKind::Cleanup &&
-               event.origin == SessionEventOrigin::Cleanup;
-      }));
+  SerialFixture test{options};
+  test.connect();
+  test.backend->set_write_steps({1, 64});
+  test.backend->write_gate.block();
+  REQUIRE(test.send(2U, bytes("ABC")));
+  REQUIRE(test.backend->write_gate.wait());
+  REQUIRE_FALSE(test.send(3U, bytes("D")));
+  std::size_t count = 1U;
+  SECTION("disconnect during the backend call") {
+    REQUIRE(test.disconnect(4U));
+    count = 2U;
+  }
+  SECTION("owner stop during the backend call") {
+    test.service->request_stop();
+  }
+  test.backend->write_gate.release();
+  const auto result = test.completions(count);
+  CHECK(tx_result(result[0], 2U, OperationOutcome::Cancelled).accepted_bytes ==
+        1U);
+  if (count == 2U)
+    REQUIRE(std::holds_alternative<DisconnectCompletion>(result[1]));
+  else
+    REQUIRE(test.service->wait_until_stopped(std::chrono::steady_clock::now() +
+                                             1s));
+  CHECK(test.backend->written() == bytes("A"));
+  const auto events = test.drain_events(3U);
+  CHECK(events[0].kind == SerialDataKind::Tx);
+  CHECK(events[1].kind == SerialDataKind::Error);
+  CHECK(events[2].kind == SerialDataKind::Cleanup);
+  CHECK(events[2].origin == SessionEventOrigin::Cleanup);
 }
 
-TEST_CASE("disconnect wake prevents writes after the current backend call",
-          "[serial][owner]") {
-  SerialServiceOptions options;
-  options.tx_max_messages = 1U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->set_write_steps({1, 64});
-  backend->block_writes();
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{1}, std::byte{2}, std::byte{3}}}));
-  REQUIRE(backend->wait_for_write_calls(1U, 1s));
-  REQUIRE(service->request_disconnect(
-      {OperationId{3}, ConnectionGeneration{1}, connected.session_id}));
-  backend->release_writes();
-
-  const auto completions = wait_completions(*service, 2U);
-  REQUIRE(completions.size() == 2U);
-  REQUIRE(std::holds_alternative<TxCompletion>(completions[0]));
-  REQUIRE(std::get<TxCompletion>(completions[0]).outcome ==
-          OperationOutcome::Cancelled);
-  REQUIRE(std::get<TxCompletion>(completions[0]).accepted_bytes == 1U);
-  REQUIRE(std::holds_alternative<DisconnectCompletion>(completions[1]));
-  REQUIRE(backend->written().size() == 1U);
-
-  const auto queued_bytes = service->queued_data_bytes();
-  const auto events = service->drain_data(8U);
-  REQUIRE(events.size() == 3U);
-  REQUIRE(events[0].kind == SerialDataKind::Tx);
-  REQUIRE(events[1].kind == SerialDataKind::Error);
-  REQUIRE(events[2].kind == SerialDataKind::Cleanup);
-  REQUIRE(events[0].owner_order < events[1].owner_order);
-  REQUIRE(events[1].owner_order < events[2].owner_order);
-  REQUIRE(queued_bytes == retained_event_bytes(events));
-  REQUIRE(service->queued_data_bytes() == 0U);
-}
-
-TEST_CASE("successful TX events survive saturated data ingress",
+TEST_CASE("successful TX events survive saturated RX ingress",
           "[serial][owner]") {
   SerialServiceOptions options;
   options.command_max_messages = 1U;
   options.tx_max_messages = 2U;
   options.rx_max_chunks = 1U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-
-  const std::vector<std::byte> rx{std::byte{'R'}};
-  backend->inject_rx(rx);
-  REQUIRE(wait_until([&] { return service->queued_data_bytes() != 0U; }));
-  const auto saturated_bytes = service->queued_data_bytes();
-
-  const std::vector<std::byte> first{std::byte{'A'}};
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              first}));
-  const auto first_completion = wait_completions(*service, 1U);
-  REQUIRE(first_completion.size() == 1U);
-  REQUIRE(std::get<TxCompletion>(first_completion.front()).outcome ==
-          OperationOutcome::Succeeded);
+  SerialFixture test{options};
+  test.connect();
+  test.backend->inject_rx(bytes("R"));
+  REQUIRE(wait_until([&] { return test.service->queued_data_bytes() != 0U; }));
+  const auto saturated = test.service->queued_data_bytes();
+  REQUIRE(test.send(2U, bytes("A")));
+  tx_result(test.completions(1U)[0], 2U, OperationOutcome::Succeeded);
   REQUIRE(wait_until([&] {
-    return service->queued_data_bytes() > saturated_bytes ||
-           !service->connection_snapshot().connected;
+    return test.service->queued_data_bytes() > saturated ||
+           !test.service->connection_snapshot().connected;
   }));
-  REQUIRE(service->connection_snapshot().connected);
-  REQUIRE_FALSE(service->overflow_signal());
-
-  const std::vector<std::byte> second{std::byte{'B'}};
-  REQUIRE(service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              second}));
-  const auto second_completion = wait_completions(*service, 1U);
-  REQUIRE(second_completion.size() == 1U);
-  REQUIRE(std::get<TxCompletion>(second_completion.front()).outcome ==
-          OperationOutcome::Succeeded);
-
-  const auto events = service->drain_data(8U);
-  REQUIRE(events.size() == 3U);
-  REQUIRE(events[0].kind == SerialDataKind::Rx);
-  REQUIRE(events[0].bytes == rx);
-  REQUIRE(events[1].kind == SerialDataKind::Tx);
-  REQUIRE(events[1].operation_id == OperationId{2});
-  REQUIRE(events[1].bytes == first);
-  REQUIRE(events[2].kind == SerialDataKind::Tx);
-  REQUIRE(events[2].operation_id == OperationId{3});
-  REQUIRE(events[2].bytes == second);
-  REQUIRE(events[0].owner_order < events[1].owner_order);
-  REQUIRE(events[1].owner_order < events[2].owner_order);
-  REQUIRE_FALSE(service->fatal_signal());
+  REQUIRE(test.service->connection_snapshot().connected);
+  REQUIRE(test.send(3U, bytes("B")));
+  tx_result(test.completions(1U)[0], 3U, OperationOutcome::Succeeded);
+  const auto events = test.drain_events(3U);
+  CHECK(events[0].kind == SerialDataKind::Rx);
+  CHECK(events[0].bytes == bytes("R"));
+  for (std::size_t i = 1U; i <= 2U; ++i) {
+    CHECK(events[i].kind == SerialDataKind::Tx);
+    CHECK(events[i].operation_id == OperationId{i + 1U});
+    CHECK(events[i].bytes == bytes(i == 1U ? "A" : "B"));
+  }
+  CHECK_FALSE(test.service->overflow_signal());
+  CHECK_FALSE(test.service->fatal_signal());
 }
 
-TEST_CASE("completed TX retains admission until terminal data is drained",
+TEST_CASE("retained terminal data keeps its admission and releases it on drain",
           "[serial][owner]") {
   SerialServiceOptions options;
   options.command_max_messages = 1U;
   options.tx_max_messages = 1U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{'A'}}}));
-  const auto completion = wait_completions(*service, 1U);
-  REQUIRE(completion.size() == 1U);
-  REQUIRE(std::get<TxCompletion>(completion.front()).outcome ==
-          OperationOutcome::Succeeded);
-
-  // The configured reserved pool has five slots. More attempts than that must
-  // remain bounded by the one retained TX admission rather than fill the pool.
-  for (std::uint64_t operation = 3U; operation <= 8U; ++operation) {
-    const auto rejected =
-        service->submit_tx({{OperationId{operation}, ConnectionGeneration{1},
-                             *connected.session_id, std::nullopt},
-                            {std::byte{'B'}}});
+  SECTION("TX message reservation survives completion consumption") {
+    SerialFixture test{options};
+    test.connect();
+    REQUIRE(test.send(2U, bytes("A")));
+    tx_result(test.completions(1U)[0], 2U, OperationOutcome::Succeeded);
+    // Exceed the five reserved slots without consuming the retained data.
+    for (std::uint64_t id = 3U; id <= 8U; ++id) {
+      const auto rejected = test.send(id, bytes("B"));
+      REQUIRE_FALSE(rejected);
+      CHECK(rejected.error().detail == "serial TX queue is full");
+    }
+    CHECK(test.service->connection_snapshot().connected);
+    CHECK(test.drain_events(1U)[0].kind == SerialDataKind::Tx);
+    REQUIRE(test.send(9U, bytes("C")));
+    tx_result(test.completions(1U)[0], 9U, OperationOutcome::Succeeded);
+    test.drain_events(1U);
+    CHECK_FALSE(test.service->fatal_signal());
+  }
+  SECTION("cleanup reservations survive across sessions") {
+    SerialFixture test{options};
+    for (std::uint64_t generation = 1U; generation <= 3U; ++generation) {
+      test.connect(generation * 2U - 1U, generation);
+      REQUIRE(test.disconnect(generation * 2U));
+      REQUIRE(std::holds_alternative<DisconnectCompletion>(
+          test.completions(1U)[0]));
+    }
+    const auto rejected = test.service->submit_connect(
+        {{OperationId{7}, ConnectionGeneration{4}}, fake_path(), {}});
     REQUIRE_FALSE(rejected);
-    REQUIRE(rejected.error().detail == "serial TX queue is full");
+    CHECK(rejected.error().detail == "serial cleanup capacity is full");
+    for (const auto &event : test.drain_events(3U))
+      CHECK(event.kind == SerialDataKind::Cleanup);
+    test.connect(8U, 4U);
+    CHECK_FALSE(test.service->fatal_signal());
   }
-  REQUIRE_FALSE(service->fatal_signal());
-  REQUIRE(service->connection_snapshot().connected);
-
-  const auto retained = service->drain_data(8U);
-  REQUIRE(retained.size() == 1U);
-  REQUIRE(retained.front().kind == SerialDataKind::Tx);
-  REQUIRE(service->queued_data_bytes() == 0U);
-
-  REQUIRE(service->submit_tx({{OperationId{9}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{'C'}}}));
-  REQUIRE(wait_completions(*service, 1U).size() == 1U);
-  REQUIRE(service->drain_data(8U).size() == 1U);
-  REQUIRE_FALSE(service->fatal_signal());
-}
-
-TEST_CASE("cleanup admission remains reserved until cleanup is drained",
-          "[serial][owner]") {
-  SerialServiceOptions options;
-  options.command_max_messages = 1U;
-  options.tx_max_messages = 1U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-
-  for (std::uint64_t generation = 1U; generation <= 3U; ++generation) {
-    const auto operation = generation * 2U - 1U;
-    const auto connected = connect(*service, operation, generation);
-    REQUIRE(connected.session_id);
-    REQUIRE(service->request_disconnect({OperationId{operation + 1U},
-                                         ConnectionGeneration{generation},
-                                         connected.session_id}));
-    const auto completion = wait_completions(*service, 1U);
-    REQUIRE(completion.size() == 1U);
-    REQUIRE(std::holds_alternative<DisconnectCompletion>(completion.front()));
+  SECTION("TX byte reservations cannot consume the independent RX quota") {
+    options.tx_max_messages = 8U;
+    options.tx_max_bytes = 1024U * 1024U;
+    options.rx_max_chunks = 1U;
+    options.rx_max_bytes = 4096U;
+    SerialFixture test{options};
+    test.connect();
+    const std::vector<std::byte> payload(700U * 1024U, std::byte{'T'});
+    REQUIRE(test.send(2U, payload));
+    test.completions(1U);
+    const auto rejected = test.send(3U, payload);
+    REQUIRE_FALSE(rejected);
+    CHECK(rejected.error().detail == "serial TX queue is full");
+    const auto before = test.service->queued_data_bytes();
+    REQUIRE(before > options.rx_max_bytes);
+    test.backend->inject_rx(bytes("R"));
+    REQUIRE(
+        wait_until([&] { return test.service->queued_data_bytes() > before; }));
+    REQUIRE(test.service->connection_snapshot().connected);
+    CHECK_FALSE(test.service->overflow_signal());
+    const auto events = test.drain_events(2U);
+    CHECK(events[0].kind == SerialDataKind::Tx);
+    CHECK(events[1].kind == SerialDataKind::Rx);
+    CHECK(retained_event_bytes(events[0]) == before);
+    REQUIRE(test.send(3U, payload));
+    test.completions(1U);
+    test.drain_events(1U);
   }
-
-  const auto rejected = service->submit_connect(
-      {{OperationId{7}, ConnectionGeneration{4}}, fake_path(), {}});
-  REQUIRE_FALSE(rejected);
-  REQUIRE(rejected.error().detail == "serial cleanup capacity is full");
-  REQUIRE_FALSE(service->fatal_signal());
-
-  const auto cleanup = service->drain_data(8U);
-  REQUIRE(cleanup.size() == 3U);
-  REQUIRE(std::all_of(cleanup.begin(), cleanup.end(), [](const auto &event) {
-    return event.kind == SerialDataKind::Cleanup;
-  }));
-  REQUIRE(cleanup[0].owner_order < cleanup[1].owner_order);
-  REQUIRE(cleanup[1].owner_order < cleanup[2].owner_order);
-  REQUIRE(service->queued_data_bytes() == 0U);
-
-  const auto connected = connect(*service, 8U, 4U);
-  REQUIRE(connected.session_id);
-  REQUIRE_FALSE(service->fatal_signal());
 }
 
-TEST_CASE("retained TX bytes gate admission without consuming RX capacity",
-          "[serial][owner]") {
-  SerialServiceOptions options;
-  options.tx_max_messages = 8U;
-  options.tx_max_bytes = 1024U * 1024U;
-  options.rx_max_chunks = 1U;
-  options.rx_max_bytes = 4096U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-
-  const std::vector<std::byte> payload(700U * 1024U, std::byte{'T'});
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              payload}));
-  REQUIRE(wait_completions(*service, 1U).size() == 1U);
-
-  const auto rejected =
-      service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
-                           *connected.session_id, std::nullopt},
-                          payload});
-  REQUIRE_FALSE(rejected);
-  REQUIRE(rejected.error().detail == "serial TX queue is full");
-
-  const auto before_rx = service->queued_data_bytes();
-  REQUIRE(before_rx > options.rx_max_bytes);
-  const std::vector<std::byte> rx{std::byte{'R'}};
-  backend->inject_rx(rx);
-  REQUIRE(wait_until([&] { return service->queued_data_bytes() > before_rx; }));
-  REQUIRE(service->connection_snapshot().connected);
-  REQUIRE_FALSE(service->overflow_signal());
-
-  const auto retained = service->drain_data(8U);
-  REQUIRE(retained.size() == 2U);
-  REQUIRE(retained[0].kind == SerialDataKind::Tx);
-  REQUIRE(retained[1].kind == SerialDataKind::Rx);
-  REQUIRE(retained_event_bytes(retained) ==
-          before_rx + retained_event_bytes(retained[1]));
-  REQUIRE(service->queued_data_bytes() == 0U);
-
-  REQUIRE(service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              payload}));
-  REQUIRE(wait_completions(*service, 1U).size() == 1U);
-  REQUIRE(service->drain_data(8U).size() == 1U);
-}
-
-TEST_CASE("TX timeout activates the next queued request with a fresh deadline",
-          "[serial][owner]") {
+TEST_CASE(
+    "TX deadlines stop partial writes and restart only for the next request",
+    "[serial][owner]") {
   SerialServiceOptions options;
   options.tx_timeout = 100ms;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->write_prefix_then_stall(1);
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{1}, std::byte{2}}}));
-  REQUIRE(service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{2}}}));
-  const auto first = wait_completions(*service, 1U);
-  REQUIRE(first.size() == 1U);
-  REQUIRE(std::get<TxCompletion>(first.front()).operation_id == OperationId{2});
-  REQUIRE(std::get<TxCompletion>(first.front()).outcome ==
-          OperationOutcome::TimedOut);
-  REQUIRE(std::get<TxCompletion>(first.front()).error);
-  REQUIRE(std::get<TxCompletion>(first.front()).error->code ==
-          ErrorCode::SerialOperationTimedOut);
-  const auto timed_out_events = service->drain_data(8U);
-  REQUIRE(timed_out_events.size() == 2U);
-  REQUIRE(timed_out_events[0].kind == SerialDataKind::Tx);
-  REQUIRE(timed_out_events[0].bytes.size() == 1U);
-  REQUIRE(timed_out_events[1].kind == SerialDataKind::Error);
-  REQUIRE(timed_out_events[1].error);
-  REQUIRE(timed_out_events[1].error->code ==
-          ErrorCode::SerialOperationTimedOut);
-  REQUIRE(timed_out_events[0].owner_order < timed_out_events[1].owner_order);
-
-  std::this_thread::sleep_for(60ms);
-  backend->resume_writes();
-  const auto second = wait_completions(*service, 1U);
-  REQUIRE(second.size() == 1U);
-  REQUIRE(std::get<TxCompletion>(second.front()).operation_id ==
-          OperationId{3});
-  REQUIRE(std::get<TxCompletion>(second.front()).outcome ==
-          OperationOutcome::Succeeded);
+  SerialFixture test{options};
+  test.connect();
+  bool queued_next = false;
+  SECTION(
+      "zero progress times out and the queued request gets a fresh deadline") {
+    test.backend->write_prefix_then_stall(1);
+    REQUIRE(test.send(2U, bytes("AB")));
+    REQUIRE(test.send(3U, bytes("B")));
+    queued_next = true;
+  }
+  SECTION("a positive partial write returns after its deadline") {
+    test.backend->set_write_steps({1, 64});
+    test.backend->write_gate.block();
+    REQUIRE(test.send(2U, bytes("ABC")));
+    REQUIRE(test.backend->write_gate.wait());
+    std::this_thread::sleep_for(150ms);
+    test.backend->write_gate.release();
+  }
+  const auto first = test.completions(1U);
+  const auto &tx = tx_result(first[0], 2U, OperationOutcome::TimedOut);
+  CHECK(tx.accepted_bytes == 1U);
+  REQUIRE(tx.error);
+  CHECK(tx.error->code == ErrorCode::SerialOperationTimedOut);
+  CHECK(test.backend->written() == bytes("A"));
+  const auto events = test.drain_events(2U);
+  CHECK(events[0].kind == SerialDataKind::Tx);
+  CHECK(events[0].bytes == bytes("A"));
+  CHECK(events[1].kind == SerialDataKind::Error);
+  REQUIRE(events[1].error);
+  CHECK(events[1].error->code == ErrorCode::SerialOperationTimedOut);
+  CHECK(events[1].error->operation_id == OperationId{2});
+  if (queued_next) {
+    std::this_thread::sleep_for(60ms);
+    test.backend->resume_writes();
+    tx_result(test.completions(1U)[0], 3U, OperationOutcome::Succeeded);
+  }
+  CHECK_FALSE(test.service->fatal_signal());
 }
 
 TEST_CASE("zero-byte TX writes use bounded retry backoff", "[serial][owner]") {
   SerialServiceOptions options;
   options.tx_timeout = 500ms;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->stall_writes();
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{1}}}));
-  REQUIRE(backend->wait_for_write_calls(1U, 1s));
-
-  const auto before = service->wait_count();
+  SerialFixture test{options};
+  test.connect();
+  test.backend->stall_writes();
+  REQUIRE(test.send(2U, bytes("A")));
+  REQUIRE(test.backend->write_gate.wait());
+  const auto before = test.service->wait_count();
   std::this_thread::sleep_for(50ms);
-  const auto waits = service->wait_count() - before;
-  REQUIRE(waits >= 3U);
-  REQUIRE(waits <= 20U);
+  const auto waits = test.service->wait_count() - before;
+  CHECK(waits >= 3U);
+  CHECK(waits <= 20U);
 }
 
-TEST_CASE("stop closes every producer and settles all accepted TX",
+TEST_CASE("owner stop settles producers and publishes its fixed lifecycle slot",
           "[serial][owner]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->stall_writes();
-  for (std::uint64_t operation = 2U; operation <= 4U; ++operation) {
-    REQUIRE(service->submit_tx(
-        {{OperationId{operation}, ConnectionGeneration{1},
-          *connected.session_id, std::nullopt},
-         {std::byte{static_cast<unsigned char>(operation)}}}));
+  SerialFixture test;
+  SECTION("idle ppoll is woken") { std::this_thread::sleep_for(20ms); }
+  SECTION("accepted TX and task control all complete") {
+    test.connect();
+    test.backend->stall_writes();
+    for (std::uint64_t id = 2U; id <= 4U; ++id)
+      REQUIRE(test.send(id, bytes("A")));
+    REQUIRE(test.backend->write_gate.wait());
+    const auto control =
+        test.service->request_stop_task({OperationId{5}, TaskGeneration{9}});
+    REQUIRE(control);
+    REQUIRE(*control == SubmitStatus::Accepted);
+    test.service->request_stop();
+    REQUIRE_FALSE(test.send(6U, bytes("B")));
+    REQUIRE_FALSE(test.disconnect(7U));
+    REQUIRE_FALSE(
+        test.service->request_stop_task({OperationId{8}, TaskGeneration{1}}));
+    REQUIRE_FALSE(test.service->request_cancel_connect(
+        {OperationId{9}, ConnectionGeneration{1}}));
+    const auto results = test.completions(4U);
+    for (std::uint64_t id = 2U; id <= 4U; ++id) {
+      CHECK(std::count_if(results.begin(), results.end(),
+                          [id](const auto &value) {
+                            const auto *tx = std::get_if<TxCompletion>(&value);
+                            return tx && tx->operation_id == OperationId{id} &&
+                                   tx->outcome == OperationOutcome::Cancelled;
+                          }) == 1);
+    }
+    CHECK(std::count_if(results.begin(), results.end(), [](const auto &value) {
+            return std::holds_alternative<TaskStopCompletion>(value);
+          }) == 1);
   }
-  REQUIRE(backend->wait_for_write_calls(1U, 1s));
-  const auto accepted_control =
-      service->request_stop_task({OperationId{5}, TaskGeneration{9}});
-  REQUIRE(accepted_control);
-  REQUIRE(*accepted_control == SubmitStatus::Accepted);
-
-  service->request_stop();
-  REQUIRE_FALSE(service->submit_tx({{OperationId{6}, ConnectionGeneration{1},
-                                     *connected.session_id, std::nullopt},
-                                    {std::byte{5}}}));
-  REQUIRE_FALSE(service->request_disconnect(
-      {OperationId{7}, ConnectionGeneration{1}, connected.session_id}));
-  REQUIRE_FALSE(
-      service->request_stop_task({OperationId{8}, TaskGeneration{1}}));
-  REQUIRE_FALSE(service->request_cancel_connect(
-      {OperationId{9}, ConnectionGeneration{1}}));
-  REQUIRE(service->wait_until_stopped(std::chrono::steady_clock::now() + 1s));
-
-  const auto completions = wait_completions(*service, 4U);
-  REQUIRE(completions.size() == 4U);
-  REQUIRE(std::count_if(completions.begin(), completions.end(),
-                        [](const SerialCompletion &completion) {
-                          return std::holds_alternative<TxCompletion>(
-                                     completion) &&
-                                 std::get<TxCompletion>(completion).outcome ==
-                                     OperationOutcome::Cancelled;
-                        }) == 3);
-  REQUIRE(std::count_if(completions.begin(), completions.end(),
-                        [](const SerialCompletion &completion) {
-                          return std::holds_alternative<TaskStopCompletion>(
-                              completion);
-                        }) == 1);
+  test.service->request_stop();
+  REQUIRE(
+      test.service->wait_until_stopped(std::chrono::steady_clock::now() + 1s));
+  const auto signal = test.service->worker_stopped_signal();
+  REQUIRE(signal);
+  CHECK(signal->worker == WorkerKind::Serial);
+  CHECK(signal->lifecycle == WorkerLifecycle::AtReturnPoint);
+  CHECK_FALSE(test.service->fatal_signal());
 }
 
-TEST_CASE("owner stop prevents writes after the current backend call",
-          "[serial][owner]") {
+TEST_CASE(
+    "task stop closes admission and confirms only after partial TX settles",
+    "[serial][owner][scheduler]") {
   SerialServiceOptions options;
   options.tx_max_messages = 1U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->set_write_steps({1, 64});
-  backend->block_writes();
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{1}, std::byte{2}, std::byte{3}}}));
-  REQUIRE(backend->wait_for_write_calls(1U, 1s));
-  service->request_stop();
-  backend->release_writes();
-  REQUIRE(service->wait_until_stopped(std::chrono::steady_clock::now() + 1s));
-
-  const auto completions = wait_completions(*service, 1U);
-  REQUIRE(completions.size() == 1U);
-  const auto &tx = std::get<TxCompletion>(completions.front());
-  REQUIRE(tx.outcome == OperationOutcome::Cancelled);
-  REQUIRE(tx.accepted_bytes == 1U);
-  REQUIRE(backend->written().size() == 1U);
-  const auto events = service->drain_data(8U);
-  REQUIRE(events.size() == 3U);
-  REQUIRE(events[0].kind == SerialDataKind::Tx);
-  REQUIRE(events[1].kind == SerialDataKind::Error);
-  REQUIRE(events[2].kind == SerialDataKind::Cleanup);
-}
-
-TEST_CASE("pending task stop rejects racing TX for the same generation",
-          "[serial][owner][scheduler]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->stall_writes();
-  backend->block_writes();
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, TaskGeneration{7}},
-                              {std::byte{1}}}));
-  REQUIRE(backend->wait_for_write_calls(1U, 1s));
-  REQUIRE(service->request_stop_task({OperationId{3}, TaskGeneration{7}}));
-
-  const auto raced =
-      service->submit_tx({{OperationId{4}, ConnectionGeneration{1},
-                           *connected.session_id, TaskGeneration{7}},
-                          {std::byte{2}}});
-  REQUIRE_FALSE(raced);
-  REQUIRE(raced.error().detail == "serial task is stopping");
-
-  backend->release_writes();
-  const auto completions = wait_completions(*service, 2U);
-  REQUIRE(completions.size() == 2U);
-  REQUIRE(std::holds_alternative<TxCompletion>(completions[0]));
-  REQUIRE(std::get<TxCompletion>(completions[0]).outcome ==
-          OperationOutcome::Cancelled);
-  REQUIRE(std::holds_alternative<TaskStopCompletion>(completions[1]));
-  REQUIRE_FALSE(service->fatal_signal());
-}
-
-TEST_CASE("task stop cancels the matching partial write before confirmation",
-          "[serial][owner][scheduler]") {
-  SerialServiceOptions options;
-  options.tx_max_messages = 1U;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->write_prefix_then_stall(1);
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, TaskGeneration{7}},
-                              {std::byte{1}, std::byte{2}, std::byte{3}}}));
-  REQUIRE(backend->wait_for_write_calls(1U, 1s));
-  REQUIRE(service->request_stop_task({OperationId{3}, TaskGeneration{7}}));
-
-  const auto completions = wait_completions(*service, 2U);
-  REQUIRE(completions.size() == 2U);
-  REQUIRE(std::holds_alternative<TxCompletion>(completions[0]));
-  REQUIRE(std::get<TxCompletion>(completions[0]).outcome ==
-          OperationOutcome::Cancelled);
-  REQUIRE(std::get<TxCompletion>(completions[0]).accepted_bytes == 1U);
-  REQUIRE(std::get<TxCompletion>(completions[0]).error);
-  REQUIRE(std::get<TxCompletion>(completions[0]).error->code ==
-          ErrorCode::SerialOperationCancelled);
-  REQUIRE(std::holds_alternative<TaskStopCompletion>(completions[1]));
-  REQUIRE(std::get<TaskStopCompletion>(completions[1]).generation ==
-          TaskGeneration{7});
-  REQUIRE(backend->written().size() == 1U);
-  const auto queued_bytes = service->queued_data_bytes();
-  const auto prefix = service->drain_data(1U);
+  SerialFixture test{options};
+  test.connect();
+  test.backend->write_prefix_then_stall(1);
+  bool blocked = false;
+  SECTION("stop arrives before the backend call returns") {
+    test.backend->write_gate.block();
+    blocked = true;
+  }
+  SECTION("stop arrives after the backend accepted a prefix") {}
+  REQUIRE(test.send(2U, bytes("ABC"), TaskGeneration{7}));
+  REQUIRE(test.backend->write_gate.wait());
+  if (!blocked)
+    REQUIRE(wait_until([&] { return test.backend->written() == bytes("A"); }));
+  REQUIRE(test.service->request_stop_task({OperationId{3}, TaskGeneration{7}}));
+  if (blocked) {
+    const auto raced = test.send(4U, bytes("B"), TaskGeneration{7});
+    REQUIRE_FALSE(raced);
+    CHECK(raced.error().detail == "serial task is stopping");
+  }
+  test.backend->write_gate.release();
+  const auto results = test.completions(2U);
+  const auto &tx = tx_result(results[0], 2U, OperationOutcome::Cancelled);
+  CHECK(tx.accepted_bytes == 1U);
+  REQUIRE(tx.error);
+  CHECK(tx.error->code == ErrorCode::SerialOperationCancelled);
+  REQUIRE(std::holds_alternative<TaskStopCompletion>(results[1]));
+  CHECK(std::get<TaskStopCompletion>(results[1]).generation ==
+        TaskGeneration{7});
+  CHECK(test.backend->written() == bytes("A"));
+  const auto queued = test.service->queued_data_bytes();
+  const auto prefix = test.service->drain_data(1U);
   REQUIRE(prefix.size() == 1U);
-  REQUIRE(prefix[0].kind == SerialDataKind::Tx);
-  const auto rejected =
-      service->submit_tx({{OperationId{4}, ConnectionGeneration{1},
-                           *connected.session_id, std::nullopt},
-                          {std::byte{4}}});
+  CHECK(prefix[0].kind == SerialDataKind::Tx);
+  const auto rejected = test.send(5U, bytes("D"));
   REQUIRE_FALSE(rejected);
-  REQUIRE(rejected.error().detail == "serial TX queue is full");
-
-  const auto terminal = service->drain_data(1U);
+  CHECK(rejected.error().detail == "serial TX queue is full");
+  const auto terminal = test.service->drain_data(1U);
   REQUIRE(terminal.size() == 1U);
-  REQUIRE(terminal[0].kind == SerialDataKind::Error);
+  CHECK(terminal[0].kind == SerialDataKind::Error);
   REQUIRE(terminal[0].error);
-  REQUIRE(terminal[0].error->code == ErrorCode::SerialOperationCancelled);
-  REQUIRE(prefix[0].owner_order < terminal[0].owner_order);
-  REQUIRE(queued_bytes ==
-          retained_event_bytes(prefix) + retained_event_bytes(terminal));
-  REQUIRE(service->queued_data_bytes() == 0U);
-
-  backend->resume_writes();
-  REQUIRE(service->submit_tx({{OperationId{5}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{5}}}));
-  REQUIRE(wait_completions(*service, 1U).size() == 1U);
-  REQUIRE(service->drain_data(1U).size() == 1U);
+  CHECK(terminal[0].error->code == ErrorCode::SerialOperationCancelled);
+  CHECK(prefix[0].owner_order < terminal[0].owner_order);
+  CHECK(queued ==
+        retained_event_bytes(prefix) + retained_event_bytes(terminal));
+  CHECK(test.service->queued_data_bytes() == 0U);
+  test.backend->resume_writes();
+  REQUIRE(test.send(6U, bytes("E")));
+  test.completions(1U);
+  test.drain_events(1U);
+  CHECK_FALSE(test.service->fatal_signal());
 }
 
 TEST_CASE("late sessions are rejected and device loss performs cleanup",
           "[serial][owner]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-
-  REQUIRE_FALSE(service->submit_tx(
-      {{OperationId{2}, ConnectionGeneration{1},
-        SessionId{connected.session_id->value + 1U}, std::nullopt},
-       {std::byte{1}}}));
-  backend->disappear();
+  SerialFixture test;
+  test.connect();
+  REQUIRE_FALSE(test.service->submit_tx(
+      {{OperationId{2}, test.connected.generation,
+        SessionId{test.connected.session_id->value + 1U}, std::nullopt},
+       bytes("A")}));
+  test.backend->disappear();
   REQUIRE(wait_until([&] {
-    const auto snapshot = service->connection_snapshot();
-    return !snapshot.connected && !snapshot.disconnecting;
+    const auto state = test.service->connection_snapshot();
+    return !state.connected && !state.disconnecting;
   }));
-  const auto queued_bytes = service->queued_data_bytes();
-  const auto data = service->drain_data(8U);
-  REQUIRE(
-      std::any_of(data.begin(), data.end(), [](const SerialDataEvent &event) {
-        return event.kind == SerialDataKind::Cleanup && event.error.has_value();
-      }));
-  REQUIRE(queued_bytes == retained_event_bytes(data));
-  REQUIRE(service->queued_data_bytes() == 0U);
+  const auto events = test.drain_events(1U);
+  CHECK(events[0].kind == SerialDataKind::Cleanup);
+  REQUIRE(events[0].error);
 }
 
 TEST_CASE("fault transition closes TX admission before backend close",
           "[serial][owner]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->set_write_steps({-1});
-  backend->block_writes();
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{1}}}));
-  REQUIRE(backend->wait_for_write_calls(1U, 1s));
-
-  backend->block_close();
-  backend->release_writes();
-  const bool close_entered = backend->wait_for_close_entry(1s);
-  const auto raced =
-      service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
-                           *connected.session_id, std::nullopt},
-                          {std::byte{2}}});
-  backend->release_close();
-
-  REQUIRE(close_entered);
+  SerialFixture test;
+  test.connect();
+  test.backend->set_write_steps({-1});
+  test.backend->write_gate.block();
+  REQUIRE(test.send(2U, bytes("A")));
+  REQUIRE(test.backend->write_gate.wait());
+  test.backend->close_gate.block();
+  test.backend->write_gate.release();
+  REQUIRE(test.backend->close_gate.wait());
+  const auto raced = test.send(3U, bytes("B"));
   REQUIRE_FALSE(raced);
-  REQUIRE(raced.error().detail == "stale or disconnected TX session");
+  CHECK(raced.error().detail == "stale or disconnected TX session");
+  test.backend->close_gate.release();
   REQUIRE(wait_until([&] {
-    const auto snapshot = service->connection_snapshot();
-    return !snapshot.connected && !snapshot.disconnecting;
+    const auto state = test.service->connection_snapshot();
+    return !state.connected && !state.disconnecting;
   }));
-  const auto completions = wait_completions(*service, 1U);
-  REQUIRE(completions.size() == 1U);
-  REQUIRE(std::get<TxCompletion>(completions.front()).operation_id ==
-          OperationId{2});
-  REQUIRE(std::get<TxCompletion>(completions.front()).outcome ==
-          OperationOutcome::Failed);
-  const auto events = service->drain_data(8U);
-  REQUIRE(events.size() == 2U);
-  REQUIRE(events[0].kind == SerialDataKind::Error);
-  REQUIRE(events[1].kind == SerialDataKind::Cleanup);
-  REQUIRE(events[0].owner_order < events[1].owner_order);
-  REQUIRE_FALSE(service->fatal_signal());
+  tx_result(test.completions(1U)[0], 2U, OperationOutcome::Failed);
+  const auto events = test.drain_events(2U);
+  CHECK(events[0].kind == SerialDataKind::Error);
+  CHECK(events[1].kind == SerialDataKind::Cleanup);
+  CHECK_FALSE(test.service->fatal_signal());
 }
 
 TEST_CASE("device loss after a partial write reports the accepted prefix",
           "[serial][owner]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->set_write_steps({2, -1});
-  REQUIRE(service->submit_tx(
-      {{OperationId{2}, ConnectionGeneration{1}, *connected.session_id,
-        std::nullopt},
-       {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}}}));
-
-  const auto completions = wait_completions(*service, 1U);
-  REQUIRE(completions.size() == 1U);
-  const auto &tx = std::get<TxCompletion>(completions.front());
-  REQUIRE(tx.outcome == OperationOutcome::Failed);
-  REQUIRE(tx.accepted_bytes == 2U);
+  SerialFixture test;
+  test.connect();
+  test.backend->set_write_steps({2, -1});
+  REQUIRE(test.send(2U, bytes("ABCD")));
+  const auto result = test.completions(1U);
+  const auto &tx = tx_result(result[0], 2U, OperationOutcome::Failed);
+  CHECK(tx.accepted_bytes == 2U);
   REQUIRE(tx.error);
   REQUIRE(wait_until([&] {
-    const auto snapshot = service->connection_snapshot();
-    return !snapshot.connected && !snapshot.disconnecting;
+    const auto state = test.service->connection_snapshot();
+    return !state.connected && !state.disconnecting;
   }));
-  const auto events = service->drain_data(8U);
-  REQUIRE(events.size() == 3U);
-  REQUIRE(events.front().kind == SerialDataKind::Tx);
-  REQUIRE(events.front().bytes.size() == 2U);
-  REQUIRE(events[1].kind == SerialDataKind::Error);
-  REQUIRE(events[1].error);
-  REQUIRE(events[1].error->code == ErrorCode::SerialDeviceGone);
-  REQUIRE(events[1].error->operation_id == OperationId{2});
-  REQUIRE(events.back().kind == SerialDataKind::Cleanup);
-  REQUIRE(events.front().owner_order < events.back().owner_order);
-  REQUIRE(events[1].owner_order < events.back().owner_order);
-}
-
-TEST_CASE("owner stop wakes ppoll and publishes its fixed lifecycle slot",
-          "[serial][owner]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  static_cast<void>(backend);
-  std::this_thread::sleep_for(20ms);
-  service->request_stop();
-  REQUIRE(service->wait_until_stopped(std::chrono::steady_clock::now() + 1s));
-  REQUIRE(service->worker_stopped_signal());
-  REQUIRE(service->worker_stopped_signal()->worker == WorkerKind::Serial);
-  REQUIRE(service->worker_stopped_signal()->lifecycle ==
-          WorkerLifecycle::AtReturnPoint);
-  REQUIRE_FALSE(service->fatal_signal());
-}
-
-TEST_CASE("manual TX wins at the next complete request boundary",
-          "[serial][owner][scheduler]") {
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->set_write_steps({1, 64, 64, 64});
-  backend->block_writes();
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{'A'}, std::byte{'a'}}}));
-  const bool started = backend->wait_for_write_calls(1U, 1s);
-  if (!started) {
-    backend->release_writes();
-  }
-  REQUIRE(started);
-  const auto scheduled =
-      service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
-                           *connected.session_id, TaskGeneration{7}},
-                          {std::byte{'Q'}, std::byte{'q'}}});
-  const auto manual =
-      service->submit_tx({{OperationId{4}, ConnectionGeneration{1},
-                           *connected.session_id, std::nullopt},
-                          {std::byte{'B'}, std::byte{'b'}}});
-
-  backend->release_writes();
-  REQUIRE(scheduled);
-  REQUIRE(manual);
-  const auto completions = wait_completions(*service, 3U);
-  REQUIRE(completions.size() == 3U);
-  CHECK(std::get<TxCompletion>(completions[0]).operation_id == OperationId{2});
-  CHECK(std::get<TxCompletion>(completions[1]).operation_id == OperationId{4});
-  CHECK(std::get<TxCompletion>(completions[2]).operation_id == OperationId{3});
-  const std::vector<std::byte> expected{std::byte{'A'}, std::byte{'a'},
-                                        std::byte{'B'}, std::byte{'b'},
-                                        std::byte{'Q'}, std::byte{'q'}};
-  CHECK(backend->written() == expected);
-  CHECK_FALSE(service->fatal_signal());
-}
-
-TEST_CASE("TX expiry stops further writes after a late positive partial write",
-          "[serial][owner]") {
-  SerialServiceOptions options;
-  options.tx_timeout = 100ms;
-  FakeSerialBackend *backend = nullptr;
-  auto service = make_service(backend, options);
-  const auto connected = connect(*service);
-  REQUIRE(connected.session_id);
-  backend->set_write_steps({1, 64});
-  backend->block_writes();
-
-  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
-                               *connected.session_id, std::nullopt},
-                              {std::byte{1}, std::byte{2}, std::byte{3}}}));
-  const bool started = backend->wait_for_write_calls(1U, 1s);
-  if (started) {
-    std::this_thread::sleep_for(150ms);
-  }
-  backend->release_writes();
-  REQUIRE(started);
-
-  const auto completions = wait_completions(*service, 1U);
-  REQUIRE(completions.size() == 1U);
-  const auto &completion = std::get<TxCompletion>(completions.front());
-  CHECK(completion.outcome == OperationOutcome::TimedOut);
-  CHECK(completion.accepted_bytes == 1U);
-  REQUIRE(completion.error);
-  CHECK(completion.error->code == ErrorCode::SerialOperationTimedOut);
-  CHECK(backend->written() == std::vector<std::byte>{std::byte{1}});
-
-  const auto events = service->drain_data(8U);
-  REQUIRE(events.size() == 2U);
+  const auto events = test.drain_events(3U);
   CHECK(events[0].kind == SerialDataKind::Tx);
-  CHECK(events[0].bytes == std::vector<std::byte>{std::byte{1}});
+  CHECK(events[0].bytes == bytes("AB"));
   CHECK(events[1].kind == SerialDataKind::Error);
   REQUIRE(events[1].error);
-  CHECK(events[1].error->code == ErrorCode::SerialOperationTimedOut);
+  CHECK(events[1].error->code == ErrorCode::SerialDeviceGone);
   CHECK(events[1].error->operation_id == OperationId{2});
-  CHECK(events[0].owner_order < events[1].owner_order);
-  CHECK_FALSE(service->fatal_signal());
+  CHECK(events[2].kind == SerialDataKind::Cleanup);
 }

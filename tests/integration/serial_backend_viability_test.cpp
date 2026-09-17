@@ -38,15 +38,6 @@ public:
   UniqueFd(const UniqueFd &) = delete;
   UniqueFd &operator=(const UniqueFd &) = delete;
 
-  UniqueFd(UniqueFd &&other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
-
-  UniqueFd &operator=(UniqueFd &&other) noexcept {
-    if (this != &other) {
-      reset(std::exchange(other.fd_, -1));
-    }
-    return *this;
-  }
-
   [[nodiscard]] int get() const noexcept { return fd_; }
 
   void reset(int fd = -1) noexcept {
@@ -59,6 +50,28 @@ public:
 private:
   int fd_;
 };
+
+struct Pty {
+  UniqueFd master{::posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
+  std::array<char, 256> slave_path{};
+  Pty() {
+    REQUIRE(master.get() >= 0);
+    REQUIRE(::grantpt(master.get()) == 0);
+    REQUIRE(::unlockpt(master.get()) == 0);
+    REQUIRE(::ptsname_r(master.get(), slave_path.data(), slave_path.size()) ==
+            0);
+  }
+};
+
+std::jthread signal_after_delay(int fd, std::atomic_bool &succeeded) {
+  return std::jthread([fd, &succeeded] {
+    std::this_thread::sleep_for(20ms);
+    const std::uint64_t value = 1;
+    succeeded.store(::write(fd, &value, sizeof(value)) ==
+                        static_cast<ssize_t>(sizeof(value)),
+                    std::memory_order_relaxed);
+  });
+}
 
 class PortGuard {
 public:
@@ -127,16 +140,10 @@ void drain_eventfd(int fd) {
 
 TEST_CASE("libserialport native fd works with ppoll and eventfd",
           "[integration][serial][linux]") {
-  UniqueFd master{::posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
-  REQUIRE(master.get() >= 0);
-  REQUIRE(::grantpt(master.get()) == 0);
-  REQUIRE(::unlockpt(master.get()) == 0);
-
-  std::array<char, 256> slave_path{};
-  REQUIRE(::ptsname_r(master.get(), slave_path.data(), slave_path.size()) == 0);
+  Pty pty;
 
   sp_port *raw_port = nullptr;
-  REQUIRE(sp_get_port_by_name(slave_path.data(), &raw_port) == SP_OK);
+  REQUIRE(sp_get_port_by_name(pty.slave_path.data(), &raw_port) == SP_OK);
   PortGuard port{raw_port};
   REQUIRE(sp_open(port.get(), SP_MODE_READ_WRITE) == SP_OK);
   port.mark_open();
@@ -165,13 +172,7 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     REQUIRE(wait_for(wait_set.data(), wait_set.size(), 30ms) == 0);
 
     std::atomic_bool signal_succeeded{false};
-    std::jthread signaler([fd = wake_fd.get(), &signal_succeeded] {
-      std::this_thread::sleep_for(20ms);
-      const std::uint64_t value = 1;
-      signal_succeeded.store(::write(fd, &value, sizeof(value)) ==
-                                 static_cast<ssize_t>(sizeof(value)),
-                             std::memory_order_relaxed);
-    });
+    auto signaler = signal_after_delay(wake_fd.get(), signal_succeeded);
 
     REQUIRE(wait_for(wait_set.data(), wait_set.size(), 1s) == 1);
     signaler.join();
@@ -184,7 +185,7 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
   SECTION("serial data uses libserialport nonblocking APIs") {
     constexpr std::array<std::byte, 4> inbound{
         std::byte{0x00}, std::byte{0x41}, std::byte{0x80}, std::byte{0xff}};
-    REQUIRE(::write(master.get(), inbound.data(), inbound.size()) ==
+    REQUIRE(::write(pty.master.get(), inbound.data(), inbound.size()) ==
             static_cast<ssize_t>(inbound.size()));
 
     pollfd readable{.fd = serial_fd, .events = POLLIN, .revents = 0};
@@ -208,11 +209,13 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     REQUIRE(write_result >= 0);
     REQUIRE(static_cast<std::size_t>(write_result) == outbound.size());
 
-    pollfd peer_readable{.fd = master.get(), .events = POLLIN, .revents = 0};
+    pollfd peer_readable{
+        .fd = pty.master.get(), .events = POLLIN, .revents = 0};
     REQUIRE(wait_for(&peer_readable, 1, 1s) == 1);
     std::array<std::byte, outbound.size()> peer_received{};
-    REQUIRE(::read(master.get(), peer_received.data(), peer_received.size()) ==
-            static_cast<ssize_t>(peer_received.size()));
+    REQUIRE(
+        ::read(pty.master.get(), peer_received.data(), peer_received.size()) ==
+        static_cast<ssize_t>(peer_received.size()));
     REQUIRE(peer_received == outbound);
   }
 
@@ -238,13 +241,7 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     REQUIRE(saw_eagain);
 
     std::atomic_bool signal_succeeded{false};
-    std::jthread signaler([fd = wake_fd.get(), &signal_succeeded] {
-      std::this_thread::sleep_for(20ms);
-      const std::uint64_t value = 1;
-      signal_succeeded.store(::write(fd, &value, sizeof(value)) ==
-                                 static_cast<ssize_t>(sizeof(value)),
-                             std::memory_order_relaxed);
-    });
+    auto signaler = signal_after_delay(wake_fd.get(), signal_succeeded);
 
     std::array<pollfd, 2> blocked_wait_set{{
         {.fd = serial_fd, .events = POLLIN | POLLOUT, .revents = 0},
@@ -285,7 +282,8 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     drain_eventfd(wake_fd.get());
 
     std::array<std::byte, 64 * 1024> drain_buffer{};
-    while (::read(master.get(), drain_buffer.data(), drain_buffer.size()) > 0) {
+    while (::read(pty.master.get(), drain_buffer.data(), drain_buffer.size()) >
+           0) {
     }
     REQUIRE(errno == EAGAIN);
 
@@ -295,7 +293,7 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
   }
 
   SECTION("closing the PTY peer reports hangup") {
-    master.reset();
+    pty.master.reset();
     pollfd disconnected{.fd = serial_fd, .events = POLLIN, .revents = 0};
     REQUIRE(wait_for(&disconnected, 1, 1s) == 1);
     REQUIRE((disconnected.revents & (POLLHUP | POLLERR)) != 0);
@@ -304,44 +302,32 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
 
 TEST_CASE("serial permission probe reports effective access",
           "[integration][serial][linux][permission]") {
-  UniqueFd master{::posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
-  REQUIRE(master.get() >= 0);
-  REQUIRE(::grantpt(master.get()) == 0);
-  REQUIRE(::unlockpt(master.get()) == 0);
-
-  std::array<char, 256> slave_path{};
-  REQUIRE(::ptsname_r(master.get(), slave_path.data(), slave_path.size()) == 0);
+  Pty pty;
   const auto allowed =
-      lazycom::serial::inspect_device_permission(slave_path.data());
+      lazycom::serial::inspect_device_permission(pty.slave_path.data());
   REQUIRE(allowed);
   REQUIRE(allowed->access == lazycom::serial::DeviceAccess::Allowed);
 
   if (::geteuid() != 0U) {
-    REQUIRE(::chmod(slave_path.data(), 0000) == 0);
+    REQUIRE(::chmod(pty.slave_path.data(), 0000) == 0);
     const auto denied =
-        lazycom::serial::inspect_device_permission(slave_path.data());
+        lazycom::serial::inspect_device_permission(pty.slave_path.data());
     REQUIRE(denied);
     CHECK(denied->access == lazycom::serial::DeviceAccess::PermissionDenied);
-    REQUIRE(::chmod(slave_path.data(), S_IRUSR | S_IWUSR) == 0);
+    REQUIRE(::chmod(pty.slave_path.data(), S_IRUSR | S_IWUSR) == 0);
   }
 }
 
 TEST_CASE("busy libserialport open does not leak its temporary fd",
           "[integration][serial][linux]") {
-  UniqueFd master{::posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
-  REQUIRE(master.get() >= 0);
-  REQUIRE(::grantpt(master.get()) == 0);
-  REQUIRE(::unlockpt(master.get()) == 0);
-
-  std::array<char, 256> slave_path{};
-  REQUIRE(::ptsname_r(master.get(), slave_path.data(), slave_path.size()) == 0);
-  UniqueFd lock_holder{
-      ::open(slave_path.data(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
+  Pty pty;
+  UniqueFd lock_holder{::open(pty.slave_path.data(),
+                              O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
   REQUIRE(lock_holder.get() >= 0);
   REQUIRE(::flock(lock_holder.get(), LOCK_EX | LOCK_NB) == 0);
 
   sp_port *raw_port = nullptr;
-  REQUIRE(sp_get_port_by_name(slave_path.data(), &raw_port) == SP_OK);
+  REQUIRE(sp_get_port_by_name(pty.slave_path.data(), &raw_port) == SP_OK);
   PortGuard port{raw_port};
   const auto before = count_open_fds();
   for (std::size_t attempt = 0U; attempt < 16U; ++attempt) {
