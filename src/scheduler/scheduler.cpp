@@ -335,7 +335,8 @@ void Scheduler::add_missed(const std::uint64_t count) noexcept {
   missed_count_ = saturated_add(missed_count_, count);
 }
 
-void Scheduler::on_deadline(const TimePoint now) noexcept {
+void Scheduler::on_deadline(const TimePoint now,
+                            const bool writer_busy) noexcept {
   if (state_ != SchedulerState::Running || !next_deadline_ ||
       now < *next_deadline_) {
     return;
@@ -375,7 +376,7 @@ void Scheduler::on_deadline(const TimePoint now) noexcept {
   }
   next_deadline_ = next;
 
-  if (trigger_pending_ || outstanding_) {
+  if (trigger_pending_ || outstanding_ || writer_busy) {
     add_missed(due_count);
     return;
   }
@@ -414,7 +415,7 @@ std::optional<ScheduledSend>
 Scheduler::on_tx_boundary(const TimePoint now, const TxBoundary &boundary) {
   // A deadline reached while the previous request was active is missed, even
   // when its completion is observed at this same owner boundary.
-  on_deadline(now);
+  on_deadline(now, boundary.manual_pending);
 
   if (state_ != SchedulerState::Running) {
     return std::nullopt;

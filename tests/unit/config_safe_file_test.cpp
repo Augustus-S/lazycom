@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
@@ -153,6 +154,36 @@ TEST_CASE("safe file rejects symlinks sizes and public permissions",
   REQUIRE_FALSE(lazycom::config::read_safe_file(public_file, 1024));
 }
 
+TEST_CASE("configuration FIFO paths are rejected without waiting for a peer",
+          "[config][file]") {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "config.toml";
+  REQUIRE(::mkfifo(path.c_str(), S_IRUSR | S_IWUSR) == 0);
+  bool write = false;
+  SECTION("read") {}
+  SECTION("atomic save") { write = true; }
+
+  const auto child = ::fork();
+  REQUIRE(child >= 0);
+  if (child == 0) {
+    ::alarm(2U);
+    const bool rejected =
+        write ? lazycom::config::write_file_atomically(path, "version = 1\n",
+                                                       1024U, {})
+                        .state == lazycom::config::CommitState::NotCommitted
+              : !lazycom::config::read_safe_file(path, 1024U);
+    ::_exit(rejected ? 0 : 1);
+  }
+  int status{};
+  pid_t waited{};
+  do {
+    waited = ::waitpid(child, &status, 0);
+  } while (waited < 0 && errno == EINTR);
+  REQUIRE(waited == child);
+  REQUIRE(WIFEXITED(status));
+  REQUIRE(WEXITSTATUS(status) == 0);
+}
+
 TEST_CASE("safe file requires exact modes and rejects NUL paths",
           "[config][file]") {
   TemporaryDirectory directory;
@@ -194,6 +225,29 @@ TEST_CASE("Linux atomic writer creates private durable target",
   const auto loaded = lazycom::config::read_safe_file(path, 1024);
   REQUIRE(loaded);
   REQUIRE(loaded->bytes == "version = 1\n");
+  REQUIRE(outcome.committed_identity);
+  CHECK(*outcome.committed_identity == loaded->identity);
+}
+
+TEST_CASE("committed file identity rejects a subsequent external replacement",
+          "[config][file]") {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "config.toml";
+  const auto saved =
+      lazycom::config::write_file_atomically(path, "version = 1\n", 1024U, {});
+  REQUIRE(saved.state == lazycom::config::CommitState::Committed);
+  REQUIRE(saved.committed_identity);
+
+  const auto replacement = directory.path() / "external.toml";
+  write_test_file(replacement, "external document");
+  REQUIRE(::rename(replacement.c_str(), path.c_str()) == 0);
+  const auto overwritten = lazycom::config::write_file_atomically(
+      path, "version = 1\nx = 2\n", 1024U, *saved.committed_identity);
+  CHECK(overwritten.state == lazycom::config::CommitState::NotCommitted);
+  CHECK_FALSE(overwritten.committed_identity);
+  const auto current = lazycom::config::read_safe_file(path, 1024U);
+  REQUIRE(current);
+  CHECK(current->bytes == "external document");
 }
 
 TEST_CASE("Linux atomic writer creates a missing private application directory",
@@ -411,4 +465,37 @@ TEST_CASE("atomic writer exposes all three commit states", "[config][file]") {
   REQUIRE(
       lazycom::config::write_file_atomically(target, "data", 1024, {}, success)
           .state == lazycom::config::CommitState::Committed);
+}
+
+TEST_CASE("committed identity survives directory synchronization failures",
+          "[config][file]") {
+  const auto target = std::filesystem::path{"/unused/state.toml"};
+  for (const auto failure :
+       {lazycom::test::AtomicFailurePoint::None,
+        lazycom::test::AtomicFailurePoint::DirectorySync,
+        lazycom::test::AtomicFailurePoint::DirectorySyncException}) {
+    CAPTURE(failure);
+    lazycom::test::FakeAtomicFileSystem file_system{failure};
+    const auto outcome = lazycom::config::write_file_atomically(
+        target, "data", 1024U, {}, file_system);
+    CHECK(outcome.state ==
+          (failure == lazycom::test::AtomicFailurePoint::None
+               ? lazycom::config::CommitState::Committed
+               : lazycom::config::CommitState::CommittedDurabilityUnknown));
+    REQUIRE(outcome.committed_identity);
+    CHECK(outcome.committed_identity->exists);
+    CHECK(outcome.committed_identity->device == 17U);
+    CHECK(outcome.committed_identity->inode == 23U);
+    CHECK(outcome.committed_identity->size == 4U);
+  }
+  for (const auto failure : {lazycom::test::AtomicFailurePoint::Begin,
+                             lazycom::test::AtomicFailurePoint::Stage,
+                             lazycom::test::AtomicFailurePoint::Commit}) {
+    CAPTURE(failure);
+    lazycom::test::FakeAtomicFileSystem file_system{failure};
+    const auto outcome = lazycom::config::write_file_atomically(
+        target, "data", 1024U, {}, file_system);
+    CHECK(outcome.state == lazycom::config::CommitState::NotCommitted);
+    CHECK_FALSE(outcome.committed_identity);
+  }
 }

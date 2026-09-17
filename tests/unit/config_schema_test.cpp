@@ -500,6 +500,58 @@ future_slot = 7
   REQUIRE(round_trip.snapshot.slots[0]->content == "ping");
 }
 
+TEST_CASE("quick-send full slots survive repeated clear and refill",
+          "[config]") {
+  lazycom::config::QuickSendSnapshot snapshot;
+  for (std::size_t position = 0; position < snapshot.slots.size(); ++position) {
+    lazycom::config::QuickSendSlot slot;
+    slot.index = static_cast<std::uint32_t>(position + 1U);
+    slot.content = "payload";
+    snapshot.slots[position] = std::move(slot);
+  }
+  auto document = lazycom::config::serialize_quick_send_toml(
+      snapshot, "version = 1\n[[slots]]\nindex = 1\nfuture_slot = 7\n");
+  REQUIRE(document);
+  for (std::uint32_t pass = 0U; pass < 3U; ++pass) {
+    CAPTURE(pass);
+    snapshot.slots[0].reset();
+    document = lazycom::config::serialize_quick_send_toml(snapshot, *document);
+    REQUIRE(document);
+    auto loaded = lazycom::config::parse_quick_send_toml(*document);
+    REQUIRE(loaded.accepted);
+    CHECK(loaded.snapshot == snapshot);
+    CHECK(document->find("future_slot = 7") != std::string::npos);
+
+    lazycom::config::QuickSendSlot slot;
+    slot.index = 1U;
+    slot.content = "new payload";
+    snapshot.slots[0] = std::move(slot);
+    document = lazycom::config::serialize_quick_send_toml(snapshot, *document);
+    REQUIRE(document);
+    loaded = lazycom::config::parse_quick_send_toml(*document);
+    REQUIRE(loaded.accepted);
+    CHECK(loaded.snapshot == snapshot);
+    CHECK(document->find("future_slot = 7") != std::string::npos);
+  }
+}
+
+TEST_CASE("quick-send serialization enforces the next load's combined budget",
+          "[config]") {
+  lazycom::config::QuickSendSnapshot snapshot;
+  for (std::uint32_t index = 0U; index < 3U; ++index) {
+    lazycom::config::QuickSendSlot slot;
+    slot.index = index + 1U;
+    slot.content.assign(index == 2U ? 512U * 1024U : 1024U * 1024U, 'x');
+    snapshot.slots[index] = std::move(slot);
+  }
+  REQUIRE(lazycom::config::validate_quick_send_snapshot(snapshot).empty());
+  const std::string preserved =
+      "version = 1\nfuture_blob = '" + std::string(1024U * 1024U, 'x') + "'\n";
+  REQUIRE(lazycom::config::parse_quick_send_toml(preserved).accepted);
+  REQUIRE_FALSE(
+      lazycom::config::serialize_quick_send_toml(snapshot, preserved));
+}
+
 TEST_CASE("state accepts zero or 10ms through one day only", "[config]") {
   REQUIRE(lazycom::config::parse_state_toml(
               "version = 1\nlast_quick_send_slot = 20\nlast_interval_ms = 0\n")

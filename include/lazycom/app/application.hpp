@@ -293,6 +293,7 @@ private:
   void process_scheduler();
   [[nodiscard]] bool request_quick_task_stop(TaskGeneration generation,
                                              std::string_view notice);
+  [[nodiscard]] bool log_rollover_pending() const noexcept;
   void begin_log_session();
   void end_log_session(ConnectionGeneration generation, SessionId session_id);
   void start_log_rollover_if_needed();

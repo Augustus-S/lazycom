@@ -872,8 +872,13 @@ struct SerialService::Impl {
     {
       std::lock_guard lock(mutex);
       if (!tx_queue.empty()) {
-        active_tx.emplace(std::move(tx_queue.front()));
-        tx_queue.pop_front();
+        const auto manual = std::find_if(
+            tx_queue.begin(), tx_queue.end(), [](const QueuedTx &request) {
+              return !request.request.command.task_generation;
+            });
+        const auto next = manual != tx_queue.end() ? manual : tx_queue.begin();
+        active_tx.emplace(std::move(*next));
+        tx_queue.erase(next);
       }
     }
     if (active_tx) {
@@ -926,6 +931,10 @@ struct SerialService::Impl {
       auto &request = *active_tx;
       if (tx_control_pending(request.request.command.task_generation)) {
         return;
+      }
+      if (request.deadline && Clock::now() >= *request.deadline) {
+        process_tx_deadline();
+        continue;
       }
       const auto remaining =
           std::span<const std::byte>{request.request.payload}.subspan(

@@ -16,8 +16,10 @@
 #include <atomic>
 #include <charconv>
 #include <chrono>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -335,8 +337,92 @@ constexpr std::size_t kCommandMaximumBytes = 64U;
 constexpr std::size_t kNumericMaximumBytes = 20U;
 constexpr std::size_t kPathMaximumBytes = 4096U;
 constexpr std::size_t kGeneralModalMaximumBytes = 4096U;
+constexpr std::string_view kPasteBegin = "\x1b[200~";
+constexpr std::string_view kPasteEnd = "\x1b[201~";
+
+void set_bracketed_paste_mode(const bool enabled) noexcept {
+  static constexpr std::string_view enable = "\x1b[?2004h";
+  static constexpr std::string_view disable = "\x1b[?2004l";
+  const auto sequence = enabled ? enable : disable;
+  static_cast<void>(std::fwrite(sequence.data(), 1U, sequence.size(), stdout));
+  static_cast<void>(std::fflush(stdout));
+}
+
+class BracketedPasteModeGuard {
+public:
+  BracketedPasteModeGuard() noexcept { set_bracketed_paste_mode(true); }
+  ~BracketedPasteModeGuard() noexcept { set_bracketed_paste_mode(false); }
+  BracketedPasteModeGuard(const BracketedPasteModeGuard &) = delete;
+  BracketedPasteModeGuard &operator=(const BracketedPasteModeGuard &) = delete;
+};
 
 } // namespace
+
+void BracketedPaste::start(const RouteMode mode, const std::uint64_t context_id,
+                           const std::size_t available_bytes,
+                           const bool accepts_text) {
+  active_ = true;
+  rejected_ = !accepts_text;
+  accepts_text_ = accepts_text;
+  mode_ = mode;
+  context_id_ = context_id;
+  available_bytes_ = available_bytes;
+  text_.clear();
+}
+
+PasteConsumeResult
+BracketedPaste::consume(const std::string_view text, const bool is_character,
+                        const bool is_end, const RouteMode current_mode,
+                        const std::uint64_t current_context_id) {
+  if (!active_) {
+    return PasteConsumeResult::Rejected;
+  }
+  if (current_mode != mode_ || current_context_id != context_id_) {
+    rejected_ = true;
+  }
+  if (is_end) {
+    active_ = false;
+    if (rejected_) {
+      text_.clear();
+      return PasteConsumeResult::Rejected;
+    }
+    return PasteConsumeResult::Completed;
+  }
+  if (!accepts_text_ || !is_character || !strict_utf8(text) ||
+      text.size() >
+          available_bytes_ - std::min(available_bytes_, text_.size())) {
+    rejected_ = true;
+    return PasteConsumeResult::Consumed;
+  }
+  if (!rejected_) {
+    text_.append(text);
+  }
+  return PasteConsumeResult::Consumed;
+}
+
+std::string BracketedPaste::take_text() {
+  auto result = std::move(text_);
+  text_.clear();
+  return result;
+}
+
+PasteConsumeResult consume_paste_event(BracketedPaste &paste,
+                                       const Event &event,
+                                       const RouteMode current_mode,
+                                       const std::uint64_t current_context_id) {
+  const bool end = event.input() == kPasteEnd;
+  if (event.is_character()) {
+    return paste.consume(event.input(), true, end, current_mode,
+                         current_context_id);
+  }
+  if (event == Event::Return) {
+    return paste.consume("\n", true, end, current_mode, current_context_id);
+  }
+  if (event == Event::Tab) {
+    return paste.consume("\t", true, end, current_mode, current_context_id);
+  }
+  return paste.consume({}, false, end, current_mode, current_context_id);
+}
 
 bool edit_utf8_text(std::string &value, std::size_t &cursor,
                     const Utf8EditAction action,
@@ -715,6 +801,7 @@ struct Tui::Impl {
   std::string quick_preview_summary;
   std::size_t preview_offset{};
   bool preserve_selection{};
+  BracketedPaste paste;
   std::atomic_bool custom_event_pending{};
 
   Impl() {
@@ -1828,6 +1915,70 @@ struct Tui::Impl {
     }
   }
 
+  [[nodiscard]] std::uint64_t paste_context_id() const noexcept {
+    return mode == RouteMode::Modal ? modal_id : 0U;
+  }
+
+  void start_paste() {
+    std::size_t available{};
+    bool accepts_text = false;
+    if (mode == RouteMode::SendEdit) {
+      const auto maximum = static_cast<std::size_t>(
+          application->snapshot().config.send.max_draft_bytes);
+      available = maximum - std::min(maximum, draft_input_value.size());
+      accepts_text = true;
+    } else if (mode == RouteMode::Search &&
+               search_focus == SearchFocus::Query) {
+      available = kSearchMaximumBytes -
+                  std::min(kSearchMaximumBytes, search_query.size());
+      accepts_text = true;
+    } else if (mode == RouteMode::Modal && modal_options.empty() &&
+               modal_kind != "quick-preview") {
+      const auto maximum = modal_input_limit();
+      available = maximum - std::min(maximum, edit_value.size());
+      accepts_text = true;
+    }
+    paste.start(mode, paste_context_id(), available, accepts_text);
+  }
+
+  void apply_paste(std::string text) {
+    if (text.empty()) {
+      return;
+    }
+    if (mode == RouteMode::SendEdit) {
+      auto cursor = static_cast<std::size_t>(std::max(draft_cursor, 0));
+      const auto maximum = static_cast<std::size_t>(
+          application->snapshot().config.send.max_draft_bytes);
+      if (edit_utf8_text(draft_input_value, cursor, Utf8EditAction::Insert,
+                         text, maximum)) {
+        draft_cursor = static_cast<int>(std::min(
+            cursor, static_cast<std::size_t>(std::numeric_limits<int>::max())));
+        application->set_draft(draft_input_value);
+        draft_input_value = application->snapshot().draft;
+        draft_cursor = std::min(
+            draft_cursor,
+            static_cast<int>(std::min(
+                draft_input_value.size(),
+                static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+      }
+      return;
+    }
+    if (mode == RouteMode::Search && search_focus == SearchFocus::Query) {
+      edit_value = search_query;
+      if (edit_utf8_text(edit_value, edit_cursor, Utf8EditAction::Insert, text,
+                         kSearchMaximumBytes)) {
+        search_query = edit_value;
+      }
+      return;
+    }
+    if (mode == RouteMode::Modal && modal_options.empty() &&
+        modal_kind != "quick-preview") {
+      static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
+                                       Utf8EditAction::Insert, text,
+                                       modal_input_limit()));
+    }
+  }
+
   void scroll(RoutedAction action) {
     normalize_viewport();
     const auto indices = view_indices();
@@ -1864,6 +2015,15 @@ struct Tui::Impl {
 
   bool handle(Event event) {
     preserve_selection = false;
+    if (event.input() == kPasteBegin) {
+      if (paste.active()) {
+        static_cast<void>(
+            paste.consume({}, false, false, mode, paste_context_id()));
+      } else {
+        start_paste();
+      }
+      return true;
+    }
     if (event == Event::Custom) {
       custom_event_pending.store(false, std::memory_order_release);
       const bool follow = at_bottom && !application->snapshot().manual_pause &&
@@ -1926,6 +2086,24 @@ struct Tui::Impl {
         normalize_viewport(follow);
       }
       return false;
+    }
+    if (paste.active()) {
+      const auto result =
+          consume_paste_event(paste, event, mode, paste_context_id());
+      if (result == PasteConsumeResult::Completed) {
+        apply_paste(paste.take_text());
+      } else if (result == PasteConsumeResult::Rejected) {
+        set_notice("Paste rejected; input was not changed", true);
+      }
+      return true;
+    }
+    if (event == Event::CtrlZ) {
+      screen.Post(screen.WithRestoredIO([] {
+        set_bracketed_paste_mode(false);
+        static_cast<void>(std::raise(SIGTSTP));
+        set_bracketed_paste_mode(true);
+      }));
+      return true;
     }
     if (event == Event::CtrlC) {
       if (mode == RouteMode::ReceiveBrowse && !receive_vim_pending.empty()) {
@@ -2943,6 +3121,7 @@ int Tui::run() {
   component = CatchEvent(std::move(component),
                          [this](Event event) { return impl_->handle(event); });
   impl_->screen.ForceHandleCtrlC(false);
+  impl_->screen.ForceHandleCtrlZ(false);
   impl_->screen.SelectionChange(
       [this] { impl_->selected_text = impl_->screen.GetSelection(); });
   std::jthread ticker([this](const std::stop_token stop) {
@@ -2957,6 +3136,7 @@ int Tui::run() {
       // A failed ticker must not escape the thread and call std::terminate.
     }
   });
+  BracketedPasteModeGuard paste_mode;
   impl_->screen.Loop(std::move(component));
   ticker.request_stop();
   if (!impl_->application->snapshot().shutting_down ||

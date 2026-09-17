@@ -490,7 +490,8 @@ read_open_file(int descriptor, std::size_t maximum_bytes, Operation operation) {
                                                   std::size_t maximum_bytes,
                                                   Operation operation) {
   const int descriptor =
-      ::openat(directory_fd, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+      ::openat(directory_fd, name.c_str(),
+               O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
   if (descriptor < 0) {
     if (errno == ENOENT) {
       return ObservedFile{};
@@ -626,6 +627,26 @@ public:
     if (fsync_retry(temporary_fd_.get()) != 0) {
       return status_failure("cannot fsync atomic write temporary", errno);
     }
+    struct stat staged_status{};
+    if (::fstat(temporary_fd_.get(), &staged_status) != 0) {
+      return status_failure("cannot inspect atomic write temporary", errno);
+    }
+    if (!S_ISREG(staged_status.st_mode) ||
+        staged_status.st_uid != ::geteuid() ||
+        !has_file_permissions(staged_status) || staged_status.st_size < 0 ||
+        static_cast<std::uintmax_t>(staged_status.st_size) != bytes.size()) {
+      return status_failure("atomic write temporary changed while staging");
+    }
+    Sha256 digest;
+    digest.update(bytes);
+    staged_identity_ = {
+        true,
+        static_cast<std::uint64_t>(staged_status.st_dev),
+        static_cast<std::uint64_t>(staged_status.st_ino),
+        static_cast<std::uint64_t>(staged_status.st_size),
+        static_cast<std::int64_t>(staged_status.st_mtim.tv_sec),
+        static_cast<std::int64_t>(staged_status.st_mtim.tv_nsec),
+        digest.finish()};
     const int descriptor = temporary_fd_.release();
     if (::close(descriptor) != 0) {
       return status_failure("cannot close atomic write temporary", errno);
@@ -633,9 +654,11 @@ public:
     return {};
   }
 
-  Status commit() override {
+  Result<SafeFileIdentity> commit() override {
     if (temporary_.empty() || temporary_fd_.get() >= 0 || committed_) {
-      return status_failure("atomic write transaction is not ready to commit");
+      return failure<SafeFileIdentity>(
+          Operation::SaveConfig,
+          "atomic write transaction is not ready to commit");
     }
     // Build the backup only from the identity observed by the caller, then
     // recheck after backup I/O so an external replacement cannot be overwritten
@@ -643,16 +666,16 @@ public:
     const auto initial_identity_status = validate_expected_target(
         directory_.get(), target_, maximum_bytes_, expected_identity_);
     if (!initial_identity_status) {
-      return initial_identity_status;
+      return tl::make_unexpected(initial_identity_status.error());
     }
     const auto backup_status = backup_existing_target();
     if (!backup_status) {
-      return backup_status;
+      return tl::make_unexpected(backup_status.error());
     }
     const auto final_identity_status = validate_expected_target(
         directory_.get(), target_, maximum_bytes_, expected_identity_);
     if (!final_identity_status) {
-      return final_identity_status;
+      return tl::make_unexpected(final_identity_status.error());
     }
     const int rename_result =
         expected_identity_.exists
@@ -660,11 +683,12 @@ public:
                          target_.c_str())
             : rename_noreplace(directory_.get(), temporary_, target_);
     if (rename_result != 0) {
-      return status_failure("cannot rename atomic write temporary", errno);
+      return failure<SafeFileIdentity>(
+          Operation::SaveConfig, "cannot rename atomic write temporary", errno);
     }
     temporary_.clear();
     committed_ = true;
-    return {};
+    return staged_identity_;
   }
 
   Status sync_parent_directory() override {
@@ -768,6 +792,7 @@ private:
   FileDescriptor temporary_fd_;
   std::size_t maximum_bytes_;
   SafeFileIdentity expected_identity_;
+  SafeFileIdentity staged_identity_;
   bool committed_{};
 };
 
@@ -864,10 +889,9 @@ write_file_atomically(const std::filesystem::path &target,
                       std::string_view bytes, std::size_t maximum_bytes,
                       const SafeFileIdentity &expected_identity,
                       AtomicFileSystem &file_system) {
-  // This flag records the visibility boundary. Any failure or exception after
-  // commit() must report the replacement as visible even if durability is
-  // unknown; reporting NotCommitted could make a caller overwrite newer state.
-  bool committed = false;
+  // A committed identity survives directory-sync failure and remains tied to
+  // this replacement even if another writer subsequently changes the path.
+  std::optional<SafeFileIdentity> committed_identity;
   try {
     if (maximum_bytes == 0 || bytes.size() > maximum_bytes) {
       return {CommitState::NotCommitted,
@@ -885,27 +909,30 @@ write_file_atomically(const std::filesystem::path &target,
     if (!status) {
       return {CommitState::NotCommitted, status.error()};
     }
-    status = (*transaction)->commit();
-    if (!status) {
-      return {CommitState::NotCommitted, status.error()};
+    auto committed = (*transaction)->commit();
+    if (!committed) {
+      return {CommitState::NotCommitted, committed.error()};
     }
-    committed = true;
+    committed_identity = *committed;
     status = (*transaction)->sync_parent_directory();
     if (!status) {
-      return {CommitState::CommittedDurabilityUnknown, status.error()};
+      return {CommitState::CommittedDurabilityUnknown, status.error(),
+              committed_identity};
     }
-    return {CommitState::Committed, std::nullopt};
+    return {CommitState::Committed, std::nullopt, committed_identity};
   } catch (const std::exception &exception) {
-    return {committed ? CommitState::CommittedDurabilityUnknown
-                      : CommitState::NotCommitted,
+    return {committed_identity ? CommitState::CommittedDurabilityUnknown
+                               : CommitState::NotCommitted,
             file_error(Operation::SaveConfig,
                        std::string{"atomic configuration write failed: "} +
-                           exception.what())};
+                           exception.what()),
+            committed_identity};
   } catch (...) {
     return {
-        committed ? CommitState::CommittedDurabilityUnknown
-                  : CommitState::NotCommitted,
-        file_error(Operation::SaveConfig, "atomic configuration write failed")};
+        committed_identity ? CommitState::CommittedDurabilityUnknown
+                           : CommitState::NotCommitted,
+        file_error(Operation::SaveConfig, "atomic configuration write failed"),
+        committed_identity};
   }
 }
 

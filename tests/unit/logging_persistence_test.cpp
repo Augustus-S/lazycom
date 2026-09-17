@@ -114,12 +114,14 @@ public:
       : state_{std::move(state)} {}
 
   lazycom::Status stage(std::string_view) override { return {}; }
-  lazycom::Status commit() override {
+  lazycom::Result<lazycom::config::SafeFileIdentity> commit() override {
     std::unique_lock lock{state_->mutex};
     state_->entered_commit = true;
     state_->condition.notify_all();
     state_->condition.wait(lock, [this] { return state_->release; });
-    return {};
+    lazycom::config::SafeFileIdentity identity;
+    identity.exists = true;
+    return identity;
   }
   lazycom::Status sync_parent_directory() override { return {}; }
 
@@ -366,6 +368,10 @@ TEST_CASE("persistence worker preserves atomic commit tri-state",
   REQUIRE(completion.file == lazycom::config::PersistenceFile::State);
   REQUIRE(completion.outcome.state ==
           lazycom::config::CommitState::CommittedDurabilityUnknown);
+  REQUIRE(completion.outcome.committed_identity);
+  CHECK(completion.outcome.committed_identity->exists);
+  CHECK(completion.outcome.committed_identity->size ==
+        completion.serialized_document.size());
   REQUIRE(completion.serialized_document.find("version = 1") !=
           std::string::npos);
 }

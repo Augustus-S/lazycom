@@ -1101,3 +1101,86 @@ TEST_CASE("owner stop wakes ppoll and publishes its fixed lifecycle slot",
           WorkerLifecycle::AtReturnPoint);
   REQUIRE_FALSE(service->fatal_signal());
 }
+
+TEST_CASE("manual TX wins at the next complete request boundary",
+          "[serial][owner][scheduler]") {
+  FakeSerialBackend *backend = nullptr;
+  auto service = make_service(backend);
+  const auto connected = connect(*service);
+  REQUIRE(connected.session_id);
+  backend->set_write_steps({1, 64, 64, 64});
+  backend->block_writes();
+
+  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
+                               *connected.session_id, std::nullopt},
+                              {std::byte{'A'}, std::byte{'a'}}}));
+  const bool started = backend->wait_for_write_calls(1U, 1s);
+  if (!started) {
+    backend->release_writes();
+  }
+  REQUIRE(started);
+  const auto scheduled =
+      service->submit_tx({{OperationId{3}, ConnectionGeneration{1},
+                           *connected.session_id, TaskGeneration{7}},
+                          {std::byte{'Q'}, std::byte{'q'}}});
+  const auto manual =
+      service->submit_tx({{OperationId{4}, ConnectionGeneration{1},
+                           *connected.session_id, std::nullopt},
+                          {std::byte{'B'}, std::byte{'b'}}});
+
+  backend->release_writes();
+  REQUIRE(scheduled);
+  REQUIRE(manual);
+  const auto completions = wait_completions(*service, 3U);
+  REQUIRE(completions.size() == 3U);
+  CHECK(std::get<TxCompletion>(completions[0]).operation_id == OperationId{2});
+  CHECK(std::get<TxCompletion>(completions[1]).operation_id == OperationId{4});
+  CHECK(std::get<TxCompletion>(completions[2]).operation_id == OperationId{3});
+  const std::vector<std::byte> expected{std::byte{'A'}, std::byte{'a'},
+                                        std::byte{'B'}, std::byte{'b'},
+                                        std::byte{'Q'}, std::byte{'q'}};
+  CHECK(backend->written() == expected);
+  CHECK_FALSE(service->fatal_signal());
+}
+
+TEST_CASE("TX expiry stops further writes after a late positive partial write",
+          "[serial][owner]") {
+  SerialServiceOptions options;
+  options.tx_timeout = 100ms;
+  FakeSerialBackend *backend = nullptr;
+  auto service = make_service(backend, options);
+  const auto connected = connect(*service);
+  REQUIRE(connected.session_id);
+  backend->set_write_steps({1, 64});
+  backend->block_writes();
+
+  REQUIRE(service->submit_tx({{OperationId{2}, ConnectionGeneration{1},
+                               *connected.session_id, std::nullopt},
+                              {std::byte{1}, std::byte{2}, std::byte{3}}}));
+  const bool started = backend->wait_for_write_calls(1U, 1s);
+  if (started) {
+    std::this_thread::sleep_for(150ms);
+  }
+  backend->release_writes();
+  REQUIRE(started);
+
+  const auto completions = wait_completions(*service, 1U);
+  REQUIRE(completions.size() == 1U);
+  const auto &completion = std::get<TxCompletion>(completions.front());
+  CHECK(completion.outcome == OperationOutcome::TimedOut);
+  CHECK(completion.accepted_bytes == 1U);
+  REQUIRE(completion.error);
+  CHECK(completion.error->code == ErrorCode::SerialOperationTimedOut);
+  CHECK(backend->written() == std::vector<std::byte>{std::byte{1}});
+
+  const auto events = service->drain_data(8U);
+  REQUIRE(events.size() == 2U);
+  CHECK(events[0].kind == SerialDataKind::Tx);
+  CHECK(events[0].bytes == std::vector<std::byte>{std::byte{1}});
+  CHECK(events[1].kind == SerialDataKind::Error);
+  REQUIRE(events[1].error);
+  CHECK(events[1].error->code == ErrorCode::SerialOperationTimedOut);
+  CHECK(events[1].error->operation_id == OperationId{2});
+  CHECK(events[0].owner_order < events[1].owner_order);
+  CHECK_FALSE(service->fatal_signal());
+}

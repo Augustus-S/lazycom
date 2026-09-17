@@ -799,8 +799,13 @@ void Application::set_draft(std::string draft) {
     return;
   }
   if (draft.size() > snapshot_.config.send.max_draft_bytes) {
-    draft.resize(snapshot_.config.send.max_draft_bytes);
     set_notice("Draft reached its configured byte limit");
+    return;
+  }
+  if (!logging::is_strict_utf8(
+          std::as_bytes(std::span{draft.data(), draft.size()}))) {
+    set_notice("Draft must contain valid UTF-8 text");
+    return;
   }
   snapshot_.draft = std::move(draft);
   history_index_.reset();
@@ -1297,6 +1302,8 @@ void Application::process_serial_completions() {
               finish_failed_connection(value);
             }
           } else if constexpr (std::is_same_v<Value, serial::TxCompletion>) {
+            scheduler_.on_deadline(std::chrono::steady_clock::now(),
+                                   active_tx_count_ != 0U);
             if (active_tx_count_ != 0U) {
               --active_tx_count_;
             }
@@ -1309,6 +1316,7 @@ void Application::process_serial_completions() {
                   scheduler::SchedulerState::Stopping) {
                 scheduler::TxBoundary boundary;
                 boundary.completed_request = token;
+                boundary.manual_pending = active_tx_count_ != 0U;
                 boundary.completed_successfully =
                     value.outcome == OperationOutcome::Succeeded;
                 if (const auto next = scheduler_.on_tx_boundary(
@@ -1317,6 +1325,7 @@ void Application::process_serial_completions() {
                                  next->token.generation, next->token)) {
                     scheduler::TxBoundary failed;
                     failed.completed_request = next->token;
+                    failed.manual_pending = active_tx_count_ != 0U;
                     static_cast<void>(scheduler_.on_tx_boundary(
                         std::chrono::steady_clock::now(), failed));
                   }
@@ -1417,11 +1426,21 @@ void Application::process_scan_completions() {
   }
 }
 
+bool Application::log_rollover_pending() const noexcept {
+  return restart_log_owner_ && connection_.generation() &&
+         connection_.session_id() &&
+         *restart_log_owner_ == LogSessionOwner{*connection_.generation(),
+                                                *connection_.session_id()};
+}
+
 void Application::begin_log_session() {
+  const bool finishing_rollover = log_rollover_pending();
   if (!operations_allowed() || log_state_.state() != LogState::Waiting ||
       log_command_ || writer_reconfigure_pending_ || writer_stop_deadline_ ||
-      snapshot_.shutting_down ||
-      connection_.state() != ConnectionState::Connected ||
+      (snapshot_.shutting_down && !finishing_rollover) ||
+      (connection_.state() != ConnectionState::Connected &&
+       !(finishing_rollover &&
+         connection_.state() == ConnectionState::Disconnecting)) ||
       !connection_.generation() || !connection_.session_id() ||
       !connected_port_config_) {
     return;
@@ -1442,9 +1461,10 @@ void Application::begin_log_session() {
                    to_log_flow(port.flow_control)};
   log_command_.emplace(PendingLogCommand{
       writer_->start_session(std::move(header)), PendingLogCommand::Kind::Start,
-      owner, false,
+      owner, processed_cleanup_ == owner,
       std::chrono::steady_clock::now() +
           std::chrono::milliseconds{snapshot_.config.timeouts.log_barrier_ms}});
+  restart_log_owner_.reset();
 }
 
 void Application::end_log_session(const ConnectionGeneration generation,
@@ -1461,6 +1481,11 @@ void Application::end_log_session(const ConnectionGeneration generation,
     if (!log_command_->owner) {
       log_command_->owner = owner;
     }
+    return;
+  }
+  if (log_rollover_pending() && writer_reconfigure_pending_ &&
+      log_state_.state() == LogState::Waiting) {
+    reconfigure_log_writer_if_inactive();
     return;
   }
   if (writer_stop_deadline_) {
@@ -1503,7 +1528,8 @@ void Application::end_log_session(const ConnectionGeneration generation,
 void Application::start_log_rollover_if_needed() {
   if (!restart_log_owner_ || !writer_reconfigure_pending_ || log_command_ ||
       log_state_.state() != LogState::Recording ||
-      connection_.state() != ConnectionState::Connected ||
+      (connection_.state() != ConnectionState::Connected &&
+       connection_.state() != ConnectionState::Disconnecting) ||
       !connection_.generation() || !connection_.session_id() ||
       *restart_log_owner_ != LogSessionOwner{*connection_.generation(),
                                              *connection_.session_id()}) {
@@ -1624,7 +1650,7 @@ void Application::process_log_commands() {
     static_cast<void>(log_state_.disable());
   }
   if (!failed && kind != PendingLogCommand::Kind::Start && !log_command_ &&
-      owner && processed_cleanup_ == owner) {
+      owner && processed_cleanup_ == owner && !log_rollover_pending()) {
     if (!log_backlog_.empty()) {
       log_backlog_.clear();
       log_backlog_bytes_ = 0U;
@@ -1638,8 +1664,8 @@ void Application::process_log_commands() {
                     processed_cleanup_->session_id);
   }
   snapshot_.log = log_state_.state();
+  reconfigure_log_writer_if_inactive();
   if (!snapshot_.shutting_down) {
-    reconfigure_log_writer_if_inactive();
     start_log_rollover_if_needed();
     if (!log_command_ && log_state_.state() == LogState::Waiting &&
         connection_.state() == ConnectionState::Connected) {
@@ -1657,13 +1683,16 @@ void Application::process_log_commands() {
 }
 
 void Application::reconfigure_log_writer_if_inactive() {
-  if (!writer_reconfigure_pending_ || log_command_ || snapshot_.shutting_down ||
+  const bool finishing_rollover = log_rollover_pending();
+  if (!writer_reconfigure_pending_ || log_command_ ||
+      (snapshot_.shutting_down && !finishing_rollover) ||
       !operations_allowed() || log_state_.state() == LogState::Recording) {
     return;
   }
   const auto now = std::chrono::steady_clock::now();
   if (!writer_stop_deadline_) {
-    if (connection_.state() == ConnectionState::Disconnecting) {
+    if (connection_.state() == ConnectionState::Disconnecting &&
+        !finishing_rollover) {
       return;
     }
     writer_stop_deadline_ = now + std::chrono::milliseconds{
@@ -1689,7 +1718,8 @@ void Application::reconfigure_log_writer_if_inactive() {
     snapshot_.log = log_state_.state();
     set_notice("Session log failed while stopping the previous writer");
   }
-  if (connection_.state() == ConnectionState::Disconnecting) {
+  if (connection_.state() == ConnectionState::Disconnecting &&
+      !finishing_rollover) {
     if (processed_cleanup_) {
       end_log_session(processed_cleanup_->generation,
                       processed_cleanup_->session_id);
@@ -1709,7 +1739,9 @@ void Application::reconfigure_log_writer_if_inactive() {
     }
     snapshot_.log_pending = log_backlog_.size();
     snapshot_.log = log_state_.state();
-    restart_log_owner_.reset();
+    if (log_state_.state() != LogState::Waiting) {
+      restart_log_owner_.reset();
+    }
     begin_log_session();
   } catch (const std::bad_alloc &) {
     enter_fatal_stopping({ErrorCode::InternalOutOfMemory,
@@ -1799,7 +1831,7 @@ void Application::process_scheduler() {
     return;
   }
   const auto now = std::chrono::steady_clock::now();
-  scheduler_.on_deadline(now);
+  scheduler_.on_deadline(now, active_tx_count_ != 0U);
   if (const auto automatic_stop = scheduler_.take_automatic_stop_request()) {
     const auto reason = automatic_stop->reason ==
                                 scheduler::AutomaticStopReason::DeadlineOverflow
@@ -1813,7 +1845,8 @@ void Application::process_scheduler() {
       return;
     }
   }
-  if (connection_.state() == ConnectionState::Connected) {
+  if (connection_.state() == ConnectionState::Connected &&
+      active_tx_count_ == 0U) {
     if (const auto send = scheduler_.on_tx_boundary(now)) {
       if (!submit_tx(send->execution->bytes, send->execution->mode,
                      send->token.generation, send->token)) {
@@ -2158,7 +2191,9 @@ Status Application::apply_logging(const std::string_view value,
                                           : snapshot_.config.logging.directory;
   auto saved = save_config();
   writer_reconfigure_pending_ = true;
-  restart_log_owner_.reset();
+  if (!log_rollover_pending()) {
+    restart_log_owner_.reset();
+  }
   if (policy == LogApplyPolicy::RotateNow) {
     if (log_command_ && log_command_->kind == PendingLogCommand::Kind::Start &&
         log_command_->owner) {
@@ -2402,20 +2437,30 @@ void Application::process_save_completions() {
                       : ""));
       continue;
     }
+    if (!completion.outcome.committed_identity ||
+        !completion.outcome.committed_identity->exists) {
+      enter_fatal_stopping({ErrorCode::InternalInvariantBroken,
+                            Operation::CoordinateFatal, WorkerKind::Persistence,
+                            FatalReason::InvariantBroken,
+                            SignalSourceLocation::current()});
+      return;
+    }
+    const auto update_saved_document = [&completion](auto &loaded) {
+      loaded.file_exists = true;
+      loaded.file_identity = *completion.outcome.committed_identity;
+      loaded.document = std::move(completion.serialized_document);
+    };
     if (index == 0U) {
-      config_load_ = config::load_config_toml(paths_.config);
-      config_load_.document = std::move(completion.serialized_document);
+      update_saved_document(config_load_);
     } else if (index == 1U) {
-      quick_load_ = config::load_quick_send_toml(paths_.quick_send);
-      quick_load_.document = std::move(completion.serialized_document);
+      update_saved_document(quick_load_);
       if (pending_quick_send_) {
         snapshot_.quick_send = std::move(*pending_quick_send_);
         pending_quick_send_.reset();
       }
       snapshot_.quick_send_save_failed = false;
     } else {
-      state_load_ = config::load_state_toml(paths_.state);
-      state_load_.document = std::move(completion.serialized_document);
+      update_saved_document(state_load_);
     }
     if (completion.outcome.state ==
         config::CommitState::CommittedDurabilityUnknown) {
@@ -2544,7 +2589,21 @@ bool Application::shutdown() noexcept {
     stop_quick_task();
     const auto drain_log_commands = [this, log_timeout] {
       const auto deadline = std::chrono::steady_clock::now() + log_timeout;
-      while (log_command_) {
+      while (log_command_ || log_rollover_pending()) {
+        if (!log_command_) {
+          start_log_rollover_if_needed();
+          reconfigure_log_writer_if_inactive();
+          if (!operations_allowed()) {
+            return;
+          }
+          if (!log_command_) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+              abort_after_shutdown_timeout();
+            }
+            std::this_thread::sleep_for(1ms);
+            continue;
+          }
+        }
         if (log_command_->completion.wait_until(deadline) !=
             std::future_status::ready) {
           abort_after_shutdown_timeout();

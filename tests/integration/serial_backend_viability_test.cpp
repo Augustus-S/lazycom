@@ -192,7 +192,7 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     REQUIRE((readable.revents & POLLIN) != 0);
 
     std::array<std::byte, inbound.size()> received{};
-    const auto read_result =
+    const int read_result =
         sp_nonblocking_read(port.get(), received.data(), received.size());
     REQUIRE(read_result >= 0);
     REQUIRE(static_cast<std::size_t>(read_result) == received.size());
@@ -203,7 +203,7 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     pollfd writable{.fd = serial_fd, .events = POLLOUT, .revents = 0};
     REQUIRE(wait_for(&writable, 1, 1s) == 1);
     REQUIRE((writable.revents & POLLOUT) != 0);
-    const auto write_result =
+    const int write_result =
         sp_nonblocking_write(port.get(), outbound.data(), outbound.size());
     REQUIRE(write_result >= 0);
     REQUIRE(static_cast<std::size_t>(write_result) == outbound.size());
@@ -223,7 +223,7 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     bool saw_eagain = false;
 
     for (std::size_t attempt = 0; attempt < 512; ++attempt) {
-      const auto written =
+      const int written =
           sp_nonblocking_write(port.get(), chunk.data(), chunk.size());
       REQUIRE(written >= 0);
       if (written == 0) {
@@ -236,9 +236,6 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     }
     REQUIRE(saw_partial_write);
     REQUIRE(saw_eagain);
-
-    pollfd blocked{.fd = serial_fd, .events = POLLOUT, .revents = 0};
-    REQUIRE(wait_for(&blocked, 1, 30ms) == 0);
 
     std::atomic_bool signal_succeeded{false};
     std::jthread signaler([fd = wake_fd.get(), &signal_succeeded] {
@@ -253,12 +250,38 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
         {.fd = serial_fd, .events = POLLIN | POLLOUT, .revents = 0},
         {.fd = wake_fd.get(), .events = POLLIN, .revents = 0},
     }};
-    REQUIRE(wait_for(blocked_wait_set.data(), blocked_wait_set.size(), 1s) ==
-            1);
+    const auto wake_deadline = std::chrono::steady_clock::now() + 1s;
+    bool wake_observed = false;
+    while (!wake_observed) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= wake_deadline) {
+        break;
+      }
+      const auto timeout =
+          std::chrono::ceil<std::chrono::milliseconds>(wake_deadline - now);
+      const auto ready =
+          wait_for(blocked_wait_set.data(), blocked_wait_set.size(), timeout);
+      if (ready < 0 && errno == EINTR) {
+        continue;
+      }
+      REQUIRE(ready >= 0);
+      if (ready == 0) {
+        break;
+      }
+      REQUIRE((blocked_wait_set[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ==
+              0);
+      wake_observed = (blocked_wait_set[1].revents & POLLIN) != 0;
+      if (!wake_observed && (blocked_wait_set[0].revents & POLLOUT) != 0) {
+        // PTY buffering may restore readiness after the first EAGAIN even
+        // before the peer reads. Refill it while still observing the wake fd.
+        const int written =
+            sp_nonblocking_write(port.get(), chunk.data(), chunk.size());
+        REQUIRE(written >= 0);
+      }
+    }
     signaler.join();
     REQUIRE(signal_succeeded.load(std::memory_order_relaxed));
-    REQUIRE((blocked_wait_set[1].revents & POLLIN) != 0);
-    REQUIRE((blocked_wait_set[0].revents & POLLOUT) == 0);
+    REQUIRE(wake_observed);
     drain_eventfd(wake_fd.get());
 
     std::array<std::byte, 64 * 1024> drain_buffer{};

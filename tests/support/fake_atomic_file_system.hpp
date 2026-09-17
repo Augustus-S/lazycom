@@ -4,13 +4,21 @@
 
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace lazycom::test {
 
-enum class AtomicFailurePoint { None, Begin, Stage, Commit, DirectorySync };
+enum class AtomicFailurePoint {
+  None,
+  Begin,
+  Stage,
+  Commit,
+  DirectorySync,
+  DirectorySyncException,
+};
 
 [[nodiscard]] inline Status atomic_test_failure(std::string detail) {
   return tl::make_unexpected(make_error(
@@ -28,12 +36,22 @@ public:
                                                : Status{};
   }
 
-  Status commit() override {
-    return point_ == AtomicFailurePoint::Commit ? atomic_test_failure("commit")
-                                                : Status{};
+  Result<config::SafeFileIdentity> commit() override {
+    if (point_ == AtomicFailurePoint::Commit) {
+      return tl::make_unexpected(atomic_test_failure("commit").error());
+    }
+    config::SafeFileIdentity identity;
+    identity.exists = true;
+    identity.device = 17U;
+    identity.inode = 23U;
+    identity.size = staged.size();
+    return identity;
   }
 
   Status sync_parent_directory() override {
+    if (point_ == AtomicFailurePoint::DirectorySyncException) {
+      throw std::runtime_error{"directory sync"};
+    }
     return point_ == AtomicFailurePoint::DirectorySync
                ? atomic_test_failure("directory sync")
                : Status{};

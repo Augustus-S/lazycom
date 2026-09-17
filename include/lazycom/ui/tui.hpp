@@ -8,6 +8,10 @@
 #include <string>
 #include <string_view>
 
+namespace ftxui {
+class Event;
+}
+
 namespace lazycom::ui {
 
 enum class RouteMode : std::uint8_t {
@@ -95,6 +99,39 @@ struct RouteInput {
   bool device_modal{};
   bool search_filter_focused{};
 };
+
+enum class PasteConsumeResult : std::uint8_t {
+  Consumed,
+  Completed,
+  Rejected,
+};
+
+/** Collects one terminal bracketed paste without routing its contents as keys.
+ */
+class BracketedPaste {
+public:
+  void start(RouteMode mode, std::uint64_t context_id,
+             std::size_t available_bytes, bool accepts_text);
+  [[nodiscard]] PasteConsumeResult consume(std::string_view text,
+                                           bool is_character, bool is_end,
+                                           RouteMode current_mode,
+                                           std::uint64_t current_context_id);
+  [[nodiscard]] bool active() const noexcept { return active_; }
+  [[nodiscard]] std::string take_text();
+
+private:
+  bool active_{};
+  bool rejected_{};
+  bool accepts_text_{};
+  RouteMode mode_{RouteMode::Normal};
+  std::uint64_t context_id_{};
+  std::size_t available_bytes_{};
+  std::string text_;
+};
+
+[[nodiscard]] PasteConsumeResult
+consume_paste_event(BracketedPaste &paste, const ftxui::Event &event,
+                    RouteMode current_mode, std::uint64_t current_context_id);
 
 /**
  * @brief Applies pure context-sensitive routing to one canonical key name.

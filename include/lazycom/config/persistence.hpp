@@ -28,7 +28,9 @@ struct SaveCompletion {
   AtomicWriteOutcome outcome;
   /**
    * Exact validated document passed to the atomic writer. Callers use it to
-   * commit the matching in-memory snapshot for both committed states.
+   * commit the matching in-memory snapshot and retain
+   * outcome.committed_identity for both committed states, without reloading the
+   * target path.
    */
   std::string serialized_document;
 };

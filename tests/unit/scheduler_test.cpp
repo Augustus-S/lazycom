@@ -383,3 +383,38 @@ TEST_CASE("request sequence exhaustion emits an explicit stop request",
       scheduler.confirm_stopped(*started.started_generation, at(1)).status ==
       StopConfirmationStatus::Stopped);
 }
+
+TEST_CASE("periodic deadlines skip manual work without deferring another send",
+          "[scheduler]") {
+  Scheduler scheduler;
+  REQUIRE(scheduler.start(request(10U), at(0)).status ==
+          TaskStartStatus::Started);
+  const auto first = scheduler.on_tx_boundary(at(0));
+  REQUIRE(first);
+  REQUIRE_FALSE(
+      scheduler.on_tx_boundary(at(1), TxBoundary{first->token, true, false}));
+
+  REQUIRE_FALSE(
+      scheduler.on_tx_boundary(at(35), TxBoundary{std::nullopt, false, true}));
+  CHECK(scheduler.snapshot().missed_count == 3U);
+  CHECK_FALSE(scheduler.snapshot().trigger_pending);
+  CHECK(scheduler.next_deadline() == at(40));
+  CHECK_FALSE(scheduler.on_tx_boundary(at(36)));
+  const auto next = scheduler.on_tx_boundary(at(40));
+  REQUIRE(next);
+  CHECK(next->token.sequence == 2U);
+}
+
+TEST_CASE("busy deadlines retain the task's first immediate trigger",
+          "[scheduler]") {
+  Scheduler scheduler;
+  REQUIRE(scheduler.start(request(10U), at(0)).status ==
+          TaskStartStatus::Started);
+  REQUIRE_FALSE(
+      scheduler.on_tx_boundary(at(35), TxBoundary{std::nullopt, false, true}));
+  CHECK(scheduler.snapshot().missed_count == 3U);
+  CHECK(scheduler.snapshot().trigger_pending);
+  const auto first = scheduler.on_tx_boundary(at(36));
+  REQUIRE(first);
+  CHECK(first->token.sequence == 1U);
+}

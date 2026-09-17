@@ -81,8 +81,7 @@ void initialize_libserialport() noexcept {
   }
 }
 
-[[nodiscard]] Error adapt_sp_error(const enum sp_return result,
-                                   const Operation operation,
+[[nodiscard]] Error adapt_sp_error(const int result, const Operation operation,
                                    const std::string_view context) {
   int os_error = 0;
   std::string message;
@@ -532,7 +531,7 @@ LibserialportBackend::read_some(const std::span<std::byte> destination) {
                                      Operation::ReadSerial,
                                      "serial read requested while closed"));
   }
-  const auto result =
+  const int result =
       sp_nonblocking_read(impl_->port, destination.data(), destination.size());
   if (result < 0) {
     return tl::unexpected(adapt_sp_error(result, Operation::ReadSerial,
@@ -548,7 +547,7 @@ LibserialportBackend::write_some(const std::span<const std::byte> source) {
                                      Operation::WriteSerial,
                                      "serial write requested while closed"));
   }
-  const auto result =
+  const int result =
       sp_nonblocking_write(impl_->port, source.data(), source.size());
   if (result < 0) {
     return tl::unexpected(adapt_sp_error(result, Operation::WriteSerial,

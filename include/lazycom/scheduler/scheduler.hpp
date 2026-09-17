@@ -234,9 +234,11 @@ public:
 
   /**
    * @brief Advances fixed-rate deadlines and records missed periods.
+   * @param writer_busy Whether accepted TX occupies the writer at this
+   * observation.
    * @note At most one trigger and one TX request can be outstanding.
    */
-  void on_deadline(TimePoint now) noexcept;
+  void on_deadline(TimePoint now, bool writer_busy = false) noexcept;
   /**
    * @brief Applies a completed TX boundary and emits at most one scheduled
    * send.

@@ -19,7 +19,8 @@ namespace lazycom::config {
  *
  * The token combines filesystem identity, size, modification time, and a
  * content digest. Callers should retain the complete value returned by
- * read_safe_file() and supply it unchanged to a later atomic write.
+ * read_safe_file() or a committed write and supply it unchanged to a later
+ * atomic write.
  */
 struct SafeFileIdentity {
   bool exists{};
@@ -63,6 +64,8 @@ enum class CommitState {
 struct AtomicWriteOutcome {
   CommitState state{CommitState::NotCommitted};
   std::optional<Error> error;
+  /** Exact identity of this replacement; present in both committed states. */
+  std::optional<SafeFileIdentity> committed_identity{};
 };
 
 class AtomicWriteTransaction {
@@ -71,8 +74,12 @@ public:
 
   /** @brief Writes and synchronizes the complete temporary-file contents. */
   virtual Status stage(std::string_view bytes) = 0;
-  /** @brief Makes the staged file visible at the target path. */
-  virtual Status commit() = 0;
+  /**
+   * @brief Makes the staged file visible and returns that file's identity.
+   * @note The identity belongs to the staged inode, not a subsequent read of
+   * the target path. An error means the replacement was not committed.
+   */
+  virtual Result<SafeFileIdentity> commit() = 0;
   /** @brief Synchronizes the parent directory after a successful commit. */
   virtual Status sync_parent_directory() = 0;
 };
@@ -110,7 +117,8 @@ public:
  * @param expected_identity Identity observed by the preceding safe read.
  * @param file_system Borrowed implementation used for this call only.
  * @return A tri-state outcome. CommittedDurabilityUnknown must be treated as a
- * committed replacement even though restart durability is uncertain.
+ * committed replacement even though restart durability is uncertain. Both
+ * committed states carry the identity to use for the next optimistic save.
  */
 [[nodiscard]] AtomicWriteOutcome
 write_file_atomically(const std::filesystem::path &target,

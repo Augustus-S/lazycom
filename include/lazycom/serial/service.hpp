@@ -172,8 +172,10 @@ public:
   /**
    * @brief Admits a nonempty, at-most-1-MiB TX for the exact active session.
    *
-   * Requests do not interleave bytes. Terminal data contains the exact accepted
-   * prefix, followed by an ERR for partial failure/cancellation/timeout.
+   * Requests do not interleave bytes. Pending manual TX takes priority over
+   * scheduled TX at request boundaries. Terminal data contains the exact
+   * accepted prefix, followed by an ERR for partial
+   * failure/cancellation/timeout.
    */
   [[nodiscard]] Result<OperationId> submit_tx(TxRequest request);
   /**

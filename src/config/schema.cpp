@@ -1289,8 +1289,17 @@ serialize_quick_send_toml(const QuickSendSnapshot &snapshot,
         continue;
       }
       if (slot_table == nullptr) {
-        slots->push_back(toml::table{});
-        slot_table = slots->back().as_table();
+        for (auto &node : *slots) {
+          auto *empty = node.as_table();
+          if (empty != nullptr && !empty->contains("index")) {
+            slot_table = empty;
+            break;
+          }
+        }
+        if (slot_table == nullptr) {
+          slots->push_back(toml::table{});
+          slot_table = slots->back().as_table();
+        }
       }
       slot_table->insert_or_assign("index", slot->index);
       slot_table->insert_or_assign("name", slot->name);
@@ -1300,7 +1309,16 @@ serialize_quick_send_toml(const QuickSendSnapshot &snapshot,
                                    std::string{to_string(slot->newline)});
       slot_table->insert_or_assign("note", slot->note);
     }
-    return format_table(std::move(table), kQuickSendMaximumBytes);
+    auto serialized = format_table(std::move(table), kQuickSendMaximumBytes);
+    if (!serialized) {
+      return serialized;
+    }
+    const auto round_trip = parse_quick_send_toml(*serialized);
+    if (!round_trip.accepted) {
+      return serialization_failure(validation_detail(round_trip.errors),
+                                   ErrorCode::ValidationInvalidValue);
+    }
+    return serialized;
   } catch (const std::exception &error) {
     return serialization_failure(error.what());
   } catch (...) {
