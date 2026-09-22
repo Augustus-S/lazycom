@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -81,8 +82,7 @@ public:
     }
     if (fail_read_) {
       fail_read_ = false;
-      std::uint64_t wake_count{};
-      static_cast<void>(::read(wait_fd_, &wake_count, sizeof(wake_count)));
+      drain_wake();
       return tl::unexpected(lazycom::make_error(
           lazycom::ErrorCode::SerialDeviceGone, lazycom::Operation::ReadSerial,
           "injected application read failure"));
@@ -96,8 +96,7 @@ public:
     pending_rx_.erase(pending_rx_.begin(),
                       pending_rx_.begin() +
                           static_cast<std::ptrdiff_t>(amount));
-    std::uint64_t wake_count{};
-    static_cast<void>(::read(wait_fd_, &wake_count, sizeof(wake_count)));
+    drain_wake();
     read_bytes_count_.fetch_add(amount, std::memory_order_release);
     return amount;
   }
@@ -127,8 +126,7 @@ public:
         pending_rx_.push_back(static_cast<std::byte>(value));
       }
     }
-    const std::uint64_t wake = 1U;
-    static_cast<void>(::write(wait_fd_, &wake, sizeof(wake)));
+    signal_wake();
   }
 
   void fail_next_read() {
@@ -136,8 +134,7 @@ public:
       std::lock_guard lock(mutex_);
       fail_read_ = true;
     }
-    const std::uint64_t wake = 1U;
-    static_cast<void>(::write(wait_fd_, &wake, sizeof(wake)));
+    signal_wake();
   }
 
   void throw_next_read() {
@@ -145,8 +142,7 @@ public:
       std::lock_guard lock(mutex_);
       throw_read_ = true;
     }
-    const std::uint64_t wake = 1U;
-    static_cast<void>(::write(wait_fd_, &wake, sizeof(wake)));
+    signal_wake();
   }
 
   void fail_after_write_limit(const std::size_t size) {
@@ -192,6 +188,29 @@ public:
   void inject_rx_on_open(std::string bytes) { open_rx_ = std::move(bytes); }
 
 private:
+  void drain_wake() {
+    eventfd_t wake_count{};
+    int result;
+    do {
+      result = ::eventfd_read(wait_fd_, &wake_count);
+    } while (result < 0 && errno == EINTR);
+    // Partial RX reads can consume data after the wake counter was drained.
+    if (result < 0 && errno != EAGAIN) {
+      throw std::runtime_error("cannot drain fake serial eventfd");
+    }
+  }
+
+  void signal_wake() {
+    int result;
+    do {
+      result = ::eventfd_write(wait_fd_, 1U);
+    } while (result < 0 && errno == EINTR);
+    // A saturated counter already makes the descriptor readable.
+    if (result < 0 && errno != EAGAIN) {
+      throw std::runtime_error("cannot signal fake serial eventfd");
+    }
+  }
+
   std::vector<serial::DeviceInfo> devices_;
   bool block_enumerate_{};
   int wait_fd_;

@@ -183,7 +183,7 @@ TEST_CASE("fixed rate deadlines do not drift or accumulate requests",
 
 TEST_CASE("manual priority preserves only the initial pending trigger",
           "[scheduler]") {
-  for (const auto [initial, explicit_deadline] :
+  for (const auto &[initial, explicit_deadline] :
        {std::pair{true, false}, std::pair{true, true},
         std::pair{false, false}}) {
     CAPTURE(initial, explicit_deadline);
