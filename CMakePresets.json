@@ -89,6 +89,11 @@
       "output": { "outputOnFailure": true }
     },
     {
+      "name": "gcc-debug-fast",
+      "inherits": "gcc-debug",
+      "filter": { "exclude": { "label": "^(build|extended)$" } }
+    },
+    {
       "name": "clang-debug",
       "configurePreset": "clang-debug",
       "output": { "outputOnFailure": true }

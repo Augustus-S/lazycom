@@ -1,0 +1,202 @@
+name: Build and prerelease
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: ${{ matrix.preset }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        preset:
+          - gcc-debug
+          - clang-debug
+          - gcc-release
+          - gcc-debug-no-diagnostics
+          - gcc-asan-ubsan
+    env:
+      PRESET: ${{ matrix.preset }}
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      CTEST_PARALLEL_LEVEL: 2
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            cmake ninja-build make gcc-13 g++-13 clang-18
+
+      - name: Configure
+        run: |
+          if [[ "$PRESET" == clang-debug ]]; then
+            c_compiler=clang-18
+            cxx_compiler=clang++-18
+          else
+            c_compiler=gcc-13
+            cxx_compiler=g++-13
+          fi
+          cmake --preset "$PRESET" \
+            -DCMAKE_C_COMPILER="$c_compiler" -DCMAKE_CXX_COMPILER="$cxx_compiler" \
+            -DLAZYCOM_BUILD_COMMIT="$GITHUB_SHA" \
+            -DLAZYCOM_PACKAGE_SUFFIX="~pre.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.g${GITHUB_SHA:0:12}"
+
+      - name: Build
+        run: cmake --build --preset "$PRESET"
+
+      - name: Test
+        run: ctest --preset "$PRESET" --no-tests=error
+
+      - name: Install packaging tools
+        if: matrix.preset == 'gcc-release'
+        run: |
+          sudo apt-get install --no-install-recommends -y \
+            dpkg-dev rpm file binutils curl desktop-file-utils squashfs-tools
+
+      - name: Build DEB, RPM, archive and AppImage
+        if: matrix.preset == 'gcc-release'
+        run: |
+          for generator in DEB RPM TGZ; do
+            cpack --config build/gcc-release/CPackConfig.cmake \
+              -G "$generator" -B build/packages
+          done
+          mkdir -p build/release-assets
+          cp build/packages/*.deb build/packages/*.rpm build/packages/*.tar.gz \
+            build/release-assets/
+          bash packaging/build-appimage.sh build/gcc-release build/release-assets
+
+          staging="$RUNNER_TEMP/archive-check"
+          mkdir -p "$staging"
+          tar -xzf build/release-assets/*.tar.gz -C "$staging" --strip-components=1
+          binary="$staging/usr/bin/lazycom"
+          readelf -d "$binary" | grep -F '[$ORIGIN/../lib/lazycom]'
+          ldd "$binary" | tee "$RUNNER_TEMP/lazycom-ldd.txt"
+          grep -F "libserialport.so.0 => $staging/usr/bin/../lib/lazycom/" \
+            "$RUNNER_TEMP/lazycom-ldd.txt"
+          if grep -F 'not found' "$RUNNER_TEMP/lazycom-ldd.txt"; then
+            exit 1
+          fi
+
+          cd build/release-assets
+          sha256sum ./*.deb ./*.rpm ./*.tar.gz ./*.AppImage > SHA256SUMS
+
+      - name: Upload release bundle
+        if: matrix.preset == 'gcc-release'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-linux-x86_64
+          path: build/release-assets/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload test failure logs
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: test-logs-${{ matrix.preset }}
+          path: build/${{ matrix.preset }}/Testing/Temporary/
+          overwrite: true
+          retention-days: 7
+
+  install-test:
+    name: Install on ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu:24.04
+            format: deb
+          - image: ubuntu:26.04
+            format: deb
+          - image: debian:13
+            format: deb
+          - image: registry.fedoraproject.org/fedora:44
+            format: rpm
+    steps:
+      - name: Check out package tests
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download packages
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-linux-x86_64
+          path: release-assets
+
+      - name: Verify checksums
+        working-directory: release-assets
+        run: sha256sum --check SHA256SUMS
+
+      - name: Install, start and remove native package; start AppImage
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+          PACKAGE_FORMAT: ${{ matrix.format }}
+        run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            "$TEST_IMAGE" bash /workspace/packaging/test-install.sh \
+            "$PACKAGE_FORMAT" /workspace/release-assets
+
+  release:
+    name: Publish prerelease
+    if: github.event_name != 'pull_request'
+    needs: [build, install-test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release bundle
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-linux-x86_64
+          path: release-assets
+
+      - name: Publish GitHub prerelease
+        working-directory: release-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha256sum --check SHA256SUMS
+          tag="build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          LazyCom Linux x86_64 预发布版本。
+
+          - Commit: $GITHUB_SHA
+          - 构建记录: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - DEB: Debian 13、Ubuntu 24.04 / 26.04；使用 apt install ./lazycom_*.deb 安装。
+          - RPM: Fedora 44；使用 dnf install ./lazycom-*.rpm 安装。
+          - 安装后的命令为 lazycom。
+          - AppImage: 设置可执行权限后运行；无 FUSE 时可设置 APPIMAGE_EXTRACT_AND_RUN=1。
+          - tar.gz: 解压后运行 usr/bin/lazycom，保留 usr 目录结构。
+          - SHA256SUMS: 下载所需附件后使用 sha256sum --check --ignore-missing SHA256SUMS 校验。
+
+          此版本通过自动构建和测试，尚未完成真实串口硬件及长时性能验收。
+          EOF
+          gh release create "$tag" ./*.deb ./*.rpm ./*.AppImage ./*.tar.gz SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "Build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT} (${GITHUB_SHA:0:12})" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --prerelease --latest=false

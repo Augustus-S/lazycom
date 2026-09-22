@@ -156,6 +156,8 @@ foreach(lazycom_target IN ITEMS
 endforeach()
 target_link_libraries(lazycom PRIVATE lazycom_release_link_hardening)
 
+include(cmake/Install.cmake)
+
 if(BUILD_TESTING AND LAZYCOM_BUILD_TESTS)
   add_subdirectory(tests)
 endif()

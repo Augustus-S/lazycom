@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LazyCom
+Comment=Terminal serial port assistant
+Exec=lazycom
+Icon=lazycom
+Terminal=true
+Categories=Utility;
+Keywords=serial;UART;terminal;
