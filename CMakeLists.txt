@@ -13,6 +13,7 @@ include(cmake/Dependencies.cmake)
 
 add_library(lazycom_base STATIC
   src/base/error.cpp
+  src/base/text.cpp
 )
 target_include_directories(lazycom_base PUBLIC include)
 target_link_libraries(lazycom_base
@@ -38,10 +39,11 @@ target_link_libraries(lazycom_config
 add_library(lazycom_logging STATIC
   src/logging/schema.cpp
   src/logging/session_writer.cpp
+  src/logging/linux_session_files.cpp
 )
 target_include_directories(lazycom_logging PUBLIC include)
 target_link_libraries(lazycom_logging
-  PUBLIC lazycom_base Threads::Threads
+  PUBLIC lazycom_base lazycom_data_path Threads::Threads
   PRIVATE lazycom_project_options lazycom_project_warnings
 )
 
@@ -51,22 +53,13 @@ add_library(lazycom_data_path STATIC
   src/model/memory_budget.cpp
   src/model/session_record.cpp
   src/model/session_sequencer.cpp
-  src/model/tx_operation.cpp
 )
 target_include_directories(lazycom_data_path PUBLIC include)
 target_link_libraries(lazycom_data_path
-  PUBLIC lazycom_logging Threads::Threads
+  PUBLIC lazycom_base Threads::Threads
   PRIVATE lazycom_project_options lazycom_project_warnings
 )
 
-add_library(lazycom_scheduler STATIC
-  src/scheduler/scheduler.cpp
-)
-target_include_directories(lazycom_scheduler PUBLIC include)
-target_link_libraries(lazycom_scheduler
-  PUBLIC lazycom_config
-  PRIVATE lazycom_project_options lazycom_project_warnings
-)
 target_include_directories(lazycom_core PUBLIC include)
 target_compile_definitions(lazycom_core PRIVATE LAZYCOM_VERSION="${PROJECT_VERSION}")
 target_link_libraries(lazycom_core
@@ -92,6 +85,7 @@ add_library(lazycom_serial STATIC
   src/serial/libserialport_probe.cpp
   src/serial/scanner.cpp
   src/serial/service.cpp
+  src/scheduler/scheduler.cpp
 )
 target_include_directories(lazycom_serial PUBLIC include)
 target_link_libraries(lazycom_serial
@@ -104,6 +98,9 @@ endif()
 
 add_library(lazycom_app STATIC
   src/app/application.cpp
+  src/app/settings_coordinator.cpp
+  src/app/session_log_coordinator.cpp
+  src/app/session_records.cpp
   src/app/state.cpp
 )
 target_include_directories(lazycom_app PUBLIC include)
@@ -113,7 +110,6 @@ target_link_libraries(lazycom_app
     lazycom_config
     lazycom_data_path
     lazycom_logging
-    lazycom_scheduler
     lazycom_serial
     lazycom_diagnostics
   PRIVATE lazycom_project_options lazycom_project_warnings
@@ -121,6 +117,7 @@ target_link_libraries(lazycom_app
 
 add_library(lazycom_ui STATIC
   src/ui/tui.cpp
+  src/ui/receive_view_model.cpp
 )
 target_include_directories(lazycom_ui PUBLIC include)
 target_link_libraries(lazycom_ui
@@ -149,7 +146,6 @@ foreach(lazycom_target IN ITEMS
     lazycom_config
     lazycom_logging
     lazycom_data_path
-    lazycom_scheduler
     lazycom_diagnostics
     lazycom_serial
     lazycom_app

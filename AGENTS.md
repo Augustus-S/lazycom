@@ -58,7 +58,6 @@ LazyCom 是使用 C++20 开发的 Linux 优先 TUI 串口助手。项目使用�
 - `lazycom_config`
 - `lazycom_logging`
 - `lazycom_data_path`
-- `lazycom_scheduler`
 - `lazycom_diagnostics`
 - `lazycom_serial`
 - `lazycom_app`

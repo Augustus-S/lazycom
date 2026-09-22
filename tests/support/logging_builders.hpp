@@ -1,6 +1,8 @@
 #pragma once
 
 #include <lazycom/logging/schema.hpp>
+#include <lazycom/model/session_record.hpp>
+#include <stdexcept>
 
 #include <cstddef>
 #include <cstdint>
@@ -34,6 +36,24 @@ log_record(std::uint64_t seq, logging::Direction direction,
   value.direction = direction;
   value.payload = std::move(payload);
   return value;
+}
+
+[[nodiscard]] inline model::SessionRecordPtr
+session_record(logging::Record record) {
+  model::GlobalMemoryBudget budget;
+  model::RecordDraft draft{record.direction,
+                           {std::move(record.time_utc), record.elapsed_ns},
+                           record.payload,
+                           record.input_mode,
+                           std::move(record.message),
+                           std::move(record.code),
+                           {}};
+  auto reservation = budget.try_reserve(model::BudgetCategory::UiRecords,
+                                        model::estimate_record_memory(draft));
+  if (!reservation)
+    throw std::runtime_error("test record exceeds budget");
+  return std::make_shared<model::SessionRecord>(record.seq, std::move(draft),
+                                                std::move(*reservation));
 }
 
 } // namespace lazycom::test

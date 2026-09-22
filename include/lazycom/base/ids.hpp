@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <compare>
 #include <concepts>
 #include <cstdint>
@@ -96,6 +97,33 @@ public:
 
 private:
   Id last_issued_{};
+};
+
+/** Shared operation-ID domain for callers and owner-generated periodic sends.
+ */
+class OperationIdIssuer {
+public:
+  [[nodiscard]] IdIncrementResult issue(OperationId &issued) noexcept {
+    auto previous = last_.load(std::memory_order_relaxed);
+    while (previous != std::numeric_limits<std::uint64_t>::max()) {
+      if (last_.compare_exchange_weak(previous, previous + 1U,
+                                      std::memory_order_relaxed)) {
+        issued = OperationId{previous + 1U};
+        return IdIncrementResult::Advanced;
+      }
+    }
+    return IdIncrementResult::Overflow;
+  }
+  void observe(OperationId issued) noexcept {
+    auto previous = last_.load(std::memory_order_relaxed);
+    while (previous < issued.value &&
+           !last_.compare_exchange_weak(previous, issued.value,
+                                        std::memory_order_relaxed)) {
+    }
+  }
+
+private:
+  std::atomic<std::uint64_t> last_{};
 };
 
 } // namespace lazycom

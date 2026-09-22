@@ -19,12 +19,12 @@ using lazycom::config::QuickSendSnapshot;
 using lazycom::config::SendMode;
 using namespace lazycom::scheduler;
 
-static_assert(Scheduler::valid_interval(0U));
-static_assert(!Scheduler::valid_interval(1U));
-static_assert(!Scheduler::valid_interval(9U));
-static_assert(Scheduler::valid_interval(10U));
-static_assert(Scheduler::valid_interval(86'400'000U));
-static_assert(!Scheduler::valid_interval(86'400'001U));
+static_assert(valid_interval(0U));
+static_assert(!valid_interval(1U));
+static_assert(!valid_interval(9U));
+static_assert(valid_interval(10U));
+static_assert(valid_interval(86'400'000U));
+static_assert(!valid_interval(86'400'001U));
 
 [[nodiscard]] Scheduler::TimePoint at(const std::int64_t milliseconds) {
   return Scheduler::TimePoint{} + std::chrono::milliseconds{milliseconds};

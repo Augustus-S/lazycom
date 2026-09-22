@@ -2,6 +2,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <support/temporary_directory.hpp>
+#include <support/wait.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -38,6 +39,8 @@ namespace logging = lazycom::logging;
 namespace serial = lazycom::serial;
 
 namespace {
+using namespace std::chrono_literals;
+using lazycom::test::wait_until;
 
 class FakeBackend final : public serial::ISerialBackend {
 public:
@@ -101,12 +104,6 @@ public:
   lazycom::Result<std::size_t>
   write_some(std::span<const std::byte> source) override {
     std::lock_guard lock(mutex_);
-    if (fail_write_) {
-      fail_write_ = false;
-      return tl::unexpected(lazycom::make_error(
-          lazycom::ErrorCode::SerialDeviceGone, lazycom::Operation::WriteSerial,
-          "injected application TX failure"));
-    }
     const auto remaining =
         write_limit_ > written_bytes_ ? write_limit_ - written_bytes_ : 0U;
     if (remaining == 0U && fail_after_write_limit_) {
@@ -150,11 +147,6 @@ public:
     }
     const std::uint64_t wake = 1U;
     static_cast<void>(::write(wait_fd_, &wake, sizeof(wake)));
-  }
-
-  void fail_next_write() {
-    std::lock_guard lock(mutex_);
-    fail_write_ = true;
   }
 
   void fail_after_write_limit(const std::size_t size) {
@@ -216,7 +208,6 @@ private:
   std::atomic_bool enumerate_entered_{};
   bool fail_read_{};
   bool throw_read_{};
-  bool fail_write_{};
   bool fail_after_write_limit_{};
 };
 
@@ -241,13 +232,15 @@ struct ApplicationHarness {
   std::unique_ptr<app::Application> application;
   bool shutdown_attempted{};
 
-  ApplicationHarness(std::unique_ptr<serial::ISerialBackend> serial =
-                         std::make_unique<FakeBackend>(),
-                     std::unique_ptr<serial::ISerialBackend> scanner =
-                         std::make_unique<FakeBackend>(),
-                     const std::string_view log_subdirectory = "logs",
-                     const std::function<void(const config::PersistencePaths &)>
-                         &prepare = {}) {
+  ApplicationHarness(
+      std::unique_ptr<serial::ISerialBackend> serial =
+          std::make_unique<FakeBackend>(),
+      std::unique_ptr<serial::ISerialBackend> scanner =
+          std::make_unique<FakeBackend>(),
+      const std::string_view log_subdirectory = "logs",
+      const std::function<void(const config::PersistencePaths &)> &prepare = {},
+      lazycom::model::GlobalMemoryBudget budget =
+          lazycom::model::GlobalMemoryBudget{}) {
     if (prepare) {
       prepare(paths);
     }
@@ -256,6 +249,7 @@ struct ApplicationHarness {
     dependencies.scanner_backend = std::move(scanner);
     dependencies.paths = paths;
     dependencies.log_directory = directory.path() / log_subdirectory;
+    dependencies.memory_budget = std::move(budget);
     auto created = app::Application::create(std::move(dependencies));
     if (!created) {
       throw std::runtime_error("cannot create application test fixture");
@@ -338,10 +332,17 @@ TEST_CASE("application restores startup state and integrates device scans",
     REQUIRE(application.snapshot().config.serial.baud == 115200);
     REQUIRE(application.snapshot().devices.size() == 1U);
     REQUIRE(application.snapshot().devices.front().path == "/dev/ttyFAKE0");
-    REQUIRE(application.apply_baud("230400"));
+    REQUIRE(application.apply_baud(230400));
     REQUIRE(application.snapshot().config.serial.baud == 230400);
-    REQUIRE(application.apply_data_format("8,1,none,none"));
-    REQUIRE_FALSE(application.apply_baud("0"));
+    REQUIRE(application.apply_data_format(
+        {8, 1, config::Parity::None, config::FlowControl::None}));
+    REQUIRE_FALSE(application.apply_baud(0));
+    REQUIRE_FALSE(application.apply_newline(config::Newline::Session));
+    REQUIRE_FALSE(application.apply_newline(static_cast<config::Newline>(99)));
+    REQUIRE_FALSE(
+        application.apply_send_mode(static_cast<config::SendMode>(99)));
+    REQUIRE_FALSE(application.apply_data_format(
+        {8, 1, static_cast<config::Parity>(99), config::FlowControl::None}));
     REQUIRE(harness.shutdown());
   }
   SECTION("application restores receive visibility from state") {
@@ -392,7 +393,6 @@ TEST_CASE("application restores startup state and integrates device scans",
     auto &application = harness.app();
     REQUIRE(tick_until(
         application, [&] { return bool(application.snapshot().alert); }, 100));
-    REQUIRE(application.snapshot().alert);
     CHECK(application.snapshot().alert->code ==
           lazycom::ErrorCode::SerialPermissionDenied);
     CHECK(application.snapshot().alert->message.find("dialout") !=
@@ -459,10 +459,6 @@ TEST_CASE("connection completion and cancellation preserve session data and "
               }));
         },
         200));
-    CHECK(std::ranges::any_of(
-        application.snapshot().records, [](const auto &record) {
-          return record.direction == app::RecordDirection::Rx;
-        }));
     REQUIRE(harness.shutdown());
   }
   SECTION("application exposes the active serial configuration snapshot") {
@@ -470,8 +466,9 @@ TEST_CASE("connection completion and cancellation preserve session data and "
     auto &application = harness.app();
     REQUIRE_FALSE(application.snapshot().active_port_config);
     application.set_device_path("/dev/null");
-    REQUIRE(application.apply_baud("230400"));
-    REQUIRE(application.apply_data_format("7,2,even,none"));
+    REQUIRE(application.apply_baud(230400));
+    REQUIRE(application.apply_data_format(
+        {7, 2, config::Parity::Even, config::FlowControl::None}));
 
     application.connection_control();
     REQUIRE(application.snapshot().active_port_config);
@@ -488,8 +485,6 @@ TEST_CASE("connection completion and cancellation preserve session data and "
                  app::ConnectionState::Connected;
         },
         100));
-    REQUIRE(application.snapshot().connection ==
-            app::ConnectionState::Connected);
     REQUIRE(application.snapshot().active_port_config);
 
     application.connection_control();
@@ -501,8 +496,6 @@ TEST_CASE("connection completion and cancellation preserve session data and "
                  app::ConnectionState::Disconnected;
         },
         100));
-    REQUIRE(application.snapshot().connection ==
-            app::ConnectionState::Disconnected);
     REQUIRE_FALSE(application.snapshot().active_port_config);
     REQUIRE(harness.shutdown());
   }
@@ -521,18 +514,13 @@ TEST_CASE("connection completion and cancellation preserve session data and "
     application.connect();
     REQUIRE(application.snapshot().connection ==
             app::ConnectionState::Connecting);
-    for (int attempt = 0; attempt < 200 && !backend->opened(); ++attempt) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
-    REQUIRE(backend->opened());
+    REQUIRE(wait_until([&] { return backend->opened(); }, 200ms));
     std::this_thread::sleep_for(std::chrono::milliseconds{10});
     application.disconnect();
     REQUIRE(tick_until(application, [&] {
       return application.snapshot().connection ==
              app::ConnectionState::Disconnected;
     }));
-    CHECK(application.snapshot().connection ==
-          app::ConnectionState::Disconnected);
     CHECK_FALSE(application.snapshot().active_port_config);
     REQUIRE(harness.shutdown());
     const auto decoded = read_session(log_directory);
@@ -550,14 +538,14 @@ TEST_CASE(
     ApplicationHarness harness;
     auto &application = harness.app();
     const auto default_logs = harness.directory.path() / "logs";
-    REQUIRE(application.apply_logging("|25|128|16"));
+    REQUIRE(application.apply_logging({{}, 25U, 128U, 16U}));
     REQUIRE(application.snapshot().config.logging.directory.empty());
     CHECK(application.snapshot().effective_log_directory ==
           default_logs.string());
     REQUIRE(application.snapshot().config.logging.max_files == 25U);
     REQUIRE(application.snapshot().config.logging.max_total_size_mib == 128U);
     REQUIRE(application.snapshot().config.logging.max_file_size_mib == 16U);
-    REQUIRE_FALSE(application.apply_logging("relative|25|128|16"));
+    REQUIRE_FALSE(application.apply_logging({"relative", 25U, 128U, 16U}));
 
     REQUIRE(tick_until(application, [&] {
       if (application.snapshot().log == app::LogState::Off)
@@ -577,8 +565,9 @@ TEST_CASE(
     const auto root = harness.directory.path();
     const auto missing = root / "missing";
     REQUIRE_FALSE(
-        application.validate_logging(missing.string() + "|25|128|16"));
-    REQUIRE_FALSE(application.apply_logging(missing.string() + "|25|128|16"));
+        application.validate_logging({missing.string(), 25U, 128U, 16U}));
+    REQUIRE_FALSE(
+        application.apply_logging({missing.string(), 25U, 128U, 16U}));
 
     const auto regular_file = root / "not-a-directory";
     {
@@ -587,13 +576,13 @@ TEST_CASE(
     }
     REQUIRE(::chmod(regular_file.c_str(), S_IRUSR | S_IWUSR) == 0);
     REQUIRE_FALSE(
-        application.validate_logging(regular_file.string() + "|25|128|16"));
+        application.validate_logging({regular_file.string(), 25U, 128U, 16U}));
 
-    const auto directory = root / "logs";
+    const auto directory = root / "logs|session";
     REQUIRE(std::filesystem::create_directory(directory));
     REQUIRE(::chmod(directory.c_str(), S_IRWXU) == 0);
-    REQUIRE(application.validate_logging(directory.string() + "|25|128|16"));
-    REQUIRE(application.apply_logging(directory.string() + "|25|128|16",
+    REQUIRE(application.validate_logging({directory.string(), 25U, 128U, 16U}));
+    REQUIRE(application.apply_logging({directory.string(), 25U, 128U, 16U},
                                       app::LogApplyPolicy::NextSession));
     CHECK(application.snapshot().config.logging.directory ==
           directory.string());
@@ -609,21 +598,21 @@ TEST_CASE(
     ApplicationHarness harness;
     auto &application = harness.app();
 
-    REQUIRE(application.apply_baud("230400"));
-    REQUIRE(application.apply_data_format("7,2,even,none"));
-    REQUIRE(application.apply_newline("crlf"));
-    bool persisted = false;
-    for (int attempt = 0; attempt < 200 && !persisted; ++attempt) {
-      application.tick();
-      const auto loaded = config::load_config_toml(harness.paths.config);
-      persisted = loaded.accepted && loaded.snapshot.serial.baud == 230400 &&
-                  loaded.snapshot.serial.data_bits == 7 &&
-                  loaded.snapshot.serial.stop_bits == 2 &&
-                  loaded.snapshot.serial.parity == config::Parity::Even &&
-                  loaded.snapshot.send.newline == config::Newline::CrLf;
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
-    CHECK(persisted);
+    REQUIRE(application.apply_baud(230400));
+    REQUIRE(application.apply_data_format(
+        {7, 2, config::Parity::Even, config::FlowControl::None}));
+    REQUIRE(application.apply_newline(config::Newline::CrLf));
+    CHECK(tick_until(
+        application,
+        [&] {
+          const auto loaded = config::load_config_toml(harness.paths.config);
+          return loaded.accepted && loaded.snapshot.serial.baud == 230400 &&
+                 loaded.snapshot.serial.data_bits == 7 &&
+                 loaded.snapshot.serial.stop_bits == 2 &&
+                 loaded.snapshot.serial.parity == config::Parity::Even &&
+                 loaded.snapshot.send.newline == config::Newline::CrLf;
+        },
+        200));
     REQUIRE(harness.shutdown());
   }
   SECTION("quick-send deletion changes memory only after persistence commits") {
@@ -653,16 +642,13 @@ TEST_CASE(
     ApplicationHarness harness;
     auto &application = harness.app();
     const auto &paths = harness.paths;
-    REQUIRE(application.apply_baud("230400"));
-    bool committed = false;
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (!committed && std::chrono::steady_clock::now() < deadline) {
-      const auto loaded = config::load_config_toml(paths.config);
-      committed = loaded.accepted && loaded.snapshot.serial.baud == 230400;
-      if (!committed)
-        std::this_thread::sleep_for(1ms);
-    }
-    REQUIRE(committed);
+    REQUIRE(application.apply_baud(230400));
+    REQUIRE(wait_until(
+        [&] {
+          const auto loaded = config::load_config_toml(paths.config);
+          return loaded.accepted && loaded.snapshot.serial.baud == 230400;
+        },
+        2s));
     const std::string external = "[invalid syntax\n";
     {
       std::ofstream output{paths.config};
@@ -672,7 +658,7 @@ TEST_CASE(
       application.tick();
       std::this_thread::sleep_for(1ms);
     }
-    REQUIRE(application.apply_baud("460800"));
+    REQUIRE(application.apply_baud(460800));
     REQUIRE(harness.shutdown());
     const auto retained = config::read_safe_file(paths.config, 1024U);
     REQUIRE(retained);
@@ -695,21 +681,12 @@ TEST_CASE("pending log starts converge through reconnect and shutdown",
                  app::ConnectionState::Disconnected;
         },
         500));
-    REQUIRE(application.snapshot().connection ==
-            app::ConnectionState::Disconnected);
-
     application.connect();
-    for (int attempt = 0;
-         attempt < 500 &&
-         (application.snapshot().connection !=
-              app::ConnectionState::Connected ||
-          application.snapshot().log != app::LogState::Recording);
-         ++attempt) {
-      application.tick();
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
-    CHECK(application.snapshot().connection == app::ConnectionState::Connected);
-    CHECK(application.snapshot().log == app::LogState::Recording);
+    CHECK(tick_until(application, [&] {
+      return application.snapshot().connection ==
+                 app::ConnectionState::Connected &&
+             application.snapshot().log == app::LogState::Recording;
+    }));
     REQUIRE(harness.shutdown());
   }
   SECTION("shutdown persists records queued behind a pending log start") {
@@ -744,7 +721,6 @@ TEST_CASE("send history enforces its configured byte limit", "[application]") {
     REQUIRE(tick_until(
         application, [&] { return application.snapshot().tx_pending == 0U; },
         200));
-    REQUIRE(application.snapshot().tx_pending == 0U);
   }
   application.set_draft("sentinel");
   application.history_previous();
@@ -773,8 +749,12 @@ TEST_CASE("search direction is independent from the display filter",
             }));
       },
       200));
-  REQUIRE(application.apply_view("txt,hex,0,1,1,1"));
-  REQUIRE_FALSE(application.apply_view("txt,hex,0,0,0,0"));
+  REQUIRE(application.apply_view({config::ReceiveView::Txt,
+                                  config::ReceiveView::Hex,
+                                  {false, true, true, true}}));
+  REQUIRE_FALSE(application.apply_view({config::ReceiveView::Txt,
+                                        config::ReceiveView::Hex,
+                                        {false, false, false, false}}));
   const app::DirectionFilter rx_only{true, false, false, false};
   const app::DirectionFilter tx_only{false, true, false, false};
   const auto rx_matches = application.search("needle", rx_only);
@@ -787,12 +767,15 @@ TEST_CASE("search direction is independent from the display filter",
   REQUIRE(rx_matches.front() == rx_record->record_id);
   REQUIRE(application.search("needle", tx_only).empty());
 
-  REQUIRE(application.apply_view("hex,mixed,1,0,1,0"));
+  REQUIRE(application.apply_view({config::ReceiveView::Hex,
+                                  config::ReceiveView::Mixed,
+                                  {true, false, true, false}}));
   CHECK(application.render_record(*rx_record).find("6E 65 65 64 6C 65") !=
         std::string::npos);
   app::VisibleRecord tx_record;
   tx_record.direction = app::RecordDirection::Tx;
-  tx_record.payload = {std::byte{0x41}};
+  const std::array tx_payload{std::byte{0x41}};
+  tx_record.payload = tx_payload;
   CHECK(application.render_record(tx_record).find("A | 41") !=
         std::string::npos);
   app::VisibleRecord system_record;
@@ -820,13 +803,10 @@ TEST_CASE("shutdown completes an active log rotation before disconnecting",
   application.toggle_log();
   bool disconnect_before_shutdown = false;
   SECTION("rotation begins after the initial session start completes") {
-    for (int attempt = 0; attempt < 200 && application.snapshot().log !=
-                                               app::LogState::Recording;
-         ++attempt) {
-      application.tick();
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
-    REQUIRE(application.snapshot().log == app::LogState::Recording);
+    REQUIRE(tick_until(
+        application,
+        [&] { return application.snapshot().log == app::LogState::Recording; },
+        200));
   }
   SECTION("rotation is requested while the initial start is still pending") {
     REQUIRE(application.snapshot().log == app::LogState::Waiting);
@@ -838,13 +818,10 @@ TEST_CASE("shutdown completes an active log rotation before disconnecting",
 
   REQUIRE(std::filesystem::create_directory(new_logs));
   REQUIRE(::chmod(new_logs.c_str(), S_IRWXU) == 0);
-  REQUIRE(application.apply_logging(new_logs.string() + "|25|128|16"));
+  REQUIRE(application.apply_logging({new_logs.string(), 25U, 128U, 16U}));
   serial_backend->inject_rx("last RX\n");
-  for (int attempt = 0; attempt < 500 && serial_backend->read_bytes() == 0U;
-       ++attempt) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(serial_backend->read_bytes() == 8U);
+  REQUIRE(
+      wait_until([&] { return serial_backend->read_bytes() == 8U; }, 500ms));
   if (disconnect_before_shutdown) {
     application.disconnect();
     REQUIRE(application.snapshot().connection ==
@@ -878,8 +855,10 @@ TEST_CASE("unexpected serial loss invalidates a periodic task before reconnect",
   }));
   REQUIRE(harness.connect());
   REQUIRE(application.execute_quick(1U, 1000U));
-  REQUIRE(application.snapshot().task.state ==
-          lazycom::scheduler::SchedulerState::Running);
+  REQUIRE(tick_until(application, [&] {
+    return application.snapshot().task.state ==
+           lazycom::scheduler::SchedulerState::Running;
+  }));
 
   serial_backend->fail_next_read();
   REQUIRE(tick_until(application, [&] {
@@ -888,11 +867,6 @@ TEST_CASE("unexpected serial loss invalidates a periodic task before reconnect",
            application.snapshot().task.state ==
                lazycom::scheduler::SchedulerState::Idle;
   }));
-  REQUIRE(application.snapshot().connection ==
-          app::ConnectionState::Disconnected);
-  REQUIRE(application.snapshot().task.state ==
-          lazycom::scheduler::SchedulerState::Idle);
-
   REQUIRE(harness.connect());
   REQUIRE(application.snapshot().task.state ==
           lazycom::scheduler::SchedulerState::Idle);
@@ -915,11 +889,8 @@ TEST_CASE("disconnect drains more than 512 ordered RX events through cleanup",
 
   const std::string payload(600U, 'r');
   backend->inject_rx(payload);
-  for (int attempt = 0; attempt < 500 && backend->read_bytes() < payload.size();
-       ++attempt) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(backend->read_bytes() == payload.size());
+  REQUIRE(wait_until([&] { return backend->read_bytes() == payload.size(); },
+                     500ms));
   application.disconnect();
   REQUIRE(tick_until(application, [&] {
     return application.snapshot().connection ==
@@ -947,11 +918,7 @@ TEST_CASE("disconnect retains the written prefix of a partial TX",
   REQUIRE(harness.connect());
   application.set_draft(std::string(1024U, 'T'));
   application.submit_draft();
-  for (int attempt = 0; attempt < 200 && backend->written_bytes() != 7U;
-       ++attempt) {
-    std::this_thread::sleep_for(std::chrono::milliseconds{1});
-  }
-  REQUIRE(backend->written_bytes() == 7U);
+  REQUIRE(wait_until([&] { return backend->written_bytes() == 7U; }, 200ms));
   application.disconnect();
   REQUIRE(tick_until(application, [&] {
     return application.snapshot().connection ==
@@ -976,7 +943,7 @@ TEST_CASE("TX errors retain their code and operation identifier",
   const auto log_directory = harness.paths.config.parent_path() / "logs";
   REQUIRE(std::filesystem::create_directory(log_directory));
   REQUIRE(::chmod(log_directory.c_str(), S_IRWXU) == 0);
-  REQUIRE(application.apply_logging(log_directory.string() + "|25|128|16"));
+  REQUIRE(application.apply_logging({log_directory.string(), 25U, 128U, 16U}));
   REQUIRE(tick_until(application, [&] {
     return application.snapshot().effective_log_directory ==
            log_directory.string();
@@ -1031,6 +998,32 @@ TEST_CASE("TX errors retain their code and operation identifier",
         }) == 1);
 }
 
+TEST_CASE("record budget exhaustion stops logging and RX without a fatal error",
+          "[application][logging][budget]") {
+  auto limits = lazycom::model::BudgetLimits::defaults();
+  limits.category[static_cast<std::size_t>(
+      lazycom::model::BudgetCategory::UiRecords)] = 8U * 1024U;
+  lazycom::model::GlobalMemoryBudget budget{limits};
+  auto serial = std::make_unique<FakeBackend>();
+  auto *backend = serial.get();
+  ApplicationHarness harness{
+      std::move(serial), std::make_unique<FakeBackend>(), "logs", {}, budget};
+  auto &application = harness.app();
+  REQUIRE(harness.connect());
+  REQUIRE(harness.start_logging());
+  backend->inject_rx(std::string(8U * 1024U, 'x') + "\n");
+  REQUIRE(tick_until(application, [&] {
+    return application.snapshot().connection ==
+           app::ConnectionState::Disconnected;
+  }));
+  CHECK_FALSE(application.snapshot().fatal_stopping);
+  CHECK(application.snapshot().log == app::LogState::Error);
+  CHECK(application.snapshot().display_gap_records > 0U);
+  REQUIRE(harness.shutdown());
+  harness.application.reset();
+  CHECK(budget.total_used() == 0U);
+}
+
 TEST_CASE("fatal worker signal stops accepting operations and fails shutdown",
           "[application][shutdown]") {
   auto serial = std::make_unique<FakeBackend>();
@@ -1044,7 +1037,7 @@ TEST_CASE("fatal worker signal stops accepting operations and fails shutdown",
       500));
   REQUIRE(application.snapshot().fatal_stopping);
   REQUIRE(application.snapshot().shutting_down);
-  CHECK_FALSE(application.apply_newline("lf"));
+  CHECK_FALSE(application.apply_newline(config::Newline::Lf));
   const auto connection_before_rejected_operation =
       application.snapshot().connection;
   application.disconnect();
@@ -1089,11 +1082,7 @@ TEST_CASE("normal shutdown aborts instead of joining a timed-out scanner",
     if (!created) {
       ::_exit(13);
     }
-    for (int attempt = 0;
-         attempt < 1000 && !scanner_backend->enumerate_entered(); ++attempt) {
-      std::this_thread::sleep_for(std::chrono::milliseconds{1});
-    }
-    if (!scanner_backend->enumerate_entered()) {
+    if (!wait_until([&] { return scanner_backend->enumerate_entered(); })) {
       ::_exit(14);
     }
     static_cast<void>((*created)->shutdown());
@@ -1172,10 +1161,10 @@ TEST_CASE("repeated logging updates preserve a pending rotation and its tail",
     REQUIRE(std::filesystem::create_directory(directory));
     REQUIRE(::chmod(directory.c_str(), S_IRWXU) == 0);
   }
-  REQUIRE(application.apply_logging(old_logs.string() + "|25|128|16"));
+  REQUIRE(application.apply_logging({old_logs.string(), 25U, 128U, 16U}));
   REQUIRE(harness.connect());
   REQUIRE(harness.start_logging());
-  REQUIRE(application.apply_logging(next_logs.string() + "|25|128|16"));
+  REQUIRE(application.apply_logging({next_logs.string(), 25U, 128U, 16U}));
 
   enum class CloseKind { Disconnect, DeviceFault, Shutdown };
   auto close_kind = CloseKind::Disconnect;
@@ -1197,14 +1186,11 @@ TEST_CASE("repeated logging updates preserve a pending rotation and its tail",
   SECTION("another immediate rotation followed by shutdown") {
     close_kind = CloseKind::Shutdown;
   }
-  REQUIRE(application.apply_logging(final_logs.string() + "|25|128|16",
+  REQUIRE(application.apply_logging({final_logs.string(), 25U, 128U, 16U},
                                     second_policy));
   serial_backend->inject_rx("after twice\n");
-  for (int attempt = 0; attempt < 500 && serial_backend->read_bytes() != 12U;
-       ++attempt) {
-    std::this_thread::sleep_for(1ms);
-  }
-  REQUIRE(serial_backend->read_bytes() == 12U);
+  REQUIRE(
+      wait_until([&] { return serial_backend->read_bytes() == 12U; }, 500ms));
   if (close_kind == CloseKind::Shutdown) {
     REQUIRE(harness.shutdown());
   } else {
@@ -1216,7 +1202,6 @@ TEST_CASE("repeated logging updates preserve a pending rotation and its tail",
     REQUIRE(tick_until(application, [&] {
       return application.snapshot().connection == ConnectionState::Disconnected;
     }));
-    CHECK(application.snapshot().connection == ConnectionState::Disconnected);
     CHECK(application.snapshot().log == LogState::Waiting);
     REQUIRE(harness.shutdown());
   }

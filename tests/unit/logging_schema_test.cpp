@@ -1,3 +1,4 @@
+#include <lazycom/base/text.hpp>
 #include <lazycom/logging/schema.hpp>
 
 #include <support/logging_builders.hpp>
@@ -16,6 +17,8 @@
 namespace {
 
 using namespace lazycom::logging;
+using lazycom::is_strict_utf8;
+using lazycom::is_valid_utc;
 using lazycom::test::bytes;
 
 using lazycom::test::log_header;

@@ -2,7 +2,6 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
-#include <lazycom/config/persistence.hpp>
 #include <lazycom/logging/session_writer.hpp>
 #include <set>
 #include <string>
@@ -12,7 +11,6 @@
 
 namespace {
 namespace logging = lazycom::logging;
-namespace config = lazycom::config;
 using lazycom::test::TemporaryDirectory;
 using lazycom::test::UmaskGuard;
 [[nodiscard]] std::string read_all(const std::filesystem::path &path) {
@@ -67,7 +65,8 @@ TEST_CASE(
     const auto record = lazycom::test::log_record(
         1U, logging::Direction::Rx,
         {std::byte{0x00}, std::byte{0xFF}, std::byte{0x7E}});
-    REQUIRE(writer.try_enqueue({record}) == logging::EnqueueResult::Accepted);
+    REQUIRE(writer.try_enqueue(lazycom::test::session_record(record)) ==
+            logging::EnqueueResult::Accepted);
     REQUIRE(writer.barrier(1U).get().state == logging::BarrierState::Confirmed);
     REQUIRE(writer.end_session().get().state ==
             logging::SessionLogState::Waiting);
@@ -144,8 +143,10 @@ TEST_CASE(
     auto second = first, third = first;
     second.seq = 2U;
     third.seq = 3U;
-    REQUIRE(writer.try_enqueue({first, second, third}) ==
-            logging::EnqueueResult::Accepted);
+    for (auto record : {first, second, third}) {
+      REQUIRE(writer.try_enqueue(lazycom::test::session_record(
+                  std::move(record))) == logging::EnqueueResult::Accepted);
+    }
     REQUIRE(writer.barrier(3U).get().state == logging::BarrierState::Confirmed);
     REQUIRE(writer.end_session().get().state ==
             logging::SessionLogState::Waiting);
@@ -188,27 +189,9 @@ TEST_CASE("quota cache rescans after an external directory change",
   const auto damaged = log_directory / "lazycom-session-external.ndjson";
   write_controlled_file(damaged, std::string(4096U, 'x'));
 
-  REQUIRE(writer.try_enqueue({record}) == logging::EnqueueResult::Accepted);
+  REQUIRE(writer.try_enqueue(lazycom::test::session_record(record)) ==
+          logging::EnqueueResult::Accepted);
   REQUIRE(writer.barrier(1U).get().state ==
           logging::BarrierState::WriterFailed);
   REQUIRE(std::filesystem::file_size(damaged) == 4096U);
-}
-
-TEST_CASE("persistence worker writes a private TOML through the real backend",
-          "[integration][config][file]") {
-  TemporaryDirectory temporary;
-  const config::PersistencePaths paths{temporary.path() / "config.toml",
-                                       temporary.path() / "quick_send.toml",
-                                       temporary.path() / "state.toml"};
-  config::PersistenceWorker worker{paths};
-  config::StateSnapshot state;
-  state.last_quick_send_slot = 7U;
-
-  auto submitted = worker.save_state(state, {});
-  REQUIRE(submitted.accepted());
-  const auto completion = submitted.completion.get();
-  REQUIRE(completion.outcome.state == config::CommitState::Committed);
-  const auto loaded = config::load_state_toml(paths.state);
-  REQUIRE(loaded.accepted);
-  REQUIRE(loaded.snapshot == state);
 }

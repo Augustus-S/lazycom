@@ -1,8 +1,9 @@
 #pragma once
 
-#include <lazycom/app/signals.hpp>
 #include <lazycom/base/error.hpp>
+#include <lazycom/base/worker_signals.hpp>
 #include <lazycom/logging/schema.hpp>
+#include <lazycom/model/session_record.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -77,11 +78,14 @@ public:
 [[nodiscard]] std::unique_ptr<SessionLogFileSystem>
 make_linux_session_log_file_system();
 
+/** @brief Checks an explicitly selected directory before applying settings. */
+[[nodiscard]] Status validate_session_log_directory(std::string_view directory);
+
 enum class EnqueueResult {
   Accepted,
   NotRecording,
-  EmptyBatch,
-  InvalidBatch,
+  EmptyRecord,
+  InvalidRecord,
   QueueFull,
   Stopping,
 };
@@ -113,9 +117,11 @@ public:
    * @param file_system Exclusively owned implementation used for the complete
    * worker lifetime.
    */
-  explicit SessionWriter(SessionWriterOptions options,
-                         std::unique_ptr<SessionLogFileSystem> file_system =
-                             make_linux_session_log_file_system());
+  explicit SessionWriter(
+      SessionWriterOptions options,
+      std::unique_ptr<SessionLogFileSystem> file_system =
+          make_linux_session_log_file_system(),
+      model::GlobalMemoryBudget budget = model::GlobalMemoryBudget{});
   ~SessionWriter();
 
   SessionWriter(const SessionWriter &) = delete;
@@ -154,13 +160,18 @@ public:
   [[nodiscard]] std::future<SessionCommandResult> end_session();
 
   /**
-   * @brief Attempts to enqueue an owned, strictly increasing record batch.
+   * @brief Attempts to retain an immutable record with a strictly increasing
+   * sequence.
    * @return Immediate admission status without waiting for filesystem I/O or
    * queue capacity. QueueFull transitions the writer to Error and prevents
    * later records from being written.
    * @note Full schema validation occurs on the worker after admission.
    */
-  [[nodiscard]] EnqueueResult try_enqueue(std::vector<Record> batch) noexcept;
+  [[nodiscard]] EnqueueResult
+  try_enqueue(model::SessionRecordPtr record) noexcept;
+
+  /** @brief Stops logging when upstream record admission loses data. */
+  void fail_overload() noexcept;
 
   /**
    * @brief Requests a user-space flush through an inclusive sequence watermark.
@@ -182,7 +193,7 @@ public:
    * @note Fatal cleanup retains the filesystem until destruction because its
    * virtual close contract does not guarantee allocation-free cleanup.
    */
-  [[nodiscard]] std::optional<app::FatalSignal> fatal_signal() const noexcept;
+  [[nodiscard]] std::optional<FatalSignal> fatal_signal() const noexcept;
   /**
    * @brief Permanently stops admission and drains the worker to its return
    * point.

@@ -1,7 +1,7 @@
 #pragma once
 
-#include <lazycom/app/signals.hpp>
-#include <lazycom/app/state.hpp>
+#include <lazycom/base/worker_signals.hpp>
+#include <lazycom/model/session_types.hpp>
 #include <lazycom/serial/backend.hpp>
 
 #include <chrono>
@@ -15,7 +15,7 @@ namespace lazycom::serial {
 struct ScanCompletion {
   OperationId operation_id{};
   ScanGeneration generation{};
-  app::OperationOutcome outcome{app::OperationOutcome::Succeeded};
+  OperationOutcome outcome{OperationOutcome::Succeeded};
   std::vector<DeviceInfo> devices;
   std::optional<Error> error;
 };
@@ -75,8 +75,8 @@ public:
    */
   [[nodiscard]] bool wait_until_stopped(
       std::chrono::steady_clock::time_point deadline) const noexcept;
-  [[nodiscard]] std::optional<app::FatalSignal> fatal_signal() const noexcept;
-  [[nodiscard]] std::optional<app::WorkerStoppedSignal>
+  [[nodiscard]] std::optional<FatalSignal> fatal_signal() const noexcept;
+  [[nodiscard]] std::optional<WorkerStoppedSignal>
   worker_stopped_signal() const noexcept;
 
 private:

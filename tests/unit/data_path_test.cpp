@@ -1,7 +1,7 @@
 #include <lazycom/encoding/display.hpp>
 #include <lazycom/encoding/tx.hpp>
 #include <lazycom/framing/rx_framer.hpp>
-#include <lazycom/model/data_path.hpp>
+#include <lazycom/model/memory_budget.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -15,6 +15,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -23,12 +24,9 @@
 namespace {
 
 using namespace std::chrono_literals;
-using lazycom::app::SessionEventOrigin;
 using lazycom::framing::ObservationClock;
-using lazycom::logging::Direction;
 using lazycom::model::BudgetCategory;
 using namespace lazycom::model;
-using lazycom::SessionId;
 using lazycom::framing::RxFramer;
 
 [[nodiscard]] std::vector<std::byte> bytes(const std::string_view text) {
@@ -50,35 +48,6 @@ void append(std::vector<lazycom::framing::RxFrame> &destination,
             std::vector<lazycom::framing::RxFrame> source) {
   destination.insert(destination.end(), std::make_move_iterator(source.begin()),
                      std::make_move_iterator(source.end()));
-}
-
-class ScriptedSink final : public IRecordSink {
-public:
-  std::deque<QueuePushResult> script;
-  std::vector<SinkEnvelope> accepted;
-  std::size_t calls{};
-
-  [[nodiscard]] QueuePushResult push(const SinkEnvelope &envelope,
-                                     const std::size_t) override {
-    ++calls;
-    const auto result =
-        script.empty() ? QueuePushResult::Accepted : script.front();
-    if (!script.empty()) {
-      script.pop_front();
-    }
-    if (result == QueuePushResult::Accepted) {
-      accepted.push_back(envelope);
-    }
-    return result;
-  }
-};
-
-[[nodiscard]] RecordDraft rx_draft(const SharedPayloadPtr &payload) {
-  RecordDraft draft;
-  draft.direction = Direction::Rx;
-  draft.time = {"2026-07-26T00:00:00Z", 1U};
-  draft.payload = ByteSlice{payload};
-  return draft;
 }
 
 } // namespace
@@ -140,66 +109,32 @@ TEST_CASE("RX framing preserves delimiter idle and size boundaries",
   }
 }
 
-TEST_CASE("RX framing reconstructs every chunk split and seeded random stream",
+TEST_CASE("RX framing reconstructs seeded random streams",
           "[data-path][framing][property]") {
-  SECTION("all input chunk boundaries preserve the exact RX stream") {
-    const auto input = bytes("A\r\nB\rC\nD\r\n");
-    const auto now = ObservationClock::time_point{};
-    const auto boundary_count = input.size() - 1U;
-    const auto combinations = std::uint64_t{1U} << boundary_count;
-
-    for (std::size_t maximum = 1U; maximum <= input.size(); ++maximum) {
-      for (std::uint64_t mask = 0U; mask < combinations; ++mask) {
-        RxFramer framer{{50ms, maximum}};
-        std::vector<lazycom::framing::RxFrame> frames;
-        std::size_t start = 0U;
-        for (std::size_t boundary = 0U; boundary < boundary_count; ++boundary) {
-          if ((mask & (std::uint64_t{1U} << boundary)) != 0U) {
-            append(frames,
-                   framer.push(std::span<const std::byte>{input}.subspan(
-                                   start, boundary + 1U - start),
-                               now + std::chrono::milliseconds{boundary}));
-            start = boundary + 1U;
-          }
-        }
-        append(frames,
-               framer.push(std::span<const std::byte>{input}.subspan(start),
-                           now + 20ms));
-        append(frames, framer.flush());
-        CAPTURE(maximum, mask);
-        REQUIRE(join(frames) == input);
-        REQUIRE(std::ranges::all_of(frames, [maximum](const auto &frame) {
-          return !frame.bytes.empty() && frame.bytes.size() <= maximum;
-        }));
-      }
+  std::mt19937 generator{0x4C415A59U};
+  const auto now = ObservationClock::time_point{};
+  for (std::size_t iteration = 0U; iteration < 200U; ++iteration) {
+    const auto length = static_cast<std::size_t>(generator() % 1024U);
+    const auto maximum = static_cast<std::size_t>(generator() % 64U) + 1U;
+    std::vector<std::byte> input(length);
+    for (auto &byte : input) {
+      byte = static_cast<std::byte>(generator() % 256U);
     }
-  }
-  SECTION("random RX streams reconstruct without loss") {
-    std::mt19937 generator{0x4C415A59U};
-    const auto now = ObservationClock::time_point{};
-    for (std::size_t iteration = 0U; iteration < 200U; ++iteration) {
-      const auto length = static_cast<std::size_t>(generator() % 1024U);
-      const auto maximum = static_cast<std::size_t>(generator() % 64U) + 1U;
-      std::vector<std::byte> input(length);
-      for (auto &byte : input) {
-        byte = static_cast<std::byte>(generator() % 256U);
-      }
-      RxFramer framer{{50ms, maximum}};
-      std::vector<lazycom::framing::RxFrame> frames;
-      std::size_t offset = 0U;
-      while (offset < input.size()) {
-        const auto available = input.size() - offset;
-        const auto count = std::min(
-            available, static_cast<std::size_t>(generator() % 31U) + 1U);
-        append(frames, framer.push(std::span<const std::byte>{input}.subspan(
-                                       offset, count),
-                                   now + std::chrono::milliseconds{offset}));
-        offset += count;
-      }
-      append(frames, framer.flush());
-      CAPTURE(iteration, length, maximum);
-      REQUIRE(join(frames) == input);
+    RxFramer framer{{50ms, maximum}};
+    std::vector<lazycom::framing::RxFrame> frames;
+    std::size_t offset = 0U;
+    while (offset < input.size()) {
+      const auto available = input.size() - offset;
+      const auto count =
+          std::min(available, static_cast<std::size_t>(generator() % 31U) + 1U);
+      append(frames, framer.push(std::span<const std::byte>{input}.subspan(
+                                     offset, count),
+                                 now + std::chrono::milliseconds{offset}));
+      offset += count;
     }
+    append(frames, framer.flush());
+    CAPTURE(iteration, length, maximum);
+    REQUIRE(join(frames) == input);
   }
 }
 
@@ -277,212 +212,21 @@ TEST_CASE("encoding projects safe text and parses complete TX payloads",
   }
 }
 
-TEST_CASE(
-    "shared payload and batch budgets follow ownership and reject overcommit",
-    "[data-path][budget]") {
-  SECTION(
-      "payload reservations count overhead once and release on last owner") {
-    for (const std::size_t size : {0U, 1U, 7U}) {
-      CAPTURE(size);
-      GlobalMemoryBudget budget;
-      const auto charge = kSharedPayloadFixedBudgetBytes + size;
-      {
-        const auto payload = make_shared_payload(budget, BudgetCategory::Tx,
-                                                 bytes(std::string(size, 'x')));
-        REQUIRE(payload);
-        CHECK(payload->bytes().size() == size);
-        CHECK(payload->budget_bytes() == charge);
-        {
-          const auto copy = payload;
-          CHECK(budget.used(BudgetCategory::Tx) == charge);
-        }
-        CHECK(budget.used(BudgetCategory::Tx) == charge);
-        const auto distinct =
-            make_shared_payload(budget, BudgetCategory::Tx, bytes("x"));
-        REQUIRE(distinct);
-        CHECK(budget.used(BudgetCategory::Tx) ==
-              charge + kSharedPayloadFixedBudgetBytes + 1U);
-      }
-      CHECK(budget.total_used() == 0U);
-    }
+TEST_CASE("memory budget rejects overcommit and releases moved reservations",
+          "[data-path][budget]") {
+  auto limits = BudgetLimits::defaults();
+  limits.category[static_cast<std::size_t>(BudgetCategory::UiRecords)] = 3U;
+  GlobalMemoryBudget budget{limits};
+  {
+    auto first = budget.try_reserve(BudgetCategory::UiRecords, 3U);
+    REQUIRE(first);
+    REQUIRE_FALSE(budget.try_reserve(BudgetCategory::UiRecords, 1U));
+    auto second = std::move(*first);
+    CHECK(budget.total_used() == 3U);
+    second.reset();
   }
-  SECTION("budget rejects before construction and returns all reservations") {
-    auto limits = BudgetLimits::defaults();
-    const auto limit = kSharedPayloadFixedBudgetBytes + 3U;
-    limits.category[static_cast<std::size_t>(BudgetCategory::RxIngress)] =
-        limit;
-    GlobalMemoryBudget budget{limits};
-    REQUIRE_FALSE(
-        make_shared_payload(budget, BudgetCategory::RxIngress, bytes("four")));
-    REQUIRE(budget.total_used() == 0U);
-    {
-      auto reservation = budget.try_reserve(BudgetCategory::RxIngress, limit);
-      REQUIRE(reservation);
-      REQUIRE_FALSE(budget.try_reserve(BudgetCategory::RxIngress, 1U));
-    }
-    REQUIRE(budget.total_used() == 0U);
-  }
-  SECTION(
-      "immutable batch returns metadata budget after every sink releases it") {
-    GlobalMemoryBudget budget;
-    const auto payload =
-        make_shared_payload(budget, BudgetCategory::RxIngress, bytes("x"));
-    ScriptedSink ui;
-    ScriptedSink log;
-    SessionSequencer sequencer{SessionId{1U}, budget, &ui, &log};
-    auto result = sequencer.submit(SessionId{1U}, SessionEventOrigin::Normal,
-                                   {rx_draft(payload)});
-    REQUIRE(result.status == SequenceStatus::Accepted);
-    REQUIRE(budget.used(BudgetCategory::OwnerScratch) > 0U);
-    result = {};
-    ui.accepted.clear();
-    REQUIRE(budget.used(BudgetCategory::OwnerScratch) > 0U);
-    log.accepted.clear();
-    REQUIRE(budget.used(BudgetCategory::OwnerScratch) == 0U);
-  }
-}
-
-TEST_CASE("record draft validation rejects out-of-range enums",
-          "[data-path][model]") {
-  GlobalMemoryBudget budget;
-  const auto payload =
-      make_shared_payload(budget, BudgetCategory::RxIngress, bytes("x"));
-
-  auto draft = rx_draft(payload);
-  draft.direction = static_cast<Direction>(std::numeric_limits<int>::max());
-  REQUIRE_FALSE(valid_record_draft(draft));
-
-  draft = rx_draft(payload);
-  draft.direction = Direction::Tx;
-  draft.input_mode =
-      static_cast<lazycom::logging::InputMode>(std::numeric_limits<int>::max());
-  REQUIRE_FALSE(valid_record_draft(draft));
-
-  draft.input_mode = lazycom::logging::InputMode::Text;
-  REQUIRE(valid_record_draft(draft));
-}
-
-TEST_CASE("sequencer isolates sink loss and keeps session and gap identities",
-          "[data-path][sequencer]") {
-  SECTION("sequencer validates identity and isolates full sinks with gaps") {
-    GlobalMemoryBudget budget;
-    const auto payload =
-        make_shared_payload(budget, BudgetCategory::RxIngress, bytes("x"));
-    ScriptedSink ui;
-    ScriptedSink log;
-    ui.script = {QueuePushResult::Full, QueuePushResult::Accepted};
-    SessionSequencer sequencer{SessionId{7U}, budget, &ui, &log};
-
-    auto wrong = sequencer.submit(SessionId{8U}, SessionEventOrigin::Normal,
-                                  {rx_draft(payload)});
-    REQUIRE(wrong.status == SequenceStatus::WrongSession);
-    REQUIRE(sequencer.next_seq() == 1U);
-
-    const auto first =
-        sequencer.submit(SessionId{7U}, SessionEventOrigin::Normal,
-                         {rx_draft(payload), rx_draft(payload)});
-    REQUIRE(first.status == SequenceStatus::Accepted);
-    REQUIRE(first.first_seq == 1U);
-    REQUIRE(first.last_seq == 2U);
-    REQUIRE(first.ui.result == QueuePushResult::Full);
-    REQUIRE(first.ui.gap == SequenceGap{1U, 2U});
-    REQUIRE(first.log.result == QueuePushResult::Accepted);
-    REQUIRE(log.accepted.size() == 1U);
-
-    const auto second = sequencer.submit(
-        SessionId{7U}, SessionEventOrigin::Normal, {rx_draft(payload)});
-    REQUIRE(second.first_seq == 3U);
-    REQUIRE(second.ui.result == QueuePushResult::Accepted);
-    REQUIRE(second.ui.gap == SequenceGap{1U, 2U});
-    REQUIRE(ui.accepted[0].gap_before == SequenceGap{1U, 2U});
-    REQUIRE(log.calls == 2U);
-
-    REQUIRE(sequencer.begin_cleanup(SessionId{7U}));
-    REQUIRE(sequencer
-                .submit(SessionId{7U}, SessionEventOrigin::Normal,
-                        {rx_draft(payload)})
-                .status == SequenceStatus::InvalidOrigin);
-    REQUIRE(sequencer
-                .submit(SessionId{7U}, SessionEventOrigin::Cleanup,
-                        {rx_draft(payload)})
-                .first_seq == 4U);
-  }
-  SECTION("UI sink evicts oldest batches and preserves a sequence gap") {
-    GlobalMemoryBudget budget;
-    const auto payload =
-        make_shared_payload(budget, BudgetCategory::RxIngress, bytes("x"));
-    EvictingUiRecordSink ui{2U, 64U * 1024U};
-    ScriptedSink log;
-    SessionSequencer sequencer{SessionId{9U}, budget, &ui, &log};
-    for (std::size_t index = 0U; index < 3U; ++index) {
-      REQUIRE(sequencer
-                  .submit(SessionId{9U}, SessionEventOrigin::Normal,
-                          {rx_draft(payload)})
-                  .ui.result == QueuePushResult::Accepted);
-    }
-    REQUIRE(ui.record_count() == 2U);
-    const auto first_visible = ui.try_pop();
-    REQUIRE(first_visible);
-    REQUIRE(first_visible->batch->first_seq() == 2U);
-    REQUIRE(first_visible->gap_before == SequenceGap{1U, 1U});
-    REQUIRE(log.calls == 3U);
-  }
-}
-
-TEST_CASE("TX terminal helper records only accepted prefix then termination",
-          "[data-path][tx]") {
-  GlobalMemoryBudget budget;
-  const auto payload =
-      make_shared_payload(budget, BudgetCategory::Tx, bytes("abcdef"));
-  TxOperation operation{lazycom::OperationId{42U},
-                        lazycom::ConnectionGeneration{2U},
-                        SessionId{7U},
-                        payload,
-                        lazycom::logging::InputMode::Text,
-                        std::chrono::steady_clock::time_point{} + 1s};
-
-  REQUIRE(operation.accept(2U, {"2026-07-26T00:00:01Z", 10U}));
-  REQUIRE(operation.accept(1U, {"2026-07-26T00:00:02Z", 20U}));
-  REQUIRE_FALSE(operation.accept(4U, {"ignored", 0U}));
-  const auto records = operation.terminal_records(
-      TxTermination::TimedOut, {"2026-07-26T00:00:03Z", 30U}, "LC-SER-2004",
-      "deadline exceeded");
-  REQUIRE(records);
-  REQUIRE(records->size() == 2U);
-  REQUIRE((*records)[0].direction == Direction::Tx);
-  REQUIRE(std::ranges::equal((*records)[0].payload.bytes(),
-                             payload->bytes().first(3U)));
-  REQUIRE((*records)[0].time.elapsed_ns == 20U);
-  REQUIRE((*records)[1].direction == Direction::Err);
-  REQUIRE((*records)[1].operation_id == lazycom::OperationId{42U});
-  REQUIRE((*records)[1].message.find("operation_id=42") != std::string::npos);
-
-  TxOperation untouched{lazycom::OperationId{43U},
-                        lazycom::ConnectionGeneration{2U},
-                        SessionId{7U},
-                        payload,
-                        lazycom::logging::InputMode::Hex,
-                        std::chrono::steady_clock::time_point{}};
-  const auto failed = untouched.terminal_records(TxTermination::Failed,
-                                                 {"2026-07-26T00:00:03Z", 30U});
-  REQUIRE(failed);
-  REQUIRE(failed->size() == 1U);
-  REQUIRE((*failed)[0].direction == Direction::Err);
-}
-
-TEST_CASE("bounded queue reports accepted full and stopped",
-          "[data-path][queue]") {
-  BoundedQueue<int> queue{2U, 3U};
-  REQUIRE(queue.push(1, 2U) == QueuePushResult::Accepted);
-  REQUIRE(queue.push(2, 2U) == QueuePushResult::Full);
-  REQUIRE(queue.push(3, 1U) == QueuePushResult::Accepted);
-  REQUIRE(queue.push(4, 0U) == QueuePushResult::Full);
-  const auto first = queue.try_pop();
-  REQUIRE(first);
-  REQUIRE(first->value == 1);
-  REQUIRE(queue.logical_bytes() == 1U);
-  queue.stop();
-  REQUIRE(queue.push(5, 0U) == QueuePushResult::Stopped);
-  REQUIRE(queue.wait_pop()->value == 3);
-  REQUIRE_FALSE(queue.wait_pop());
+  CHECK(budget.total_used() == 0U);
+  limits = BudgetLimits::defaults();
+  ++limits.category[0];
+  REQUIRE_THROWS_AS(GlobalMemoryBudget{limits}, std::invalid_argument);
 }

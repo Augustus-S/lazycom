@@ -1,11 +1,13 @@
 #include <lazycom/app/application.hpp>
 
+#include "messages.hpp"
+#include <lazycom/base/text.hpp>
+
 #include <lazycom/diagnostics/diagnostics.hpp>
 #include <lazycom/logging/schema.hpp>
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -16,19 +18,12 @@
 #include <thread>
 #include <utility>
 
-#include <fcntl.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 namespace lazycom::app {
 namespace {
 
 using namespace std::chrono_literals;
-
-[[noreturn]] void abort_after_shutdown_timeout() noexcept {
-  diagnostics::emergency_write();
-  std::abort();
-}
 
 [[nodiscard]] Error
 application_error(std::string_view detail,
@@ -56,117 +51,6 @@ absolute_environment_path(const char *name,
     throw std::runtime_error("HOME must name an absolute directory");
   }
   return std::filesystem::path{home};
-}
-
-[[nodiscard]] std::string
-format_utc(std::chrono::system_clock::time_point now) {
-  const auto seconds = std::chrono::floor<std::chrono::seconds>(now);
-  const auto milliseconds =
-      std::chrono::duration_cast<std::chrono::milliseconds>(now - seconds);
-  const std::time_t raw = std::chrono::system_clock::to_time_t(seconds);
-  std::tm value{};
-  if (::gmtime_r(&raw, &value) == nullptr) {
-    return "1970-01-01T00:00:00.000Z";
-  }
-  std::array<char, 32> output{};
-  const auto length =
-      std::strftime(output.data(), output.size(), "%Y-%m-%dT%H:%M:%S", &value);
-  if (length == 0U) {
-    return "1970-01-01T00:00:00.000Z";
-  }
-  return std::string{output.data(), length} + "." +
-         (milliseconds.count() < 100 ? "0" : "") +
-         (milliseconds.count() < 10 ? "0" : "") +
-         std::to_string(milliseconds.count()) + "Z";
-}
-
-[[nodiscard]] std::vector<std::string_view> split(std::string_view value,
-                                                  char delimiter) {
-  std::vector<std::string_view> fields;
-  while (true) {
-    const auto position = value.find(delimiter);
-    fields.push_back(value.substr(0U, position));
-    if (position == std::string_view::npos) {
-      return fields;
-    }
-    value.remove_prefix(position + 1U);
-  }
-}
-
-template <class Integer>
-[[nodiscard]] std::optional<Integer> parse_integer(std::string_view value) {
-  Integer result{};
-  const auto parsed =
-      std::from_chars(value.data(), value.data() + value.size(), result);
-  if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()) {
-    return std::nullopt;
-  }
-  return result;
-}
-
-[[nodiscard]] std::optional<config::Parity>
-parse_parity(std::string_view value) {
-  if (value == "none") {
-    return config::Parity::None;
-  }
-  if (value == "odd") {
-    return config::Parity::Odd;
-  }
-  if (value == "even") {
-    return config::Parity::Even;
-  }
-  if (value == "mark") {
-    return config::Parity::Mark;
-  }
-  if (value == "space") {
-    return config::Parity::Space;
-  }
-  return std::nullopt;
-}
-
-[[nodiscard]] std::optional<config::FlowControl>
-parse_flow(std::string_view value) {
-  if (value == "none") {
-    return config::FlowControl::None;
-  }
-  if (value == "rtscts") {
-    return config::FlowControl::RtsCts;
-  }
-  if (value == "xonxoff") {
-    return config::FlowControl::XonXoff;
-  }
-  return std::nullopt;
-}
-
-[[nodiscard]] std::optional<config::Newline>
-parse_newline(std::string_view value) {
-  if (value == "none") {
-    return config::Newline::None;
-  }
-  if (value == "lf") {
-    return config::Newline::Lf;
-  }
-  if (value == "cr") {
-    return config::Newline::Cr;
-  }
-  if (value == "crlf") {
-    return config::Newline::CrLf;
-  }
-  return std::nullopt;
-}
-
-[[nodiscard]] std::optional<config::ReceiveView>
-parse_receive_view(std::string_view value) {
-  if (value == "txt") {
-    return config::ReceiveView::Txt;
-  }
-  if (value == "hex") {
-    return config::ReceiveView::Hex;
-  }
-  if (value == "mixed") {
-    return config::ReceiveView::Mixed;
-  }
-  return std::nullopt;
 }
 
 [[nodiscard]] logging::Parity to_log_parity(config::Parity value) noexcept {
@@ -198,122 +82,18 @@ to_log_flow(config::FlowControl value) noexcept {
   return logging::FlowControl::None;
 }
 
-[[nodiscard]] std::string error_text(const Error &error) {
-  const auto &descriptor = error_descriptor(error.code);
-  std::string result{descriptor.identifier};
-  result += ": ";
-  result += descriptor.default_message;
-  if (!error.detail.empty()) {
-    result += " (";
-    result += logging::sanitize_message(error.detail);
-    result += ")";
-  }
-  return result;
-}
-
-[[nodiscard]] logging::Direction log_direction(RecordDirection direction) {
-  switch (direction) {
-  case RecordDirection::Rx:
-    return logging::Direction::Rx;
-  case RecordDirection::Tx:
-    return logging::Direction::Tx;
-  case RecordDirection::System:
-    return logging::Direction::Sys;
-  case RecordDirection::Error:
-    return logging::Direction::Err;
-  }
-  return logging::Direction::Err;
-}
-
-[[nodiscard]] logging::SessionWriterOptions
-writer_options(const config::ConfigSnapshot &snapshot,
-               const std::filesystem::path &default_directory) {
-  const auto &settings = snapshot.logging;
-  logging::SessionWriterOptions options;
-  options.directory = settings.directory.empty()
-                          ? default_directory
-                          : std::filesystem::path{settings.directory};
-  options.quotas = {
-      settings.max_files,
-      static_cast<std::uint64_t>(settings.max_total_size_mib) * 1024U * 1024U,
-      static_cast<std::uint64_t>(settings.max_file_size_mib) * 1024U * 1024U};
-  options.queue_max_records = snapshot.queues.log_max_messages;
-  options.queue_max_bytes =
-      static_cast<std::size_t>(snapshot.queues.log_max_mib) * 1024U * 1024U;
-  options.flush_interval =
-      std::chrono::milliseconds{settings.flush_interval_ms};
-  options.include_system = settings.include_system;
-  options.include_error = settings.include_error;
-  return options;
-}
-
-[[nodiscard]] std::size_t
-log_record_bytes(const logging::Record &record) noexcept {
-  std::size_t result = sizeof(logging::Record) + record.time_utc.capacity() +
-                       record.payload.capacity() + record.message.capacity();
-  if (record.code) {
-    result += record.code->capacity();
-  }
-  return result;
-}
-
-[[nodiscard]] bool direction_visible(const RecordDirection direction,
-                                     const DirectionFilter &filter) noexcept {
-  switch (direction) {
-  case RecordDirection::Rx:
-    return filter.rx;
-  case RecordDirection::Tx:
-    return filter.tx;
-  case RecordDirection::System:
-    return filter.system;
-  case RecordDirection::Error:
-    return filter.error;
-  }
-  return false;
-}
-
 [[nodiscard]] Result<config::ConfigSnapshot>
 logging_candidate(const config::ConfigSnapshot &current,
-                  const std::string_view value) {
-  const auto fields = split(value, '|');
-  if (fields.size() != 4U) {
-    return tl::unexpected(application_error(
-        "logging format is directory|max_files|max_total_mib|max_file_mib"));
-  }
+                  const LogSettingsCandidate &value) {
   auto candidate = current;
-  candidate.logging.directory = std::string{fields[0]};
-  const auto files = parse_integer<std::uint32_t>(fields[1]);
-  const auto total = parse_integer<std::uint32_t>(fields[2]);
-  const auto file = parse_integer<std::uint32_t>(fields[3]);
-  if (!files || !total || !file ||
-      (!fields[0].empty() && fields[0].front() != '/')) {
-    return tl::unexpected(application_error("invalid logging configuration"));
+  candidate.logging.directory = value.directory;
+  if (auto checked = logging::validate_session_log_directory(value.directory);
+      !checked) {
+    return tl::unexpected(std::move(checked.error()));
   }
-  if (!fields[0].empty()) {
-    const std::string path{fields[0]};
-    struct stat status{};
-    if (::lstat(path.c_str(), &status) != 0) {
-      return tl::unexpected(application_error("log directory does not exist"));
-    }
-    if (S_ISLNK(status.st_mode)) {
-      return tl::unexpected(
-          application_error("log directory must not be a symbolic link"));
-    }
-    if (!S_ISDIR(status.st_mode)) {
-      return tl::unexpected(application_error("log path is not a directory"));
-    }
-    if (status.st_uid != ::geteuid()) {
-      return tl::unexpected(
-          application_error("log directory must be owned by the current user"));
-    }
-    if (::faccessat(AT_FDCWD, path.c_str(), W_OK | X_OK, AT_EACCESS) != 0) {
-      return tl::unexpected(
-          application_error("log directory is not writable and searchable"));
-    }
-  }
-  candidate.logging.max_files = *files;
-  candidate.logging.max_total_size_mib = *total;
-  candidate.logging.max_file_size_mib = *file;
+  candidate.logging.max_files = value.max_files;
+  candidate.logging.max_total_size_mib = value.max_total_size_mib;
+  candidate.logging.max_file_size_mib = value.max_file_size_mib;
   if (const auto errors = config::validate_config_snapshot(candidate);
       !errors.empty()) {
     return tl::unexpected(application_error(errors.front().message));
@@ -410,11 +190,12 @@ Application::create(ApplicationDependencies dependencies) {
     return tl::unexpected(std::move(scanner.error()));
   }
   try {
-    auto writer = std::make_unique<logging::SessionWriter>(
-        writer_options(loaded->config.snapshot, loaded->default_log_directory));
+    auto logs = std::make_unique<SessionLogCoordinator>(
+        loaded->config.snapshot, loaded->default_log_directory,
+        dependencies.memory_budget);
     return std::unique_ptr<Application>(new Application(
         std::move(dependencies), std::move(*loaded), std::move(*serial_service),
-        std::move(*scanner), std::move(writer)));
+        std::move(*scanner), std::move(logs)));
   } catch (const std::exception &exception) {
     return tl::unexpected(
         application_error(exception.what(), Operation::WriteSessionLog));
@@ -434,38 +215,32 @@ Application::create_default(const serial::UiWakeCallback wake_callback,
   return create(std::move(dependencies));
 }
 
-Application::Application(ApplicationDependencies, LoadedConfiguration loaded,
+Application::Application(ApplicationDependencies dependencies,
+                         LoadedConfiguration loaded,
                          std::unique_ptr<serial::SerialService> serial_service,
                          std::unique_ptr<serial::DeviceScanner> scanner,
-                         std::unique_ptr<logging::SessionWriter> writer)
-    : serial_(std::move(serial_service)), scanner_(std::move(scanner)),
-      writer_(std::move(writer)), paths_(std::move(loaded.paths)),
-      config_load_(std::move(loaded.config)),
-      quick_load_(std::move(loaded.quick)),
-      state_load_(std::move(loaded.state)),
+                         std::unique_ptr<SessionLogCoordinator> logs)
+    : memory_budget_{dependencies.memory_budget}, snapshot_{records_.visible()},
+      serial_(std::move(serial_service)), scanner_(std::move(scanner)),
+      logs_(std::move(logs)),
       default_log_directory_(std::move(loaded.default_log_directory)) {
-  snapshot_.config = config_load_.snapshot;
-  snapshot_.quick_send = quick_load_.snapshot;
-  snapshot_.preferences = state_load_.snapshot;
+  snapshot_.config = loaded.config.snapshot;
+  snapshot_.quick_send = loaded.quick.snapshot;
+  snapshot_.preferences = loaded.state.snapshot;
   snapshot_.filter = {
       snapshot_.preferences.show_rx, snapshot_.preferences.show_tx,
       snapshot_.preferences.show_system, snapshot_.preferences.show_error};
-  snapshot_.config_read_only = config_load_.read_only;
-  snapshot_.quick_send_read_only = quick_load_.read_only;
-  snapshot_.state_read_only = state_load_.read_only;
+  snapshot_.config_read_only = loaded.config.read_only;
+  snapshot_.quick_send_read_only = loaded.quick.read_only;
+  snapshot_.state_read_only = loaded.state.read_only;
   snapshot_.configuration_notice = std::move(loaded.notice);
   snapshot_.effective_log_directory = snapshot_.config.logging.directory.empty()
                                           ? default_log_directory_.string()
                                           : snapshot_.config.logging.directory;
-  persistence_ = std::make_unique<config::PersistenceWorker>(paths_);
-  static_cast<void>(workers_.mark_running(WorkerKind::Serial));
-  static_cast<void>(workers_.mark_running(WorkerKind::Scanner));
-  static_cast<void>(workers_.mark_running(WorkerKind::SessionLog));
-  static_cast<void>(workers_.mark_running(WorkerKind::Persistence));
-  if (snapshot_.config.logging.default_enabled && writer_->enable()) {
-    static_cast<void>(log_state_.enable(false));
-  }
-  snapshot_.log = log_state_.state();
+  settings_ = std::make_unique<SettingsCoordinator>(
+      std::move(loaded.paths), std::move(loaded.config),
+      std::move(loaded.quick), std::move(loaded.state));
+  snapshot_.log = logs_->state();
   request_scan();
 }
 
@@ -481,8 +256,9 @@ const ApplicationSnapshot &Application::snapshot() const noexcept {
 
 OperationId Application::issue_operation() {
   OperationId result;
-  if (operation_ids_.issue(result) != IdIncrementResult::Advanced) {
-    throw std::overflow_error("operation identifier exhausted");
+  if (serial_->issue_operation(result) != IdIncrementResult::Advanced) {
+    enter_fatal_stopping(*serial_->fatal_signal());
+    return {};
   }
   return result;
 }
@@ -507,7 +283,7 @@ void Application::set_notice(std::string message, const bool error) {
   if (!error && snapshot_.notice_error) {
     return;
   }
-  snapshot_.notice = logging::sanitize_message(message);
+  snapshot_.notice = lazycom::sanitize_message(message);
   snapshot_.notice_error = error && !snapshot_.notice.empty();
   if (snapshot_.notice_revision == std::numeric_limits<std::uint64_t>::max()) {
     throw std::overflow_error("notice revision exhausted");
@@ -532,7 +308,7 @@ void Application::dismiss_notice() noexcept {
 }
 
 bool Application::operations_allowed() const noexcept {
-  return !stopped_ && fatal_guard_.state() == ProcessLifecycle::Running;
+  return !stopped_ && !snapshot_.fatal_stopping;
 }
 
 Status Application::operation_rejected() const {
@@ -544,11 +320,11 @@ Status Application::operation_rejected() const {
 void Application::publish_permission_alert(
     const std::string_view path, const serial::DevicePermission &permission) {
   std::ostringstream message;
-  message << "Cannot open " << logging::sanitize_message(path) << ".\n\n"
+  message << "Cannot open " << lazycom::sanitize_message(path) << ".\n\n"
           << "Effective UID: " << static_cast<std::uint64_t>(::geteuid())
           << "\n"
           << "Owner UID: " << permission.owner_uid << "\n"
-          << "Group: " << logging::sanitize_message(permission.group_name)
+          << "Group: " << lazycom::sanitize_message(permission.group_name)
           << " (" << permission.owner_gid << ")\n"
           << "Mode: 0" << std::oct << permission.mode << std::dec << "\n\n"
           << "The current user cannot read and write this device. Check the "
@@ -562,8 +338,8 @@ void Application::publish_permission_alert(
 void Application::dismiss_alert() noexcept { snapshot_.alert.reset(); }
 
 void Application::publish_alert(UserAlert alert) {
-  alert.title = logging::sanitize_message(alert.title);
-  alert.message = logging::sanitize_message(alert.message);
+  alert.title = lazycom::sanitize_message(alert.title);
+  alert.message = lazycom::sanitize_message(alert.message);
   snapshot_.alert = std::move(alert);
 }
 
@@ -574,6 +350,9 @@ void Application::request_scan() {
   }
   try {
     const auto operation = issue_operation();
+    if (operation.value == 0U) {
+      return;
+    }
     const auto generation = issue_scan_generation();
     const auto submitted = scanner_->submit_scan(operation, generation);
     if (!submitted) {
@@ -598,7 +377,7 @@ void Application::set_device_path(std::string path) {
     return;
   }
   device_path_ = std::move(path);
-  snapshot_.device_path = logging::sanitize_message(device_path_);
+  snapshot_.device_path = lazycom::sanitize_message(device_path_);
 }
 
 void Application::start_connection() {
@@ -629,6 +408,9 @@ void Application::start_connection() {
   try {
     const auto command =
         ConnectCommand{issue_operation(), issue_connection_generation()};
+    if (command.operation_id.value == 0U) {
+      return;
+    }
     if (connection_.begin_connect(command) != StateChange::Applied) {
       set_notice("Cannot start this connection generation");
       return;
@@ -641,6 +423,9 @@ void Application::start_connection() {
       static_cast<void>(connection_.connect_failed(failed));
       const DisconnectCommand cleanup{issue_operation(), command.generation,
                                       std::nullopt};
+      if (cleanup.operation_id.value == 0U) {
+        return;
+      }
       static_cast<void>(connection_.begin_disconnect(cleanup));
       static_cast<void>(connection_.disconnect_completed(
           {cleanup.operation_id, cleanup.generation, std::nullopt,
@@ -665,6 +450,9 @@ void Application::request_disconnect() {
   try {
     const DisconnectCommand command{
         issue_operation(), *connection_.generation(), connection_.session_id()};
+    if (command.operation_id.value == 0U) {
+      return;
+    }
     auto submitted = serial_->request_disconnect(command);
     if (!submitted) {
       set_notice(error_text(submitted.error()));
@@ -696,6 +484,9 @@ void Application::request_cancel_connect() {
   try {
     const CancelConnectCommand command{issue_operation(),
                                        *connection_.generation()};
+    if (command.operation_id.value == 0U) {
+      return;
+    }
     auto submitted = serial_->request_cancel_connect(command);
     if (!submitted) {
       const auto owner = serial_->connection_snapshot();
@@ -739,7 +530,7 @@ void Application::connect() {
     set_notice("Connect requires a disconnected link");
     return;
   }
-  if (log_command_) {
+  if (logs_->command_pending()) {
     connect_after_log_ = true;
     set_notice("Finishing the previous session log before reconnecting...",
                false);
@@ -789,8 +580,7 @@ void Application::connection_control() {
 }
 
 void Application::set_interaction(const InteractionState state) noexcept {
-  static_cast<void>(interaction_.enter(state));
-  snapshot_.interaction = interaction_.state();
+  snapshot_.interaction = state;
 }
 
 void Application::set_draft(std::string draft) {
@@ -802,7 +592,7 @@ void Application::set_draft(std::string draft) {
     set_notice("Draft reached its configured byte limit");
     return;
   }
-  if (!logging::is_strict_utf8(
+  if (!lazycom::is_strict_utf8(
           std::as_bytes(std::span{draft.data(), draft.size()}))) {
     set_notice("Draft must contain valid UTF-8 text");
     return;
@@ -811,10 +601,8 @@ void Application::set_draft(std::string draft) {
   history_index_.reset();
 }
 
-bool Application::submit_tx(
-    std::vector<std::byte> payload, const config::SendMode input_mode,
-    const std::optional<TaskGeneration> task_generation,
-    const std::optional<scheduler::ScheduledRequestToken> scheduled_token) {
+bool Application::submit_tx(std::vector<std::byte> payload,
+                            const config::SendMode input_mode) {
   if (!operations_allowed()) {
     set_notice("Application is stopping; TX rejected");
     return false;
@@ -831,27 +619,24 @@ bool Application::submit_tx(
   OperationId operation{};
   try {
     operation = issue_operation();
+    if (operation.value == 0U) {
+      return false;
+    }
     const SendCommand command{operation, *connection_.generation(),
-                              *connection_.session_id(), task_generation};
+                              *connection_.session_id(), std::nullopt};
     if (!connection_.accepts(command)) {
       set_notice("TX rejected by the active session guard");
       return false;
     }
-    if (scheduled_token) {
-      scheduled_operations_.emplace(operation.value, *scheduled_token);
-    }
     auto submitted =
         serial_->submit_tx({command, std::move(payload), input_mode});
     if (!submitted) {
-      scheduled_operations_.erase(operation.value);
       set_notice(error_text(submitted.error()));
       return false;
     }
-    ++active_tx_count_;
-    snapshot_.tx_pending = active_tx_count_;
+    snapshot_.tx_pending = serial_->pending_tx_requests();
     return true;
   } catch (const std::exception &exception) {
-    scheduled_operations_.erase(operation.value);
     set_notice(exception.what());
     return false;
   }
@@ -873,8 +658,7 @@ bool Application::submit_draft() {
     set_notice("Draft is not valid for the selected TXT/HEX mode");
     return false;
   }
-  if (!submit_tx(std::move(parsed.bytes), snapshot_.config.send.mode,
-                 std::nullopt)) {
+  if (!submit_tx(std::move(parsed.bytes), snapshot_.config.send.mode)) {
     return false;
   }
   if (history_.empty() || history_.back() != snapshot_.draft) {
@@ -930,10 +714,17 @@ void Application::history_next() {
   }
 }
 
+void Application::synchronize_records() noexcept {
+  snapshot_.rx_bytes = records_.rx_bytes();
+  snapshot_.tx_bytes = records_.tx_bytes();
+  snapshot_.display_bytes = records_.display_bytes();
+  snapshot_.display_gap_records = records_.gap_records();
+}
+
 void Application::enqueue_frames(std::vector<framing::RxFrame> frames,
                                  const SessionEventOrigin origin) {
   for (auto &frame : frames) {
-    snapshot_.rx_bytes += frame.bytes.size();
+    records_.account_rx(frame.bytes.size());
     enqueue_record(RecordDirection::Rx, frame.bytes, {}, std::nullopt,
                    std::nullopt, origin, frame.first_byte_observed_at,
                    frame.first_byte_observed_utc);
@@ -964,101 +755,34 @@ void Application::enqueue_record(
                           SignalSourceLocation::current()});
     return;
   }
-  if (next_record_id_ == std::numeric_limits<std::uint64_t>::max() ||
-      next_sequence_ == std::numeric_limits<std::uint64_t>::max()) {
-    set_notice("Session record identifier exhausted");
+  auto record = records_.append(snapshot_.config.receive, origin, direction,
+                                payload, std::move(message), error_code,
+                                operation, observed_at, time_utc, input_mode);
+  synchronize_records();
+  if (record.status != model::SequenceStatus::Accepted) {
+    if (late_cleanup_error && record.status == model::SequenceStatus::Closed) {
+      set_notice("Serial cleanup failed after the session closed");
+      return;
+    }
+    if (record.status == model::SequenceStatus::BudgetExhausted) {
+      logs_->record_overflow();
+      synchronize_log_state();
+      if (direction == RecordDirection::Rx &&
+          connection_.state() == ConnectionState::Connected) {
+        request_disconnect();
+      }
+      set_notice(
+          "Record memory limit reached; received data may be incomplete");
+      return;
+    }
+    enter_fatal_stopping({ErrorCode::InternalInvariantBroken,
+                          Operation::CoordinateFatal, WorkerKind::Serial,
+                          FatalReason::InvariantBroken,
+                          SignalSourceLocation::current()});
     return;
   }
-  VisibleRecord visible;
-  visible.record_id = next_record_id_++;
-  visible.sequence = next_sequence_++;
-  visible.direction = direction;
-  visible.time_utc = format_utc(time_utc);
-  visible.payload.assign(payload.begin(), payload.end());
-  visible.message = logging::sanitize_message(message);
-  visible.error_code = error_code;
-  visible.operation_id = operation;
-
-  logging::Record log_record;
-  log_record.seq = visible.sequence;
-  log_record.time_utc = visible.time_utc;
-  log_record.elapsed_ns =
-      observed_at <= session_started_
-          ? 0U
-          : static_cast<std::uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    observed_at - session_started_)
-                    .count());
-  log_record.direction = log_direction(direction);
-  log_record.payload = visible.payload;
-  log_record.message = visible.message;
-  if (direction == RecordDirection::Tx) {
-    log_record.input_mode = input_mode == config::SendMode::Txt
-                                ? logging::InputMode::Text
-                                : logging::InputMode::Hex;
-  }
-  if (direction == RecordDirection::Error) {
-    log_record.code =
-        std::string{error_descriptor(
-                        error_code.value_or(ErrorCode::InternalInvariantBroken))
-                        .identifier};
-  }
-  const auto visible_bytes = [](const VisibleRecord &record) {
-    return sizeof(VisibleRecord) + record.time_utc.capacity() +
-           record.payload.capacity() + record.message.capacity();
-  };
-  const auto maximum_bytes =
-      static_cast<std::size_t>(snapshot_.config.receive.visible_buffer_mib) *
-      1024U * 1024U;
-  const auto logical_bytes = visible_bytes(visible);
-  if (logical_bytes > maximum_bytes) {
-    ++snapshot_.display_gap_records;
-  } else {
-    while (!snapshot_.records.empty() &&
-           (snapshot_.records.size() >=
-                snapshot_.config.receive.visible_max_records ||
-            snapshot_.display_bytes > maximum_bytes - logical_bytes)) {
-      snapshot_.display_bytes -= visible_bytes(snapshot_.records.front());
-      snapshot_.records.pop_front();
-      ++snapshot_.display_gap_records;
-    }
-    snapshot_.records.push_back(std::move(visible));
-    snapshot_.display_bytes += visible_bytes(snapshot_.records.back());
-  }
-  const bool disabling =
-      log_command_ && log_command_->kind == PendingLogCommand::Kind::Disable;
-  if (log_state_.state() == LogState::Recording && !disabling) {
-    const auto result = writer_->try_enqueue({std::move(log_record)});
-    if (result != logging::EnqueueResult::Accepted) {
-      static_cast<void>(log_state_.fail());
-      set_notice("Session log stopped because its queue rejected a record");
-    }
-  } else if (!disabling && log_state_.state() == LogState::Waiting &&
-             connection_.generation() && connection_.session_id() &&
-             (connection_.state() == ConnectionState::Connected ||
-              connection_.state() == ConnectionState::Disconnecting ||
-              connection_.state() == ConnectionState::Error)) {
-    const auto record_bytes = log_record_bytes(log_record);
-    const auto log_maximum_bytes =
-        static_cast<std::size_t>(snapshot_.config.queues.log_max_mib) * 1024U *
-        1024U;
-    if (log_backlog_.size() < snapshot_.config.queues.log_max_messages &&
-        record_bytes <= log_maximum_bytes -
-                            std::min(log_backlog_bytes_, log_maximum_bytes)) {
-      log_backlog_bytes_ += record_bytes;
-      log_backlog_.push_back(
-          {{*connection_.generation(), *connection_.session_id()},
-           std::move(log_record)});
-    } else {
-      static_cast<void>(log_state_.fail());
-      log_backlog_.clear();
-      log_backlog_bytes_ = 0U;
-      restart_log_owner_.reset();
-      set_notice("Session log stopped because its rollover backlog is full");
-    }
-  }
-  snapshot_.log = log_state_.state();
-  snapshot_.log_pending = writer_->queued_records() + log_backlog_.size();
+  logs_->enqueue(std::move(record.record), log_context());
+  synchronize_log_state();
 }
 
 bool Application::process_serial_data() {
@@ -1084,16 +808,16 @@ bool Application::process_serial_data() {
       if (event.kind == serial::SerialDataKind::Rx) {
         const SessionDataEvent guard{event.generation, event.session_id,
                                      event.origin, SessionEventKind::Rx};
-        if (connection_.accepts(guard) && framer_) {
+        if (connection_.accepts(guard) && records_.active()) {
           enqueue_frames(
-              framer_->push(event.bytes, event.observed_at, event.time_utc),
+              records_.push(event.bytes, event.observed_at, event.time_utc),
               event.origin);
         }
       } else if (event.kind == serial::SerialDataKind::Tx) {
         const SessionDataEvent guard{event.generation, event.session_id,
                                      event.origin, SessionEventKind::Tx};
         if (connection_.accepts(guard)) {
-          snapshot_.tx_bytes += event.bytes.size();
+          records_.account_tx(event.bytes.size());
           enqueue_record(RecordDirection::Tx, event.bytes, {}, std::nullopt,
                          event.operation_id, event.origin, event.observed_at,
                          event.time_utc, event.input_mode);
@@ -1121,8 +845,8 @@ bool Application::process_serial_data() {
               connection_.session_fault({event.generation, event.session_id}) ==
               StateChange::Applied;
         }
-        if (framer_) {
-          enqueue_frames(framer_->flush(), SessionEventOrigin::Cleanup);
+        if (records_.active()) {
+          enqueue_frames(records_.flush(), SessionEventOrigin::Cleanup);
         }
         if (event.error) {
           enqueue_record(RecordDirection::Error, {}, error_text(*event.error),
@@ -1136,16 +860,12 @@ bool Application::process_serial_data() {
                          event.time_utc);
         }
         if (owner_fault_cleanup) {
-          const auto invalidated = scheduler_.invalidate_for_disconnect();
-          if (invalidated.generation_to_stop) {
-            static_cast<void>(
-                scheduler_.confirm_stopped(*invalidated.generation_to_stop,
-                                           std::chrono::steady_clock::now()));
-            snapshot_.task = scheduler_.snapshot();
-          }
           try {
             const DisconnectCommand cleanup{issue_operation(), event.generation,
                                             event.session_id};
+            if (cleanup.operation_id.value == 0U) {
+              return false;
+            }
             if (connection_.begin_disconnect(cleanup) == StateChange::Applied) {
               deferred_disconnect_completion_ = serial::DisconnectCompletion{
                   cleanup.operation_id, cleanup.generation, cleanup.session_id,
@@ -1182,6 +902,9 @@ void Application::finish_failed_connection(
     } else {
       const DisconnectCommand cleanup{issue_operation(), completion.generation,
                                       std::nullopt};
+      if (cleanup.operation_id.value == 0U) {
+        return;
+      }
       static_cast<void>(connection_.begin_disconnect(cleanup));
       static_cast<void>(connection_.disconnect_completed(
           {cleanup.operation_id, cleanup.generation, std::nullopt,
@@ -1218,6 +941,9 @@ void Application::retry_cancel_race_disconnect() {
   try {
     const DisconnectCommand command{
         issue_operation(), *connection_.generation(), connection_.session_id()};
+    if (command.operation_id.value == 0U) {
+      return;
+    }
     auto submitted = serial_->request_disconnect(command);
     if (!submitted) {
       set_notice(error_text(submitted.error()));
@@ -1246,7 +972,7 @@ void Application::process_serial_completions() {
   auto completions = serial_->drain_completions();
   const auto log_boundary_ready = [this](const ConnectionGeneration generation,
                                          const SessionId session_id) {
-    return closed_log_owner_ == LogSessionOwner{generation, session_id};
+    return logs_->closed({generation, session_id});
   };
   // Completion and data use independent channels. Hold disconnect completion
   // until this session's ordered Cleanup event and its log close boundary have
@@ -1274,16 +1000,10 @@ void Application::process_serial_completions() {
               const auto changed = connection_.connect_succeeded(
                   {value.operation_id, value.generation, *value.session_id});
               if (changed == StateChange::Applied) {
-                session_started_ = value.observed_at;
-                session_started_utc_ = value.time_utc;
+                records_.start(snapshot_.config.receive, value.observed_at,
+                               value.time_utc);
                 processed_cleanup_.reset();
-                closed_log_owner_.reset();
-                next_sequence_ = 1U;
-                framer_ =
-                    std::make_unique<framing::RxFramer>(framing::RxFramerConfig{
-                        std::chrono::milliseconds{
-                            snapshot_.config.receive.idle_gap_ms},
-                        snapshot_.config.receive.max_frame_bytes});
+                capture_log_session();
                 set_interaction(InteractionState::Normal);
                 begin_log_session();
                 if (connection_.state() == ConnectionState::Connected &&
@@ -1302,36 +1022,8 @@ void Application::process_serial_completions() {
               finish_failed_connection(value);
             }
           } else if constexpr (std::is_same_v<Value, serial::TxCompletion>) {
-            scheduler_.on_deadline(std::chrono::steady_clock::now(),
-                                   active_tx_count_ != 0U);
-            if (active_tx_count_ != 0U) {
-              --active_tx_count_;
-            }
-            const auto scheduled =
-                scheduled_operations_.find(value.operation_id.value);
-            if (scheduled != scheduled_operations_.end()) {
-              const auto token = scheduled->second;
-              scheduled_operations_.erase(scheduled);
-              if (scheduler_.snapshot().state !=
-                  scheduler::SchedulerState::Stopping) {
-                scheduler::TxBoundary boundary;
-                boundary.completed_request = token;
-                boundary.manual_pending = active_tx_count_ != 0U;
-                boundary.completed_successfully =
-                    value.outcome == OperationOutcome::Succeeded;
-                if (const auto next = scheduler_.on_tx_boundary(
-                        std::chrono::steady_clock::now(), boundary)) {
-                  if (!submit_tx(next->execution->bytes, next->execution->mode,
-                                 next->token.generation, next->token)) {
-                    scheduler::TxBoundary failed;
-                    failed.completed_request = next->token;
-                    failed.manual_pending = active_tx_count_ != 0U;
-                    static_cast<void>(scheduler_.on_tx_boundary(
-                        std::chrono::steady_clock::now(), failed));
-                  }
-                }
-              }
-            }
+            // Owner completion releases admission; ordered data carries payload
+            // and errors.
           } else if constexpr (std::is_same_v<Value,
                                               serial::DisconnectCompletion>) {
             if (connection_.generation() != value.generation ||
@@ -1351,20 +1043,13 @@ void Application::process_serial_completions() {
                 {value.operation_id, value.generation, value.session_id,
                  value.outcome});
             if (changed == StateChange::Applied) {
-              const auto invalidated = scheduler_.invalidate_for_disconnect();
-              if (invalidated.generation_to_stop) {
-                static_cast<void>(scheduler_.confirm_stopped(
-                    *invalidated.generation_to_stop,
-                    std::chrono::steady_clock::now()));
-                snapshot_.task = scheduler_.snapshot();
-              }
               processed_cleanup_.reset();
               cancel_race_disconnect_pending_ = false;
-              framer_.reset();
+              records_.finish();
               connected_port_config_.reset();
               snapshot_.active_port_config.reset();
               set_interaction(InteractionState::Normal);
-              if (log_state_.state() != LogState::Error ||
+              if (logs_->state() != LogState::Error ||
                   !snapshot_.notice_error) {
                 set_notice(value.error ? error_text(*value.error)
                            : value.outcome == OperationOutcome::Succeeded
@@ -1374,28 +1059,43 @@ void Application::process_serial_completions() {
                                value.outcome != OperationOutcome::Succeeded);
               }
             }
-          } else {
-            const auto stopped = scheduler_.confirm_stopped(
-                value.generation, std::chrono::steady_clock::now());
-            if (stopped.status ==
-                scheduler::StopConfirmationStatus::ReplacementStarted) {
-              set_notice("Old quick-send task stopped; replacement started",
-                         false);
-              process_scheduler();
-            } else if (stopped.status ==
-                       scheduler::StopConfirmationStatus::Stopped) {
-              set_notice("Quick-send task stopped", false);
-            } else if (stopped.status ==
-                       scheduler::StopConfirmationStatus::GenerationOverflow) {
-              set_notice("Quick-send replacement generation was exhausted");
+          } else if constexpr (std::is_same_v<Value,
+                                              serial::TaskStartCompletion>) {
+            if (!pending_task_start_ ||
+                pending_task_start_->operation_id != value.operation_id) {
+              return;
             }
-            snapshot_.task = scheduler_.snapshot();
+            const auto intent = *pending_task_start_;
+            pending_task_start_.reset();
+            if (value.outcome == OperationOutcome::Succeeded &&
+                connection_.generation() == value.generation &&
+                connection_.session_id() == value.session_id) {
+              snapshot_.preferences.last_quick_send_slot = intent.slot;
+              snapshot_.preferences.last_interval_ms =
+                  static_cast<std::uint32_t>(intent.interval_ms);
+              save_state();
+              set_notice(intent.interval_ms == 0U
+                             ? "Quick send submitted"
+                             : "Periodic quick-send task started",
+                         false);
+            } else if (value.outcome == OperationOutcome::Failed) {
+              set_notice("Quick-send task could not start; the active task or "
+                         "session changed");
+            }
+          } else if constexpr (std::is_same_v<Value,
+                                              serial::TaskStopCompletion>) {
+            if (pending_task_stop_ == value.operation_id) {
+              pending_task_stop_.reset();
+              if (value.outcome == OperationOutcome::Succeeded) {
+                set_notice("Quick-send task stopped", false);
+              }
+            }
           }
         },
         completion);
   }
   snapshot_.connection = connection_.state();
-  snapshot_.tx_pending = active_tx_count_;
+  snapshot_.tx_pending = serial_->pending_tx_requests();
   retry_cancel_race_disconnect();
 }
 
@@ -1426,29 +1126,58 @@ void Application::process_scan_completions() {
   }
 }
 
-bool Application::log_rollover_pending() const noexcept {
-  return restart_log_owner_ && connection_.generation() &&
-         connection_.session_id() &&
-         *restart_log_owner_ == LogSessionOwner{*connection_.generation(),
-                                                *connection_.session_id()};
+LogContext Application::log_context() const noexcept {
+  return {connection_, snapshot_.config, processed_cleanup_,
+          snapshot_.shutting_down, operations_allowed()};
 }
-
-void Application::begin_log_session() {
-  const bool finishing_rollover = log_rollover_pending();
-  if (!operations_allowed() || log_state_.state() != LogState::Waiting ||
-      log_command_ || writer_reconfigure_pending_ || writer_stop_deadline_ ||
-      (snapshot_.shutting_down && !finishing_rollover) ||
-      (connection_.state() != ConnectionState::Connected &&
-       !(finishing_rollover &&
-         connection_.state() == ConnectionState::Disconnecting)) ||
-      !connection_.generation() || !connection_.session_id() ||
-      !connected_port_config_) {
+void Application::synchronize_log_state() {
+  snapshot_.log = logs_->state();
+  snapshot_.log_pending = logs_->pending_records();
+  if (const auto fatal = logs_->fatal_signal()) {
+    enter_fatal_stopping(*fatal);
     return;
   }
-  const LogSessionOwner owner{*connection_.generation(),
-                              *connection_.session_id()};
+  if (auto notice = logs_->take_notice()) {
+    set_notice(std::move(notice->message), notice->error);
+  }
+}
+bool Application::log_rollover_pending() const noexcept {
+  return logs_->log_rollover_pending(log_context());
+}
+void Application::begin_log_session() {
+  logs_->begin_log_session(log_context());
+  synchronize_log_state();
+}
+void Application::start_log_rollover_if_needed() {
+  logs_->start_log_rollover_if_needed(log_context());
+  synchronize_log_state();
+}
+void Application::process_log_commands() {
+  logs_->process_log_commands(log_context());
+  synchronize_log_state();
+  if (operations_allowed() && !snapshot_.shutting_down && connect_after_log_ &&
+      !logs_->command_pending() &&
+      connection_.state() == ConnectionState::Disconnected) {
+    connect_after_log_ = false;
+    start_connection();
+  }
+}
+void Application::reconfigure_log_writer_if_inactive() {
+  logs_->reconfigure_log_writer_if_inactive(log_context());
+  synchronize_log_state();
+}
+void Application::toggle_log() {
+  logs_->toggle_log(log_context());
+  synchronize_log_state();
+}
+void Application::end_log_session(ConnectionGeneration generation,
+                                  SessionId session_id) {
+  logs_->end_log_session(log_context(), generation, session_id);
+  synchronize_log_state();
+}
+void Application::capture_log_session() {
   logging::Header header;
-  header.started_at = format_utc(session_started_utc_);
+  header.started_at = records_.started_at_utc();
   header.session_id = std::to_string(connection_.session_id()->value);
   for (const char value : device_path_) {
     header.device.path.push_back(static_cast<std::byte>(value));
@@ -1459,429 +1188,30 @@ void Application::begin_log_session() {
                    to_log_parity(port.parity),
                    static_cast<std::uint8_t>(port.stop_bits),
                    to_log_flow(port.flow_control)};
-  log_command_.emplace(PendingLogCommand{
-      writer_->start_session(std::move(header)), PendingLogCommand::Kind::Start,
-      owner, processed_cleanup_ == owner,
-      std::chrono::steady_clock::now() +
-          std::chrono::milliseconds{snapshot_.config.timeouts.log_barrier_ms}});
-  restart_log_owner_.reset();
+  logs_->session_opened({*connection_.generation(), *connection_.session_id()},
+                        std::move(header));
 }
 
-void Application::end_log_session(const ConnectionGeneration generation,
-                                  const SessionId session_id) {
-  const LogSessionOwner owner{generation, session_id};
-  if (closed_log_owner_ == owner) {
-    return;
-  }
-  if (log_command_) {
-    if (log_command_->kind == PendingLogCommand::Kind::Start &&
-        log_command_->owner == owner) {
-      log_command_->close_after_start = true;
+void Application::update_task_projection() {
+  const auto current = serial_->task_snapshot();
+  snapshot_.task = current.task;
+  snapshot_.tx_pending = serial_->pending_tx_requests();
+  if (current.notice_revision != task_notice_revision_) {
+    task_notice_revision_ = current.notice_revision;
+    switch (current.notice) {
+    case serial::TaskNotice::AdmissionRejected:
+      set_notice(
+          "Quick-send TX could not reserve queue or completion capacity");
+      break;
+    case serial::TaskNotice::DeadlineOverflow:
+      set_notice("Quick-send stopped after deadline overflow");
+      break;
+    case serial::TaskNotice::SequenceOverflow:
+      set_notice("Quick-send stopped after sequence exhaustion");
+      break;
+    case serial::TaskNotice::None:
+      break;
     }
-    if (!log_command_->owner) {
-      log_command_->owner = owner;
-    }
-    return;
-  }
-  if (log_rollover_pending() && writer_reconfigure_pending_ &&
-      log_state_.state() == LogState::Waiting) {
-    reconfigure_log_writer_if_inactive();
-    return;
-  }
-  if (writer_stop_deadline_) {
-    const auto now = std::chrono::steady_clock::now();
-    if (!writer_->wait_until_stopped(now)) {
-      if (now >= *writer_stop_deadline_) {
-        abort_after_shutdown_timeout();
-      }
-      return;
-    }
-    if (const auto fatal = writer_->fatal_signal()) {
-      enter_fatal_stopping(*fatal);
-      return;
-    }
-  }
-  if (!writer_stop_deadline_ && (log_state_.state() == LogState::Recording ||
-                                 log_state_.state() == LogState::Error)) {
-    log_command_.emplace(PendingLogCommand{
-        log_state_.state() == LogState::Error ? writer_->disable()
-                                              : writer_->end_session(),
-        PendingLogCommand::Kind::End, owner, false,
-        std::chrono::steady_clock::now() +
-            std::chrono::milliseconds{
-                snapshot_.config.timeouts.log_barrier_ms}});
-    static_cast<void>(log_state_.connection_closed());
-    snapshot_.log = log_state_.state();
-  } else if (processed_cleanup_ == owner) {
-    if (!log_backlog_.empty()) {
-      log_backlog_.clear();
-      log_backlog_bytes_ = 0U;
-      static_cast<void>(log_state_.fail());
-      snapshot_.log = log_state_.state();
-      set_notice("Session ended during log rollover; pending records could not "
-                 "be logged");
-    }
-    closed_log_owner_ = owner;
-  }
-}
-
-void Application::start_log_rollover_if_needed() {
-  if (!restart_log_owner_ || !writer_reconfigure_pending_ || log_command_ ||
-      log_state_.state() != LogState::Recording ||
-      (connection_.state() != ConnectionState::Connected &&
-       connection_.state() != ConnectionState::Disconnecting) ||
-      !connection_.generation() || !connection_.session_id() ||
-      *restart_log_owner_ != LogSessionOwner{*connection_.generation(),
-                                             *connection_.session_id()}) {
-    return;
-  }
-  end_log_session(restart_log_owner_->generation,
-                  restart_log_owner_->session_id);
-}
-
-void Application::process_log_commands() {
-  if (const auto fatal = writer_->fatal_signal()) {
-    enter_fatal_stopping(*fatal);
-    return;
-  }
-  if (!log_command_) {
-    return;
-  }
-  if (log_command_->completion.wait_for(0ms) != std::future_status::ready) {
-    if (std::chrono::steady_clock::now() >= log_command_->deadline) {
-      abort_after_shutdown_timeout();
-    }
-    return;
-  }
-  const auto result = log_command_->completion.get();
-  if (const auto fatal = writer_->fatal_signal()) {
-    enter_fatal_stopping(*fatal);
-    return;
-  }
-  const auto kind = log_command_->kind;
-  const auto owner = log_command_->owner;
-  const bool close_after_start = log_command_->close_after_start;
-  log_command_.reset();
-  const bool failed = result.error ||
-                      result.state == logging::SessionLogState::Error ||
-                      (kind == PendingLogCommand::Kind::Start &&
-                       result.state != logging::SessionLogState::Recording) ||
-                      (kind != PendingLogCommand::Kind::Start &&
-                       result.state == logging::SessionLogState::Recording);
-  if (failed) {
-    static_cast<void>(log_state_.fail());
-    log_backlog_.clear();
-    log_backlog_bytes_ = 0U;
-    restart_log_owner_.reset();
-    set_notice(result.error ? error_text(*result.error) : "Session log failed");
-    // A rejected command can return a ready future before any close occurred.
-    // Stop drains accepted work and proves cleanup at the worker return point.
-    if (!writer_stop_deadline_) {
-      writer_stop_deadline_ =
-          std::chrono::steady_clock::now() +
-          std::chrono::milliseconds{snapshot_.config.timeouts.log_barrier_ms};
-      writer_->request_stop();
-    }
-    writer_reconfigure_pending_ = true;
-  } else if (kind == PendingLogCommand::Kind::Start) {
-    const bool owner_is_current =
-        owner &&
-        (connection_.state() == ConnectionState::Connected ||
-         connection_.state() == ConnectionState::Disconnecting) &&
-        connection_.generation() && connection_.session_id() &&
-        *owner == LogSessionOwner{*connection_.generation(),
-                                  *connection_.session_id()};
-    if (!close_after_start && owner_is_current &&
-        log_state_.state() != LogState::Error) {
-      static_cast<void>(log_state_.connection_opened());
-    }
-    std::deque<PendingLogRecord> retained;
-    std::size_t retained_bytes = 0U;
-    bool queue_failed = false;
-    while (!log_backlog_.empty()) {
-      std::vector<logging::Record> batch;
-      batch.reserve(std::min<std::size_t>(log_backlog_.size(), 64U));
-      while (!log_backlog_.empty() && batch.size() < 64U) {
-        auto pending = std::move(log_backlog_.front());
-        log_backlog_.pop_front();
-        const auto pending_bytes = log_record_bytes(pending.record);
-        log_backlog_bytes_ -= pending_bytes;
-        if (owner && pending.owner == *owner) {
-          batch.push_back(std::move(pending.record));
-        } else {
-          retained_bytes += pending_bytes;
-          retained.push_back(std::move(pending));
-        }
-      }
-      if (!batch.empty() && writer_->try_enqueue(std::move(batch)) !=
-                                logging::EnqueueResult::Accepted) {
-        static_cast<void>(log_state_.fail());
-        log_backlog_.clear();
-        log_backlog_bytes_ = 0U;
-        queue_failed = true;
-        set_notice("Session log queue became full");
-        break;
-      }
-    }
-    if (!queue_failed) {
-      log_backlog_ = std::move(retained);
-      log_backlog_bytes_ = retained_bytes;
-    }
-    if (close_after_start || !owner_is_current || queue_failed ||
-        log_state_.state() == LogState::Error) {
-      log_command_.emplace(PendingLogCommand{
-          log_state_.state() == LogState::Error ? writer_->disable()
-                                                : writer_->end_session(),
-          PendingLogCommand::Kind::End, owner, false,
-          std::chrono::steady_clock::now() +
-              std::chrono::milliseconds{
-                  snapshot_.config.timeouts.log_barrier_ms}});
-    }
-  } else if (kind == PendingLogCommand::Kind::End) {
-    // end_session() moved the application to WAITING at submission time.
-  } else if (result.state == logging::SessionLogState::Waiting) {
-    // Observe flush/close failure before resetting the worker's error state.
-    log_command_.emplace(PendingLogCommand{
-        writer_->disable(), PendingLogCommand::Kind::Disable, owner, false,
-        std::chrono::steady_clock::now() +
-            std::chrono::milliseconds{
-                snapshot_.config.timeouts.log_barrier_ms}});
-  } else {
-    static_cast<void>(log_state_.disable());
-  }
-  if (!failed && kind != PendingLogCommand::Kind::Start && !log_command_ &&
-      owner && processed_cleanup_ == owner && !log_rollover_pending()) {
-    if (!log_backlog_.empty()) {
-      log_backlog_.clear();
-      log_backlog_bytes_ = 0U;
-      static_cast<void>(log_state_.fail());
-      set_notice("Session ended during log rollover; pending records could not "
-                 "be logged");
-    }
-    closed_log_owner_ = owner;
-  } else if (processed_cleanup_ && !log_command_) {
-    end_log_session(processed_cleanup_->generation,
-                    processed_cleanup_->session_id);
-  }
-  snapshot_.log = log_state_.state();
-  reconfigure_log_writer_if_inactive();
-  if (!snapshot_.shutting_down) {
-    start_log_rollover_if_needed();
-    if (!log_command_ && log_state_.state() == LogState::Waiting &&
-        connection_.state() == ConnectionState::Connected) {
-      if (!writer_reconfigure_pending_) {
-        restart_log_owner_.reset();
-        begin_log_session();
-      }
-    }
-    if (connect_after_log_ && !log_command_ &&
-        connection_.state() == ConnectionState::Disconnected) {
-      connect_after_log_ = false;
-      start_connection();
-    }
-  }
-}
-
-void Application::reconfigure_log_writer_if_inactive() {
-  const bool finishing_rollover = log_rollover_pending();
-  if (!writer_reconfigure_pending_ || log_command_ ||
-      (snapshot_.shutting_down && !finishing_rollover) ||
-      !operations_allowed() || log_state_.state() == LogState::Recording) {
-    return;
-  }
-  const auto now = std::chrono::steady_clock::now();
-  if (!writer_stop_deadline_) {
-    if (connection_.state() == ConnectionState::Disconnecting &&
-        !finishing_rollover) {
-      return;
-    }
-    writer_stop_deadline_ = now + std::chrono::milliseconds{
-                                      snapshot_.config.timeouts.log_barrier_ms};
-    writer_->request_stop();
-  }
-  if (!writer_->wait_until_stopped(now)) {
-    if (now >= *writer_stop_deadline_) {
-      abort_after_shutdown_timeout();
-    }
-    return;
-  }
-  if (const auto fatal = writer_->fatal_signal()) {
-    enter_fatal_stopping(*fatal);
-    return;
-  }
-  if (writer_->state() == logging::SessionLogState::Error &&
-      log_state_.state() != LogState::Error) {
-    if (log_state_.state() == LogState::Off) {
-      static_cast<void>(log_state_.enable(false));
-    }
-    static_cast<void>(log_state_.fail());
-    snapshot_.log = log_state_.state();
-    set_notice("Session log failed while stopping the previous writer");
-  }
-  if (connection_.state() == ConnectionState::Disconnecting &&
-      !finishing_rollover) {
-    if (processed_cleanup_) {
-      end_log_session(processed_cleanup_->generation,
-                      processed_cleanup_->session_id);
-    }
-    return;
-  }
-  try {
-    // The old worker is at its nonblocking return point before a new one
-    // exists.
-    writer_ = std::make_unique<logging::SessionWriter>(
-        writer_options(snapshot_.config, default_log_directory_));
-    writer_stop_deadline_.reset();
-    writer_reconfigure_pending_ = false;
-    if (log_state_.state() == LogState::Waiting && !writer_->enable()) {
-      static_cast<void>(log_state_.fail());
-      set_notice("Replacement log writer could not enter WAITING");
-    }
-    snapshot_.log_pending = log_backlog_.size();
-    snapshot_.log = log_state_.state();
-    if (log_state_.state() != LogState::Waiting) {
-      restart_log_owner_.reset();
-    }
-    begin_log_session();
-  } catch (const std::bad_alloc &) {
-    enter_fatal_stopping({ErrorCode::InternalOutOfMemory,
-                          Operation::CoordinateFatal, WorkerKind::SessionLog,
-                          FatalReason::OutOfMemory,
-                          SignalSourceLocation::current()});
-  } catch (const std::exception &exception) {
-    writer_reconfigure_pending_ = false;
-    if (log_state_.state() == LogState::Off) {
-      static_cast<void>(log_state_.enable(false));
-    }
-    static_cast<void>(log_state_.fail());
-    log_backlog_.clear();
-    log_backlog_bytes_ = 0U;
-    restart_log_owner_.reset();
-    snapshot_.log = log_state_.state();
-    set_notice(std::string{"Cannot apply logging settings: "} +
-               exception.what());
-  }
-}
-
-void Application::toggle_log() {
-  if (!operations_allowed()) {
-    set_notice("Application is stopping; logging command rejected");
-    return;
-  }
-  if (connection_.state() == ConnectionState::Disconnecting) {
-    set_notice("Logging changes are locked while disconnecting");
-    return;
-  }
-  if (writer_stop_deadline_ && !writer_reconfigure_pending_ &&
-      log_state_.state() == LogState::Error) {
-    static_cast<void>(log_state_.disable());
-    snapshot_.log = log_state_.state();
-    writer_reconfigure_pending_ = true;
-    reconfigure_log_writer_if_inactive();
-    return;
-  }
-  if (log_command_ || writer_stop_deadline_) {
-    set_notice("A log state transition is still in progress", false);
-    return;
-  }
-  if (log_state_.state() == LogState::Error) {
-    log_backlog_.clear();
-    log_backlog_bytes_ = 0U;
-    log_command_.emplace(
-        PendingLogCommand{writer_->disable(), PendingLogCommand::Kind::Disable,
-                          std::nullopt, false,
-                          std::chrono::steady_clock::now() +
-                              std::chrono::milliseconds{
-                                  snapshot_.config.timeouts.log_barrier_ms}});
-    set_notice("Resetting log error to OFF...", false);
-    return;
-  }
-  if (log_state_.state() == LogState::Off) {
-    static_cast<void>(log_state_.enable(false));
-    if (!writer_->enable()) {
-      static_cast<void>(log_state_.fail());
-      snapshot_.log = log_state_.state();
-      set_notice("Log writer could not enter WAITING");
-      return;
-    }
-    snapshot_.log = log_state_.state();
-    if (connection_.state() == ConnectionState::Connected) {
-      begin_log_session();
-    }
-    set_notice(connection_.state() == ConnectionState::Connected
-                   ? "Starting session logging..."
-                   : "Session logging is WAITING for a connection",
-               false);
-    return;
-  }
-  log_backlog_.clear();
-  log_backlog_bytes_ = 0U;
-  restart_log_owner_.reset();
-  log_command_.emplace(PendingLogCommand{
-      log_state_.state() == LogState::Recording ? writer_->end_session()
-                                                : writer_->disable(),
-      PendingLogCommand::Kind::Disable, std::nullopt, false,
-      std::chrono::steady_clock::now() +
-          std::chrono::milliseconds{snapshot_.config.timeouts.log_barrier_ms}});
-  set_notice("Stopping session logging...", false);
-}
-
-void Application::process_scheduler() {
-  if (!operations_allowed()) {
-    return;
-  }
-  const auto now = std::chrono::steady_clock::now();
-  scheduler_.on_deadline(now, active_tx_count_ != 0U);
-  if (const auto automatic_stop = scheduler_.take_automatic_stop_request()) {
-    const auto reason = automatic_stop->reason ==
-                                scheduler::AutomaticStopReason::DeadlineOverflow
-                            ? "Quick-send stopped after deadline overflow"
-                            : "Quick-send stopped after sequence exhaustion";
-    if (!request_quick_task_stop(automatic_stop->generation, reason)) {
-      enter_fatal_stopping({ErrorCode::InternalInvariantBroken,
-                            Operation::CoordinateFatal, WorkerKind::Serial,
-                            FatalReason::InvariantBroken,
-                            SignalSourceLocation::current()});
-      return;
-    }
-  }
-  if (connection_.state() == ConnectionState::Connected &&
-      active_tx_count_ == 0U) {
-    if (const auto send = scheduler_.on_tx_boundary(now)) {
-      if (!submit_tx(send->execution->bytes, send->execution->mode,
-                     send->token.generation, send->token)) {
-        scheduler::TxBoundary failed;
-        failed.completed_request = send->token;
-        failed.completed_successfully = false;
-        static_cast<void>(scheduler_.on_tx_boundary(now, failed));
-      }
-    }
-  }
-  snapshot_.task = scheduler_.snapshot();
-}
-
-bool Application::request_quick_task_stop(const TaskGeneration generation,
-                                          const std::string_view notice) {
-  if (!operations_allowed()) {
-    set_notice("Application is stopping; task stop rejected");
-    return false;
-  }
-  try {
-    const StopTaskCommand command{issue_operation(), generation};
-    auto submitted = serial_->request_stop_task(command);
-    if (!submitted) {
-      set_notice(error_text(submitted.error()));
-      return false;
-    }
-    if (*submitted == serial::SubmitStatus::AlreadyPending) {
-      set_notice("A quick-send stop is already pending", false);
-      return false;
-    }
-    set_notice(std::string{notice}, false);
-    return true;
-  } catch (const std::exception &exception) {
-    set_notice(exception.what());
-    return false;
   }
 }
 
@@ -1904,9 +1234,9 @@ void Application::tick() {
   process_scan_completions();
   // Only an actually empty drain permits idle, never a short/full event batch.
   // Use the pre-drain cutoff so time spent processing cannot manufacture idle.
-  if (drained && serial_->queued_data_bytes() == 0U && framer_ &&
+  if (drained && serial_->queued_data_bytes() == 0U && records_.active() &&
       connection_.state() == ConnectionState::Connected) {
-    enqueue_frames(framer_->on_idle(idle_observed_at),
+    enqueue_frames(records_.on_idle(idle_observed_at),
                    SessionEventOrigin::Normal);
   }
   process_log_commands();
@@ -1915,9 +1245,9 @@ void Application::tick() {
     return;
   }
   process_save_completions();
-  process_scheduler();
+  update_task_projection();
   update_worker_state();
-  snapshot_.log_pending = writer_->queued_records() + log_backlog_.size();
+  snapshot_.log_pending = logs_->pending_records();
   snapshot_.rx_ingress_bytes = serial_->queued_data_bytes();
   if (notice_deadline_ &&
       std::chrono::steady_clock::now() >= *notice_deadline_) {
@@ -1926,27 +1256,10 @@ void Application::tick() {
 }
 
 void Application::update_worker_state() {
-  if (const auto fatal = writer_->fatal_signal()) {
-    enter_fatal_stopping(*fatal);
+  logs_->observe_worker();
+  synchronize_log_state();
+  if (!operations_allowed()) {
     return;
-  }
-  if (writer_->state() == logging::SessionLogState::Error &&
-      log_state_.state() != LogState::Error) {
-    if (log_state_.state() == LogState::Off) {
-      static_cast<void>(log_state_.enable(false));
-    }
-    static_cast<void>(log_state_.fail());
-    log_backlog_.clear();
-    log_backlog_bytes_ = 0U;
-    restart_log_owner_.reset();
-    snapshot_.log = log_state_.state();
-    set_notice("Session log stopped after an asynchronous writer failure");
-  }
-  if (const auto stopped = serial_->worker_stopped_signal()) {
-    static_cast<void>(workers_.mark_at_return_point(*stopped));
-  }
-  if (const auto stopped = scanner_->worker_stopped_signal()) {
-    static_cast<void>(workers_.mark_at_return_point(*stopped));
   }
   if (const auto fatal = serial_->fatal_signal()) {
     enter_fatal_stopping(*fatal);
@@ -1963,22 +1276,16 @@ void Application::update_worker_state() {
 }
 
 void Application::enter_fatal_stopping(const FatalSignal &) noexcept {
-  if (fatal_guard_.enter_fatal_stopping() != StateChange::Applied) {
+  if (snapshot_.fatal_stopping || std::this_thread::get_id() != main_thread_) {
     return;
   }
   snapshot_.fatal_stopping = true;
   snapshot_.shutting_down = true;
-  static_cast<void>(scheduler_.invalidate_for_shutdown());
-  snapshot_.task = scheduler_.snapshot();
   serial_->request_stop();
   scanner_->request_stop();
-  persistence_->request_stop();
-  if (!writer_stop_deadline_) {
-    writer_stop_deadline_ =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds{snapshot_.config.timeouts.log_barrier_ms};
-  }
-  writer_->request_stop();
+  settings_->request_stop();
+  logs_->request_stop(
+      std::chrono::milliseconds{snapshot_.config.timeouts.log_barrier_ms});
   // Fatal coordination must not allocate even when the triggering failure is
   // OOM.
   notice_deadline_.reset();
@@ -2002,9 +1309,8 @@ void Application::clear_records() {
     set_notice("Application is stopping; clear rejected");
     return;
   }
-  snapshot_.records.clear();
-  snapshot_.display_bytes = 0U;
-  snapshot_.display_gap_records = 0U;
+  records_.clear();
+  synchronize_records();
   set_notice("In-memory session records cleared; log files were not changed",
              false);
 }
@@ -2045,12 +1351,12 @@ Status Application::apply_port(const std::string_view value) {
                    "selected serial device is not accessible"));
   }
   device_path_ = std::string{value};
-  snapshot_.device_path = logging::sanitize_message(device_path_);
+  snapshot_.device_path = lazycom::sanitize_message(device_path_);
   set_notice("Serial device selected", false);
   return {};
 }
 
-Status Application::apply_baud(const std::string_view value) {
+Status Application::apply_baud(const std::int32_t value) {
   if (!operations_allowed()) {
     return operation_rejected();
   }
@@ -2058,13 +1364,12 @@ Status Application::apply_baud(const std::string_view value) {
     return tl::unexpected(
         application_error("hardware is locked while connected"));
   }
-  const auto baud = parse_integer<std::int32_t>(value);
-  if (!baud || *baud < 1) {
+  if (value < 1) {
     return tl::unexpected(
         application_error("baud must be one of the supported presets"));
   }
   auto candidate = snapshot_.config;
-  candidate.serial.baud = *baud;
+  candidate.serial.baud = value;
   if (const auto errors = config::validate_config_snapshot(candidate);
       !errors.empty()) {
     return tl::unexpected(application_error(errors.front().message));
@@ -2073,7 +1378,7 @@ Status Application::apply_baud(const std::string_view value) {
   return save_config();
 }
 
-Status Application::apply_data_format(const std::string_view value) {
+Status Application::apply_data_format(const DataFormatCandidate &value) {
   if (!operations_allowed()) {
     return operation_rejected();
   }
@@ -2081,23 +1386,11 @@ Status Application::apply_data_format(const std::string_view value) {
     return tl::unexpected(
         application_error("hardware is locked while connected"));
   }
-  const auto fields = split(value, ',');
-  if (fields.size() != 4U) {
-    return tl::unexpected(
-        application_error("format is data_bits,stop_bits,parity,flow"));
-  }
-  const auto data = parse_integer<std::int32_t>(fields[0]);
-  const auto stop = parse_integer<std::int32_t>(fields[1]);
-  const auto parity = parse_parity(fields[2]);
-  const auto flow = parse_flow(fields[3]);
-  if (!data || !stop || !parity || !flow) {
-    return tl::unexpected(application_error("invalid serial format value"));
-  }
   auto candidate = snapshot_.config;
-  candidate.serial.data_bits = *data;
-  candidate.serial.stop_bits = *stop;
-  candidate.serial.parity = *parity;
-  candidate.serial.flow_control = *flow;
+  candidate.serial.data_bits = value.data_bits;
+  candidate.serial.stop_bits = value.stop_bits;
+  candidate.serial.parity = value.parity;
+  candidate.serial.flow_control = value.flow_control;
   if (const auto errors = config::validate_config_snapshot(candidate);
       !errors.empty()) {
     return tl::unexpected(application_error(errors.front().message));
@@ -2106,47 +1399,30 @@ Status Application::apply_data_format(const std::string_view value) {
   return save_config();
 }
 
-Status Application::apply_newline(const std::string_view value) {
+Status Application::apply_newline(const config::Newline value) {
   if (!operations_allowed()) {
     return operation_rejected();
   }
-  const auto newline = parse_newline(value);
-  if (!newline) {
+  if (value == config::Newline::Session || config::to_string(value).empty()) {
     return tl::unexpected(application_error("newline must be none/lf/cr/crlf"));
   }
-  snapshot_.config.send.newline = *newline;
+  snapshot_.config.send.newline = value;
   return save_config();
 }
 
-Status Application::apply_view(const std::string_view value) {
+Status Application::apply_view(const ViewCandidate &value) {
   if (!operations_allowed()) {
     return operation_rejected();
   }
-  const auto fields = split(value, ',');
-  if (fields.size() != 6U) {
-    return tl::unexpected(application_error(
-        "view must be rx_mode,tx_mode plus four direction filters"));
-  }
-  const auto rx_view = parse_receive_view(fields[0]);
-  const auto tx_view = parse_receive_view(fields[1]);
-  if (!rx_view || !tx_view) {
+  if (config::to_string(value.rx_view).empty() ||
+      config::to_string(value.tx_view).empty()) {
     return tl::unexpected(
         application_error("RX/TX view must be txt/hex/mixed"));
   }
   auto candidate = snapshot_.config;
-  candidate.receive.rx_view = *rx_view;
-  candidate.receive.tx_view = *tx_view;
-  if (std::ranges::any_of(fields | std::views::drop(2),
-                          [](const std::string_view field) {
-                            return field != "0" && field != "1";
-                          })) {
-    return tl::unexpected(application_error("view filters must be 0 or 1"));
-  }
-  const auto enabled = [](const std::string_view field) {
-    return field == "1";
-  };
-  const DirectionFilter filter{enabled(fields[2]), enabled(fields[3]),
-                               enabled(fields[4]), enabled(fields[5])};
+  candidate.receive.rx_view = value.rx_view;
+  candidate.receive.tx_view = value.tx_view;
+  const auto &filter = value.filter;
   if (!filter.rx && !filter.tx && !filter.system && !filter.error) {
     return tl::unexpected(
         application_error("at least one receive direction must remain on"));
@@ -2162,21 +1438,18 @@ Status Application::apply_view(const std::string_view value) {
   return saved;
 }
 
-Status Application::apply_send_mode(const std::string_view value) {
+Status Application::apply_send_mode(const config::SendMode value) {
   if (!operations_allowed()) {
     return operation_rejected();
   }
-  if (value == "txt") {
-    snapshot_.config.send.mode = config::SendMode::Txt;
-  } else if (value == "hex") {
-    snapshot_.config.send.mode = config::SendMode::Hex;
-  } else {
+  if (config::to_string(value).empty()) {
     return tl::unexpected(application_error("send mode must be txt or hex"));
   }
+  snapshot_.config.send.mode = value;
   return save_config();
 }
 
-Status Application::apply_logging(const std::string_view value,
+Status Application::apply_logging(const LogSettingsCandidate &value,
                                   const LogApplyPolicy policy) {
   if (!operations_allowed()) {
     return operation_rejected();
@@ -2190,26 +1463,9 @@ Status Application::apply_logging(const std::string_view value,
                                           ? default_log_directory_.string()
                                           : snapshot_.config.logging.directory;
   auto saved = save_config();
-  writer_reconfigure_pending_ = true;
-  if (!log_rollover_pending()) {
-    restart_log_owner_.reset();
-  }
-  if (policy == LogApplyPolicy::RotateNow) {
-    if (log_command_ && log_command_->kind == PendingLogCommand::Kind::Start &&
-        log_command_->owner) {
-      restart_log_owner_ = log_command_->owner;
-    } else if (log_state_.state() == LogState::Recording &&
-               connection_.generation() && connection_.session_id()) {
-      restart_log_owner_ =
-          LogSessionOwner{*connection_.generation(), *connection_.session_id()};
-    }
-  }
-  reconfigure_log_writer_if_inactive();
   const bool rotates_active_file =
-      policy == LogApplyPolicy::RotateNow && restart_log_owner_.has_value();
-  if (policy == LogApplyPolicy::RotateNow) {
-    start_log_rollover_if_needed();
-  }
+      logs_->apply_settings(log_context(), policy == LogApplyPolicy::RotateNow);
+  synchronize_log_state();
   if (saved) {
     set_notice(
         rotates_active_file
@@ -2220,7 +1476,7 @@ Status Application::apply_logging(const std::string_view value,
   return saved;
 }
 
-Status Application::validate_logging(const std::string_view value) const {
+Status Application::validate_logging(const LogSettingsCandidate &value) const {
   auto candidate = logging_candidate(snapshot_.config, value);
   if (!candidate) {
     return tl::unexpected(candidate.error());
@@ -2237,7 +1493,7 @@ Application::apply_quick_slot(const std::uint32_t index,
   if (index < 1U || index > 20U || (slot && slot->index != index)) {
     return tl::unexpected(application_error("invalid quick-send slot"));
   }
-  if (save_completions_[1]) {
+  if (settings_->quick_save_pending()) {
     return tl::unexpected(
         application_error("quick-send save is busy", Operation::SaveConfig));
   }
@@ -2247,15 +1503,9 @@ Application::apply_quick_slot(const std::uint32_t index,
       !errors.empty()) {
     return tl::unexpected(application_error(errors.front().message));
   }
-  auto submission = persistence_->save_quick_send(
-      candidate, quick_load_.file_identity, quick_load_.document,
-      snapshot_.quick_send_read_only);
-  if (!submission.accepted()) {
-    return tl::unexpected(submission.error.value_or(
-        application_error("quick-send save is busy", Operation::SaveConfig)));
+  if (auto saved = settings_->save_quick_send(std::move(candidate)); !saved) {
+    return saved;
   }
-  pending_quick_send_ = std::move(candidate);
-  save_completions_[1] = std::move(submission.completion);
   snapshot_.quick_send_save_pending = true;
   snapshot_.quick_send_save_failed = false;
   set_notice("Saving quick-send slot...", false);
@@ -2278,57 +1528,34 @@ Status Application::execute_quick(const std::uint32_t slot,
     return tl::unexpected(
         application_error("quick-send slot is empty or invalid"));
   }
-  const auto now = std::chrono::steady_clock::now();
-  const auto scheduler_state = scheduler_.snapshot();
-  if (scheduler_state.state == scheduler::SchedulerState::Running &&
+  if (pending_task_start_ || pending_task_stop_) {
+    return tl::unexpected(application_error("a task command is still pending"));
+  }
+  const auto current = serial_->task_snapshot().task;
+  if (current.state == scheduler::SchedulerState::Running &&
       !replacement_confirmed) {
     return tl::unexpected(
         application_error("replacing the active task requires confirmation"));
   }
-  if (scheduler_state.state == scheduler::SchedulerState::Stopping) {
-    return tl::unexpected(
-        application_error("the active task is still stopping"));
-  }
-  if (!scheduler::Scheduler::valid_interval(interval_ms)) {
+  if (current.state == scheduler::SchedulerState::Stopping ||
+      !scheduler::valid_interval(interval_ms)) {
     return tl::unexpected(application_error("invalid interval or task state"));
   }
-  if (scheduler_state.state == scheduler::SchedulerState::Running) {
-    if (!scheduler_state.generation ||
-        !request_quick_task_stop(
-            *scheduler_state.generation,
-            "Stopping the old task before starting its replacement...")) {
-      return tl::unexpected(
-          application_error("could not submit the task replacement stop"));
-    }
+  const auto operation = issue_operation();
+  if (operation.value == 0U) {
+    return operation_rejected();
   }
-  auto started = scheduler_.start(
-      {std::move(*execution.execution), interval_ms}, now,
-      scheduler_state.state == scheduler::SchedulerState::Running);
-  if (started.status ==
-      scheduler::TaskStartStatus::ReplacementConfirmationRequired) {
-    return tl::unexpected(
-        application_error("replacing the active task requires confirmation"));
+  auto submitted =
+      serial_->submit_task({operation,
+                            *connection_.generation(),
+                            *connection_.session_id(),
+                            current.generation,
+                            {std::move(*execution.execution), interval_ms}});
+  if (!submitted) {
+    return tl::unexpected(std::move(submitted.error()));
   }
-  if (started.status != scheduler::TaskStartStatus::Started &&
-      started.status != scheduler::TaskStartStatus::ReplacementStopRequested) {
-    return tl::unexpected(application_error("invalid interval or task state"));
-  }
-  snapshot_.preferences.last_quick_send_slot = slot;
-  snapshot_.preferences.last_interval_ms =
-      static_cast<std::uint32_t>(interval_ms);
-  save_state();
-  if (started.status == scheduler::TaskStartStatus::ReplacementStopRequested &&
-      started.generation_to_stop) {
-    snapshot_.task = scheduler_.snapshot();
-    return {};
-  }
-  process_scheduler();
-  set_notice(started.status ==
-                     scheduler::TaskStartStatus::ReplacementStopRequested
-                 ? "Quick-send replacement started"
-             : interval_ms == 0U ? "Quick send submitted"
-                                 : "Periodic quick-send task started",
-             false);
+  pending_task_start_ = PendingTaskStart{operation, slot, interval_ms};
+  set_notice("Quick-send task command accepted", false);
   return {};
 }
 
@@ -2337,43 +1564,47 @@ void Application::stop_quick_task() {
     set_notice("Application is stopping; task stop rejected");
     return;
   }
-  const auto current = scheduler_.snapshot();
-  if (current.state == scheduler::SchedulerState::Running &&
-      current.generation &&
-      request_quick_task_stop(
-          *current.generation,
-          "Stopping quick-send task at the serial owner boundary...")) {
-    static_cast<void>(scheduler_.request_stop());
-  } else if (current.state == scheduler::SchedulerState::Stopping) {
+  if (pending_task_stop_) {
     set_notice("A quick-send stop is already pending", false);
+    return;
   }
-  snapshot_.task = scheduler_.snapshot();
+  const auto current = serial_->task_snapshot().task;
+  if (!current.generation && !pending_task_start_) {
+    return;
+  }
+  const auto operation = issue_operation();
+  if (operation.value == 0U) {
+    return;
+  }
+  const auto submitted = serial_->request_stop_task(
+      {operation, current.generation,
+       pending_task_start_ ? std::optional{pending_task_start_->operation_id}
+                           : std::nullopt});
+  if (!submitted) {
+    set_notice(error_text(submitted.error()));
+    return;
+  }
+  if (*submitted == serial::SubmitStatus::Accepted) {
+    pending_task_stop_ = operation;
+    set_notice("Stopping quick-send task at the serial owner boundary...",
+               false);
+  }
 }
 
 Status Application::save_config() {
   if (!operations_allowed()) {
     return operation_rejected();
   }
-  if (save_completions_[0]) {
-    config_save_dirty_ = true;
-    set_notice("Settings applied; latest configuration save queued", false);
-    return {};
-  }
-  auto submission = persistence_->save_config(
-      snapshot_.config, config_load_.file_identity, config_load_.document,
-      snapshot_.config_read_only);
-  if (!submission.accepted()) {
-    config_save_dirty_ = submission.state == config::SaveSubmitState::Busy;
-    auto error = submission.error.value_or(
-        application_error("Config save is busy", Operation::SaveConfig));
+  auto saved = settings_->save_config(snapshot_.config);
+  if (!saved) {
     set_notice("Settings applied for this process, but not saved: " +
-               error_text(error));
-    return tl::unexpected(std::move(error));
-  } else {
-    config_save_dirty_ = false;
-    save_completions_[0] = std::move(submission.completion);
-    set_notice("Settings applied; configuration save pending", false);
+               error_text(saved.error()));
+    return tl::unexpected(std::move(saved.error()));
   }
+  set_notice(*saved == SaveAdmission::Queued
+                 ? "Settings applied; latest configuration save queued"
+                 : "Settings applied; configuration save pending",
+             false);
   return {};
 }
 
@@ -2381,55 +1612,27 @@ void Application::save_state() {
   if (!operations_allowed()) {
     return;
   }
-  if (save_completions_[2]) {
-    state_save_dirty_ = true;
-    return;
-  }
-  auto submission =
-      persistence_->save_state(snapshot_.preferences, state_load_.file_identity,
-                               state_load_.document, snapshot_.state_read_only);
-  if (!submission.accepted()) {
-    state_save_dirty_ = submission.state == config::SaveSubmitState::Busy;
-    if (submission.error) {
-      set_notice(error_text(*submission.error));
-    }
-  } else {
-    state_save_dirty_ = false;
-    save_completions_[2] = std::move(submission.completion);
+  if (auto saved = settings_->save_state(snapshot_.preferences); !saved) {
+    set_notice(error_text(saved.error()));
   }
 }
 
 void Application::process_save_completions() {
-  for (std::size_t index = 0U; index < save_completions_.size(); ++index) {
-    auto &pending = save_completions_[index];
-    if (!pending || pending->wait_for(0ms) != std::future_status::ready) {
+  auto results = settings_->poll();
+  snapshot_.quick_send_save_pending = settings_->quick_save_pending();
+  snapshot_.quick_send_save_failed = settings_->quick_save_failed();
+  for (auto &pending : results.completions) {
+    if (!pending) {
       continue;
     }
-    auto completion = pending->get();
-    pending.reset();
-    constexpr std::array files{config::PersistenceFile::Config,
-                               config::PersistenceFile::QuickSend,
-                               config::PersistenceFile::State};
-    if (completion.file != files[index]) {
-      enter_fatal_stopping({ErrorCode::InternalInvariantBroken,
-                            Operation::CoordinateFatal, WorkerKind::Persistence,
-                            FatalReason::InvariantBroken,
-                            SignalSourceLocation::current()});
-      return;
-    }
-    if (index == 1U) {
-      snapshot_.quick_send_save_pending = false;
-    }
-    const bool superseded = (index == 0U && config_save_dirty_) ||
-                            (index == 2U && state_save_dirty_);
-    const std::string file = index == 0U   ? "config.toml"
-                             : index == 1U ? "quick_send.toml"
-                                           : "state.toml";
+    auto &completion = *pending;
+    const bool superseded = completion.superseded;
+    const std::string file =
+        completion.file == config::PersistenceFile::Config ? "config.toml"
+        : completion.file == config::PersistenceFile::QuickSend
+            ? "quick_send.toml"
+            : "state.toml";
     if (completion.outcome.state == config::CommitState::NotCommitted) {
-      if (index == 1U) {
-        pending_quick_send_.reset();
-        snapshot_.quick_send_save_failed = true;
-      }
       set_notice((superseded ? "Earlier " : "") + file +
                  " snapshot was not saved" +
                  (completion.outcome.error
@@ -2437,30 +1640,8 @@ void Application::process_save_completions() {
                       : ""));
       continue;
     }
-    if (!completion.outcome.committed_identity ||
-        !completion.outcome.committed_identity->exists) {
-      enter_fatal_stopping({ErrorCode::InternalInvariantBroken,
-                            Operation::CoordinateFatal, WorkerKind::Persistence,
-                            FatalReason::InvariantBroken,
-                            SignalSourceLocation::current()});
-      return;
-    }
-    const auto update_saved_document = [&completion](auto &loaded) {
-      loaded.file_exists = true;
-      loaded.file_identity = *completion.outcome.committed_identity;
-      loaded.document = std::move(completion.serialized_document);
-    };
-    if (index == 0U) {
-      update_saved_document(config_load_);
-    } else if (index == 1U) {
-      update_saved_document(quick_load_);
-      if (pending_quick_send_) {
-        snapshot_.quick_send = std::move(*pending_quick_send_);
-        pending_quick_send_.reset();
-      }
-      snapshot_.quick_send_save_failed = false;
-    } else {
-      update_saved_document(state_load_);
+    if (completion.committed_quick_send) {
+      snapshot_.quick_send = std::move(*completion.committed_quick_send);
     }
     if (completion.outcome.state ==
         config::CommitState::CommittedDurabilityUnknown) {
@@ -2470,76 +1651,38 @@ void Application::process_save_completions() {
       set_notice(file + " saved", false);
     }
   }
-  if (config_save_dirty_ && !save_completions_[0]) {
-    // save_config() reports admission failures and maintains the retry flag.
+  if (results.fatal) {
+    enter_fatal_stopping(*results.fatal);
+    return;
+  }
+  if (settings_->config_retry_pending()) {
     static_cast<void>(save_config());
   }
-  if (state_save_dirty_ && !save_completions_[2]) {
+  if (settings_->state_retry_pending()) {
     save_state();
   }
 }
 
 std::string Application::render_record(const VisibleRecord &record) const {
-  std::string prefix;
-  switch (record.direction) {
-  case RecordDirection::Rx:
-    prefix = "<- RX ";
-    break;
-  case RecordDirection::Tx:
-    prefix = "-> TX ";
-    break;
-  case RecordDirection::System:
-    prefix = "!  SYS ";
-    break;
-  case RecordDirection::Error:
-    prefix = "x  ERR ";
-    break;
-  }
-  prefix += "[" + record.time_utc + "] ";
-  if (record.direction == RecordDirection::System ||
-      record.direction == RecordDirection::Error) {
-    return prefix + logging::sanitize_message(record.message);
-  }
-  const auto view = record.direction == RecordDirection::Tx
-                        ? snapshot_.config.receive.tx_view
-                        : snapshot_.config.receive.rx_view;
-  encoding::DisplayMode mode = encoding::DisplayMode::Text;
-  if (view == config::ReceiveView::Hex) {
-    mode = encoding::DisplayMode::Hex;
-  } else if (view == config::ReceiveView::Mixed) {
-    mode = encoding::DisplayMode::Mixed;
-  }
-  return prefix + encoding::render(record.payload, mode);
+  return project_record(record, snapshot_.config.receive);
 }
-
-std::vector<std::uint64_t>
-Application::search(const std::string_view query,
-                    const DirectionFilter filter) const {
-  std::vector<std::uint64_t> result;
-  if (query.empty()) {
-    return result;
-  }
-  for (std::size_t index = 0U;
-       index < snapshot_.records.size() && result.size() < 10'000U; ++index) {
-    if (direction_visible(snapshot_.records[index].direction, filter) &&
-        render_record(snapshot_.records[index]).find(query) !=
-            std::string::npos) {
-      result.push_back(snapshot_.records[index].record_id);
-    }
-  }
-  return result;
+std::vector<std::uint64_t> Application::search(std::string_view query,
+                                               DirectionFilter filter) const {
+  return records_.search(query, filter, snapshot_.config.receive);
 }
 
 bool Application::has_exit_risk() const noexcept {
   return connection_.state() != ConnectionState::Disconnected ||
-         log_state_.state() != LogState::Off ||
-         scheduler_.snapshot().state != scheduler::SchedulerState::Idle ||
+         logs_->state() != LogState::Off ||
+         (serial_->task_snapshot().task.state !=
+              scheduler::SchedulerState::Idle ||
+          pending_task_start_ || pending_task_stop_) ||
          !snapshot_.draft.empty();
 }
 
 bool Application::shutdown() noexcept {
   if (stopped_) {
-    return fatal_guard_.state() != ProcessLifecycle::FatalStopping;
+    return !snapshot_.fatal_stopping;
   }
   snapshot_.shutting_down = true;
   connect_after_log_ = false;
@@ -2549,54 +1692,42 @@ bool Application::shutdown() noexcept {
       std::chrono::milliseconds{snapshot_.config.timeouts.log_barrier_ms};
   try {
     update_worker_state();
-    const bool fatal = fatal_guard_.state() == ProcessLifecycle::FatalStopping;
+    const bool fatal = snapshot_.fatal_stopping;
     if (fatal) {
       serial_->request_stop();
       scanner_->request_stop();
-      persistence_->request_stop();
-      writer_->request_stop();
-      if (std::this_thread::get_id() != fatal_guard_.owner_thread()) {
+      settings_->request_stop();
+      logs_->request_stop(log_timeout);
+      if (std::this_thread::get_id() != main_thread_) {
         return false;
       }
       const auto deadline = std::chrono::steady_clock::now() + owner_timeout;
-      const auto log_deadline = writer_stop_deadline_.value_or(
+      const auto log_deadline = logs_->stop_deadline().value_or(
           std::chrono::steady_clock::now() + log_timeout);
       const bool serial_stopped = serial_->wait_until_stopped(deadline);
       const bool scanner_stopped = scanner_->wait_until_stopped(deadline);
-      const bool persistence_stopped =
-          persistence_->wait_until_stopped(deadline);
-      const bool log_stopped = writer_->wait_until_stopped(log_deadline);
+      const bool persistence_stopped = settings_->wait_until_stopped(deadline);
+      const bool log_stopped = logs_->wait_until_stopped(log_deadline);
       if (!serial_stopped || !scanner_stopped || !persistence_stopped ||
           !log_stopped) {
         abort_after_shutdown_timeout();
       }
-      if (const auto signal = serial_->worker_stopped_signal()) {
-        static_cast<void>(workers_.mark_at_return_point(*signal));
-      }
-      if (const auto signal = scanner_->worker_stopped_signal()) {
-        static_cast<void>(workers_.mark_at_return_point(*signal));
-      }
-      static_cast<void>(workers_.mark_at_return_point(
-          {WorkerKind::SessionLog, WorkerLifecycle::AtReturnPoint,
-           WorkerExitReason::Fatal}));
-      persistence_->shutdown();
-      static_cast<void>(workers_.mark_at_return_point(
-          {WorkerKind::Persistence, WorkerLifecycle::AtReturnPoint,
-           WorkerExitReason::Completed}));
+
+      settings_->shutdown();
       stopped_ = true;
       return false;
     }
     stop_quick_task();
     const auto drain_log_commands = [this, log_timeout] {
       const auto deadline = std::chrono::steady_clock::now() + log_timeout;
-      while (log_command_ || log_rollover_pending()) {
-        if (!log_command_) {
+      while (logs_->command_pending() || log_rollover_pending()) {
+        if (!logs_->command_pending()) {
           start_log_rollover_if_needed();
           reconfigure_log_writer_if_inactive();
           if (!operations_allowed()) {
             return;
           }
-          if (!log_command_) {
+          if (!logs_->command_pending()) {
             if (std::chrono::steady_clock::now() >= deadline) {
               abort_after_shutdown_timeout();
             }
@@ -2604,8 +1735,7 @@ bool Application::shutdown() noexcept {
             continue;
           }
         }
-        if (log_command_->completion.wait_until(deadline) !=
-            std::future_status::ready) {
+        if (!logs_->wait_command_until(deadline)) {
           abort_after_shutdown_timeout();
         }
         process_log_commands();
@@ -2632,7 +1762,7 @@ bool Application::shutdown() noexcept {
              std::chrono::steady_clock::now() < deadline) {
         process_serial_data();
         process_serial_completions();
-        if (processed_cleanup_ && !log_command_) {
+        if (processed_cleanup_ && !logs_->command_pending()) {
           end_log_session(processed_cleanup_->generation,
                           processed_cleanup_->session_id);
         }
@@ -2640,9 +1770,9 @@ bool Application::shutdown() noexcept {
         if (!operations_allowed()) {
           return shutdown();
         }
-        if (writer_stop_deadline_ &&
-            std::chrono::steady_clock::now() >= *writer_stop_deadline_ &&
-            !writer_->wait_until_stopped(std::chrono::steady_clock::now())) {
+        if (logs_->stop_deadline() &&
+            std::chrono::steady_clock::now() >= *logs_->stop_deadline() &&
+            !logs_->wait_until_stopped(std::chrono::steady_clock::now())) {
           abort_after_shutdown_timeout();
         }
         if (!processed_cleanup_ &&
@@ -2660,79 +1790,45 @@ bool Application::shutdown() noexcept {
     if (!operations_allowed()) {
       return shutdown();
     }
-    if (writer_->state() == logging::SessionLogState::Recording) {
-      auto barrier =
-          writer_->barrier(next_sequence_ == 0U ? 0U : next_sequence_ - 1U);
-      if (barrier.wait_for(log_timeout) != std::future_status::ready) {
-        abort_after_shutdown_timeout();
-      }
-      auto ended = writer_->end_session();
-      if (ended.wait_for(log_timeout) != std::future_status::ready) {
-        abort_after_shutdown_timeout();
-      }
-    }
-    writer_->request_stop();
-    if (!writer_->wait_until_stopped(writer_stop_deadline_.value_or(
-            std::chrono::steady_clock::now() + log_timeout))) {
-      abort_after_shutdown_timeout();
-    }
-    if (const auto fatal_signal = writer_->fatal_signal()) {
+    logs_->finish_writer(records_.last_sequence(), log_timeout);
+    if (const auto fatal_signal = logs_->fatal_signal()) {
       enter_fatal_stopping(*fatal_signal);
       return shutdown();
     }
-    static_cast<void>(workers_.mark_at_return_point(
-        {WorkerKind::SessionLog, WorkerLifecycle::AtReturnPoint,
-         WorkerExitReason::Completed}));
+
     scanner_->request_stop();
     if (!scanner_->wait_until_stopped(std::chrono::steady_clock::now() +
                                       owner_timeout)) {
       abort_after_shutdown_timeout();
-    }
-    if (const auto signal = scanner_->worker_stopped_signal()) {
-      static_cast<void>(workers_.mark_at_return_point(*signal));
     }
     serial_->request_stop();
     if (!serial_->wait_until_stopped(std::chrono::steady_clock::now() +
                                      owner_timeout)) {
       abort_after_shutdown_timeout();
     }
-    if (const auto signal = serial_->worker_stopped_signal()) {
-      static_cast<void>(workers_.mark_at_return_point(*signal));
-    }
     const auto persistence_deadline =
         std::chrono::steady_clock::now() + owner_timeout;
-    while (config_save_dirty_ || state_save_dirty_ ||
-           std::ranges::any_of(save_completions_, [](const auto &completion) {
-             return completion.has_value();
-           })) {
-      bool waited = false;
-      for (auto &completion : save_completions_) {
-        if (completion) {
-          if (completion->wait_until(persistence_deadline) !=
-              std::future_status::ready) {
-            abort_after_shutdown_timeout();
-          }
-          waited = true;
-          break;
-        }
+    while (settings_->pending()) {
+      const auto waited = settings_->wait_next(persistence_deadline);
+      if (waited == SaveWait::TimedOut) {
+        abort_after_shutdown_timeout();
       }
       process_save_completions();
       if (!operations_allowed()) {
         return shutdown();
       }
-      if (!waited && std::chrono::steady_clock::now() >= persistence_deadline) {
+      if (waited == SaveWait::NothingPending &&
+          std::chrono::steady_clock::now() >= persistence_deadline) {
         abort_after_shutdown_timeout();
       }
     }
-    persistence_->request_stop();
-    if (!persistence_->wait_until_stopped(std::chrono::steady_clock::now() +
-                                          owner_timeout)) {
+    settings_->request_stop();
+    if (!settings_->wait_until_stopped(std::chrono::steady_clock::now() +
+                                       owner_timeout)) {
       abort_after_shutdown_timeout();
     }
-    persistence_->shutdown();
-    static_cast<void>(workers_.mark_at_return_point(
-        {WorkerKind::Persistence, WorkerLifecycle::AtReturnPoint,
-         WorkerExitReason::Completed}));
+    settings_->shutdown();
+
     stopped_ = true;
     return true;
   } catch (...) {

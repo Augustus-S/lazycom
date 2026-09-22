@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <lazycom/serial/backend.hpp>
 #include <lazycom/serial/service.hpp>
+#include <support/serial.hpp>
 
 #include <algorithm>
 #include <array>
@@ -14,42 +15,14 @@
 namespace {
 using namespace std::chrono_literals;
 using namespace lazycom;
-using namespace lazycom::app;
 using namespace lazycom::serial;
 
-class UniqueFd final {
-public:
-  explicit UniqueFd(int fd) noexcept : fd_{fd} {}
-  ~UniqueFd() { reset(); }
-  UniqueFd(const UniqueFd &) = delete;
-  UniqueFd &operator=(const UniqueFd &) = delete;
-  int get() const noexcept { return fd_; }
-  void reset() noexcept {
-    if (fd_ >= 0)
-      static_cast<void>(::close(fd_));
-    fd_ = -1;
-  }
-
-private:
-  int fd_;
-};
 bool wait_until(const auto &predicate) {
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (!predicate()) {
-    if (std::chrono::steady_clock::now() >= deadline)
-      return false;
-    std::this_thread::sleep_for(1ms);
-  }
-  return true;
+  return test::wait_until(predicate, 2s);
 }
 struct PtyOwner {
   PtyOwner() {
-    REQUIRE(master.get() >= 0);
-    REQUIRE(::grantpt(master.get()) == 0);
-    REQUIRE(::unlockpt(master.get()) == 0);
-    std::array<char, 256> path{};
-    REQUIRE(::ptsname_r(master.get(), path.data(), path.size()) == 0);
-    auto inspected = inspect_device_path(path.data());
+    auto inspected = inspect_device_path(pty.slave_path.data());
     REQUIRE(inspected);
     auto created =
         SerialService::create(std::make_unique<LibserialportBackend>());
@@ -64,15 +37,7 @@ struct PtyOwner {
       std::terminate();
   }
   std::vector<SerialCompletion> completions(std::size_t count) {
-    std::vector<SerialCompletion> result;
-    REQUIRE(wait_until([&] {
-      auto batch = service->drain_completions();
-      result.insert(result.end(), std::make_move_iterator(batch.begin()),
-                    std::make_move_iterator(batch.end()));
-      return result.size() >= count;
-    }));
-    REQUIRE(result.size() == count);
-    return result;
+    return test::collect_completions(*service, count, 2s);
   }
   ConnectCompletion connected() {
     const auto results = completions(1U);
@@ -82,7 +47,7 @@ struct PtyOwner {
     REQUIRE(result.session_id);
     return result;
   }
-  UniqueFd master{::posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
+  test::Pty pty;
   std::unique_ptr<SerialService> service;
 };
 } // namespace
@@ -107,6 +72,63 @@ TEST_CASE("real PTY owner exchanges bytes and settles connection lifecycle",
           test.completions(1U)[0]));
     }
   }
+  SECTION(
+      "periodic deadlines run without a UI tick and stop is a write barrier") {
+    const auto connected = test.connected();
+    scheduler::QuickSendExecution execution{1U,
+                                            "probe",
+                                            config::SendMode::Txt,
+                                            config::Newline::None,
+                                            config::Newline::None,
+                                            "",
+                                            {std::byte{'Q'}}};
+    REQUIRE(test.service->submit_task({OperationId{2},
+                                       connected.generation,
+                                       *connected.session_id,
+                                       std::nullopt,
+                                       {std::move(execution), 10U}}));
+    REQUIRE(wait_until(
+        [&] { return test.service->task_snapshot().task.sent_count >= 3U; }));
+    const auto task = test.service->task_snapshot().task;
+    REQUIRE(task.generation);
+    CHECK(task.sent_count >= 3U);
+    OperationId stop;
+    REQUIRE(test.service->issue_operation(stop) == IdIncrementResult::Advanced);
+    REQUIRE(test.service->request_stop_task({stop, task.generation}));
+    bool stopped = false;
+    std::vector<OperationId> operations;
+    REQUIRE(wait_until([&] {
+      for (const auto &completion : test.service->drain_completions()) {
+        if (const auto *tx = std::get_if<TxCompletion>(&completion)) {
+          CHECK((tx->outcome == OperationOutcome::Succeeded ||
+                 tx->outcome == OperationOutcome::Cancelled));
+          CHECK(std::find(operations.begin(), operations.end(),
+                          tx->operation_id) == operations.end());
+          operations.push_back(tx->operation_id);
+        } else if (const auto *done =
+                       std::get_if<TaskStopCompletion>(&completion)) {
+          CHECK(done->operation_id == stop);
+          stopped = true;
+        } else {
+          CHECK(std::get<TaskStartCompletion>(completion).outcome ==
+                OperationOutcome::Succeeded);
+        }
+      }
+      return stopped;
+    }));
+    std::array<std::byte, 256> output{};
+    const auto amount =
+        ::read(test.pty.master.get(), output.data(), output.size());
+    REQUIRE(amount >= 3);
+    CHECK(std::all_of(output.begin(), output.begin() + amount,
+                      [](auto value) { return value == std::byte{'Q'}; }));
+    std::this_thread::sleep_for(40ms);
+    CHECK(::read(test.pty.master.get(), output.data(), output.size()) == -1);
+    CHECK(errno == EAGAIN);
+    CHECK(test.service->task_snapshot().task.state ==
+          scheduler::SchedulerState::Idle);
+    CHECK_FALSE(test.service->fatal_signal());
+  }
   SECTION("an active connection exchanges bytes without idle spinning") {
     const auto connected = test.connected();
     const auto idle = test.service->wait_count();
@@ -114,7 +136,7 @@ TEST_CASE("real PTY owner exchanges bytes and settles connection lifecycle",
     CHECK(test.service->wait_count() - idle <= 2U);
     const std::vector<std::byte> inbound{std::byte{0x00}, std::byte{0x41},
                                          std::byte{0x80}, std::byte{0xff}};
-    REQUIRE(::write(test.master.get(), inbound.data(), inbound.size()) ==
+    REQUIRE(::write(test.pty.master.get(), inbound.data(), inbound.size()) ==
             static_cast<ssize_t>(inbound.size()));
     std::vector<std::byte> received;
     REQUIRE(wait_until([&] {
@@ -134,7 +156,7 @@ TEST_CASE("real PTY owner exchanges bytes and settles connection lifecycle",
     std::size_t offset = 0U;
     REQUIRE(wait_until([&] {
       const auto amount =
-          ::read(test.master.get(), peer_received.data() + offset,
+          ::read(test.pty.master.get(), peer_received.data() + offset,
                  peer_received.size() - offset);
       if (amount > 0)
         offset += static_cast<std::size_t>(amount);
@@ -153,7 +175,7 @@ TEST_CASE("real PTY owner exchanges bytes and settles connection lifecycle",
           test.completions(1U)[0]));
     }
     SECTION("peer hangup") {
-      test.master.reset();
+      test.pty.master.reset();
       hangup = true;
     }
     REQUIRE(wait_until([&] {

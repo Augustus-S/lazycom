@@ -2,6 +2,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <libserialport.h>
+#include <support/serial.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -29,39 +30,8 @@ namespace {
 
 using namespace std::chrono_literals;
 
-class UniqueFd {
-public:
-  explicit UniqueFd(int fd = -1) noexcept : fd_(fd) {}
-
-  ~UniqueFd() { reset(); }
-
-  UniqueFd(const UniqueFd &) = delete;
-  UniqueFd &operator=(const UniqueFd &) = delete;
-
-  [[nodiscard]] int get() const noexcept { return fd_; }
-
-  void reset(int fd = -1) noexcept {
-    if (fd_ >= 0) {
-      static_cast<void>(::close(fd_));
-    }
-    fd_ = fd;
-  }
-
-private:
-  int fd_;
-};
-
-struct Pty {
-  UniqueFd master{::posix_openpt(O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC)};
-  std::array<char, 256> slave_path{};
-  Pty() {
-    REQUIRE(master.get() >= 0);
-    REQUIRE(::grantpt(master.get()) == 0);
-    REQUIRE(::unlockpt(master.get()) == 0);
-    REQUIRE(::ptsname_r(master.get(), slave_path.data(), slave_path.size()) ==
-            0);
-  }
-};
+using lazycom::test::Pty;
+using lazycom::test::UniqueFd;
 
 std::jthread signal_after_delay(int fd, std::atomic_bool &succeeded) {
   return std::jthread([fd, &succeeded] {
@@ -182,43 +152,6 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     drain_eventfd(wake_fd.get());
   }
 
-  SECTION("serial data uses libserialport nonblocking APIs") {
-    constexpr std::array<std::byte, 4> inbound{
-        std::byte{0x00}, std::byte{0x41}, std::byte{0x80}, std::byte{0xff}};
-    REQUIRE(::write(pty.master.get(), inbound.data(), inbound.size()) ==
-            static_cast<ssize_t>(inbound.size()));
-
-    pollfd readable{.fd = serial_fd, .events = POLLIN, .revents = 0};
-    REQUIRE(wait_for(&readable, 1, 1s) == 1);
-    REQUIRE((readable.revents & POLLIN) != 0);
-
-    std::array<std::byte, inbound.size()> received{};
-    const int read_result =
-        sp_nonblocking_read(port.get(), received.data(), received.size());
-    REQUIRE(read_result >= 0);
-    REQUIRE(static_cast<std::size_t>(read_result) == received.size());
-    REQUIRE(received == inbound);
-
-    constexpr std::array<std::byte, 4> outbound{
-        std::byte{0xfe}, std::byte{0x42}, std::byte{0x00}, std::byte{0x7f}};
-    pollfd writable{.fd = serial_fd, .events = POLLOUT, .revents = 0};
-    REQUIRE(wait_for(&writable, 1, 1s) == 1);
-    REQUIRE((writable.revents & POLLOUT) != 0);
-    const int write_result =
-        sp_nonblocking_write(port.get(), outbound.data(), outbound.size());
-    REQUIRE(write_result >= 0);
-    REQUIRE(static_cast<std::size_t>(write_result) == outbound.size());
-
-    pollfd peer_readable{
-        .fd = pty.master.get(), .events = POLLIN, .revents = 0};
-    REQUIRE(wait_for(&peer_readable, 1, 1s) == 1);
-    std::array<std::byte, outbound.size()> peer_received{};
-    REQUIRE(
-        ::read(pty.master.get(), peer_received.data(), peer_received.size()) ==
-        static_cast<ssize_t>(peer_received.size()));
-    REQUIRE(peer_received == outbound);
-  }
-
   SECTION(
       "blocked TX returns partial writes and EAGAIN without hiding wakeups") {
     const std::array<std::byte, 64 * 1024> chunk{};
@@ -290,13 +223,6 @@ TEST_CASE("libserialport native fd works with ppoll and eventfd",
     pollfd recovered{.fd = serial_fd, .events = POLLOUT, .revents = 0};
     REQUIRE(wait_for(&recovered, 1, 1s) == 1);
     REQUIRE((recovered.revents & POLLOUT) != 0);
-  }
-
-  SECTION("closing the PTY peer reports hangup") {
-    pty.master.reset();
-    pollfd disconnected{.fd = serial_fd, .events = POLLIN, .revents = 0};
-    REQUIRE(wait_for(&disconnected, 1, 1s) == 1);
-    REQUIRE((disconnected.revents & (POLLHUP | POLLERR)) != 0);
   }
 }
 

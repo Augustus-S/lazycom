@@ -1,7 +1,11 @@
+#include <lazycom/base/text.hpp>
+#include <lazycom/ui/receive_view_model.hpp>
 #include <lazycom/ui/tui.hpp>
 
+#include <lazycom/app/application.hpp>
+
+#include "modal_state.hpp"
 #include <lazycom/config/schema.hpp>
-#include <lazycom/logging/schema.hpp>
 
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/component_options.hpp>
@@ -292,24 +296,9 @@ const Color shortcut_text = Color::RGB(255U, 255U, 255U);
   return hbox(std::move(parts));
 }
 
-[[nodiscard]] bool visible(const app::VisibleRecord &record,
-                           const app::DirectionFilter &filter) {
-  switch (record.direction) {
-  case app::RecordDirection::Rx:
-    return filter.rx;
-  case app::RecordDirection::Tx:
-    return filter.tx;
-  case app::RecordDirection::System:
-    return filter.system;
-  case app::RecordDirection::Error:
-    return filter.error;
-  }
-  return false;
-}
-
 [[nodiscard]] std::string status_error(const Error &error) {
   return std::string{error_descriptor(error.code).identifier} + ": " +
-         logging::sanitize_message(error.detail);
+         lazycom::sanitize_message(error.detail);
 }
 
 [[nodiscard]] bool continuation_byte(const char value) noexcept {
@@ -328,7 +317,7 @@ utf8_boundary_at_or_before(const std::string_view value,
 }
 
 [[nodiscard]] bool strict_utf8(const std::string_view value) noexcept {
-  return logging::is_strict_utf8(
+  return lazycom::is_strict_utf8(
       std::as_bytes(std::span{value.data(), value.size()}));
 }
 
@@ -753,26 +742,11 @@ struct Tui::Impl {
   };
   std::array<OverlayFrame, 3> overlay_stack{};
   std::size_t overlay_depth{};
-  std::uint64_t modal_id{};
+  ModalState modal;
   std::uint64_t quick_save_modal_id{};
   std::size_t help_line{};
-  std::string modal_kind;
-  std::string modal_title;
-  std::string edit_value;
-  std::size_t edit_cursor{};
-  std::vector<std::string> modal_options;
-  std::string modal_parent;
-  std::size_t selected_device{};
-  config::SerialDefaults serial_candidate;
-  config::ReceiveView rx_view_candidate{config::ReceiveView::Txt};
-  config::ReceiveView tx_view_candidate{config::ReceiveView::Txt};
-  app::DirectionFilter filter_candidate;
-  config::LoggingSettings logging_candidate;
-  std::optional<std::uint64_t> viewport_anchor;
-  bool at_bottom{true};
-  std::string search_query;
-  std::vector<std::uint64_t> search_matches;
-  std::size_t search_match{};
+  ReceiveViewModel receive_view;
+  TextEditState search_editor;
   enum class SearchFocus : std::uint8_t { Query, Direction };
   enum class SearchDirection : std::uint8_t { All, Rx, Tx, System, Error };
   SearchFocus search_focus{SearchFocus::Query};
@@ -791,10 +765,8 @@ struct Tui::Impl {
   bool awaiting_quick_save{};
   bool connect_after_port{};
   bool exit_ok{true};
-  std::optional<std::uint64_t> receive_cursor;
   std::string receive_vim_pending;
   std::string selected_text;
-  config::QuickSendSlot quick_candidate;
   std::uint32_t quick_slot{1U};
   std::uint64_t quick_interval{};
   std::string quick_preview;
@@ -884,16 +856,9 @@ struct Tui::Impl {
 
   void copy_selection() { copy_text(selected_text, "the selection"); }
 
-  [[nodiscard]] std::vector<std::size_t> receive_visible_indices() const {
+  [[nodiscard]] ReceiveCoordinates receive_visible_indices() const {
     const auto &state = application->snapshot();
-    std::vector<std::size_t> indices;
-    indices.reserve(state.records.size());
-    for (std::size_t index = 0U; index < state.records.size(); ++index) {
-      if (visible(state.records[index], state.filter)) {
-        indices.push_back(index);
-      }
-    }
-    return indices;
+    return {state.records, state.filter};
   }
 
   [[nodiscard]] bool search_visible() const {
@@ -906,138 +871,39 @@ struct Tui::Impl {
         [](const auto &frame) { return frame.mode == RouteMode::Search; });
   }
 
-  [[nodiscard]] std::vector<std::size_t> view_indices() const {
-    if (!search_visible()) {
-      return receive_visible_indices();
-    }
-    std::vector<std::size_t> indices;
-    const auto &records = application->snapshot().records;
-    const auto filter = search_direction_filter();
-    for (std::size_t index = 0U; index < records.size(); ++index) {
-      if (visible(records[index], filter)) {
-        indices.push_back(index);
-      }
-    }
-    return indices;
+  [[nodiscard]] ReceiveCoordinates view_indices() const {
+    const auto &state = application->snapshot();
+    return {state.records,
+            search_visible() ? search_direction_filter() : state.filter};
   }
-
-  [[nodiscard]] std::size_t
-  nearest_position(const std::vector<std::size_t> &indices,
-                   const std::uint64_t id) const {
-    const auto &records = application->snapshot().records;
-    const auto next =
-        std::ranges::lower_bound(indices, id, {}, [&](const auto index) {
-          return records[index].record_id;
-        });
-    if (next == indices.begin()) {
-      return 0U;
-    }
-    if (next == indices.end()) {
-      return indices.size() - 1U;
-    }
-    const auto position =
-        static_cast<std::size_t>(std::distance(indices.begin(), next));
-    return id - records[indices[position - 1U]].record_id <
-                   records[indices[position]].record_id - id
-               ? position - 1U
-               : position;
-  }
-
   void normalize_viewport(const bool follow = false) {
-    const auto indices = view_indices();
-    if (indices.empty()) {
-      viewport_anchor.reset();
-      at_bottom = true;
-      return;
-    }
-    const auto &records = application->snapshot().records;
-    const auto position = follow || !viewport_anchor
-                              ? indices.size() - 1U
-                              : nearest_position(indices, *viewport_anchor);
-    viewport_anchor = records[indices[position]].record_id;
-    at_bottom = position + 1U == indices.size();
+    receive_view.normalize_viewport(view_indices(), follow);
   }
-
-  void set_receive_cursor(const std::vector<std::size_t> &indices,
-                          const std::size_t position) {
-    if (indices.empty()) {
-      receive_cursor.reset();
-      return;
-    }
-    const auto selected = indices[std::min(position, indices.size() - 1U)];
-    const auto &records = application->snapshot().records;
-    receive_cursor = records[selected].record_id;
-    viewport_anchor = receive_cursor;
-    at_bottom = selected == indices.back();
-  }
-
   void normalize_receive_cursor(const bool prefer_latest = false) {
-    const auto indices = receive_visible_indices();
-    if (indices.empty()) {
-      receive_cursor.reset();
-      viewport_anchor.reset();
-      at_bottom = true;
+    receive_view.normalize_cursor(receive_visible_indices(), prefer_latest);
+    if (!receive_view.cursor()) {
       receive_vim_pending.clear();
-      return;
     }
-    const auto &records = application->snapshot().records;
-    if (receive_cursor) {
-      const auto retained =
-          std::ranges::find_if(indices, [&](const auto index) {
-            return records[index].record_id == *receive_cursor;
-          });
-      if (retained != indices.end()) {
-        viewport_anchor = receive_cursor;
-        at_bottom = retained + 1 == indices.end();
-        return;
-      }
-      set_receive_cursor(indices, nearest_position(indices, *receive_cursor));
-      return;
-    }
-    if (prefer_latest) {
-      set_receive_cursor(indices, indices.size() - 1U);
-      return;
-    }
-    set_receive_cursor(
-        indices, viewport_anchor ? nearest_position(indices, *viewport_anchor)
-                                 : indices.size() - 1U);
   }
-
   void move_receive_cursor(const bool down, const std::size_t count) {
-    normalize_receive_cursor(true);
-    const auto indices = receive_visible_indices();
-    if (!receive_cursor || indices.empty()) {
-      return;
+    receive_view.move(receive_visible_indices(), down, count);
+    if (!receive_view.cursor()) {
+      receive_vim_pending.clear();
     }
-    const auto &records = application->snapshot().records;
-    const auto current = std::ranges::find_if(indices, [&](const auto index) {
-      return records[index].record_id == *receive_cursor;
-    });
-    if (current == indices.end()) {
-      return;
-    }
-    const auto position =
-        static_cast<std::size_t>(std::distance(indices.begin(), current));
-    const auto target =
-        down ? std::min(indices.size() - 1U,
-                        position + std::min(count, indices.size()))
-             : position - std::min(position, count);
-    set_receive_cursor(indices, target);
   }
-
   void move_receive_edge(const bool latest) {
-    const auto indices = receive_visible_indices();
-    if (!indices.empty()) {
-      set_receive_cursor(indices, latest ? indices.size() - 1U : 0U);
+    const auto coordinates = receive_visible_indices();
+    if (!coordinates.empty()) {
+      receive_view.select(coordinates, latest ? coordinates.size() - 1U : 0U);
     }
   }
 
   void copy_receive_record() {
-    if (!receive_cursor) {
+    if (!receive_view.cursor()) {
       return;
     }
     const auto &records = application->snapshot().records;
-    const auto current = std::ranges::find(records, *receive_cursor,
+    const auto current = std::ranges::find(records, *receive_view.cursor(),
                                            &app::VisibleRecord::record_id);
     if (current != records.end()) {
       copy_text(application->render_record(*current), "the current record");
@@ -1102,7 +968,7 @@ struct Tui::Impl {
     // Suspended fields and Input components stay in place and do not receive
     // input.
     overlay_stack[overlay_depth++] = {mode, application->snapshot().interaction,
-                                      modal_id};
+                                      modal.id};
     mode = next;
   }
 
@@ -1139,79 +1005,75 @@ struct Tui::Impl {
     pop_overlay();
   }
 
-  void open_modal(std::string kind, std::string title, std::string value) {
-    ++modal_id;
-    modal_kind = std::move(kind);
-    modal_title = std::move(title);
-    edit_value = std::move(value);
+  void open_modal(ModalKind kind, std::string title, std::string value) {
+    ++modal.id;
+    modal.kind = std::move(kind);
+    modal.title = std::move(title);
+    modal.editor.value = std::move(value);
     const auto maximum = modal_input_limit();
-    if (edit_value.size() > maximum) {
-      edit_value.resize(utf8_boundary_at_or_before(edit_value, maximum));
+    if (modal.editor.value.size() > maximum) {
+      modal.editor.value.resize(
+          utf8_boundary_at_or_before(modal.editor.value, maximum));
     }
-    edit_cursor = edit_value.size();
-    selected_device = 0U;
-    modal_options.clear();
-    modal_parent.clear();
+    modal.editor.cursor = modal.editor.value.size();
+    modal.selected = 0U;
+    modal.options.clear();
+    modal.parent = ModalKind::None;
     mode = RouteMode::Modal;
   }
 
   [[nodiscard]] std::size_t modal_input_limit() const noexcept {
-    if (modal_kind == "E" || modal_kind == "f") {
+    if (modal.kind == ModalKind::CommandPalette ||
+        modal.kind == ModalKind::QuickExecuteSlots) {
       return kCommandMaximumBytes;
     }
-    if (modal_kind == "G-files" || modal_kind == "G-total" ||
-        modal_kind == "G-file") {
+    if (modal.kind == ModalKind::LogFiles ||
+        modal.kind == ModalKind::LogTotalSize ||
+        modal.kind == ModalKind::LogFileSize) {
       return kNumericMaximumBytes;
     }
-    if (modal_kind == "G-dir") {
+    if (modal.kind == ModalKind::LogDirectory) {
       return kPathMaximumBytes;
     }
-    if (modal_kind == "F-content") {
+    if (modal.kind == ModalKind::QuickContent) {
       return config::kQuickSendMaximumBytes;
     }
-    if (modal_kind == "F-name") {
+    if (modal.kind == ModalKind::QuickName) {
       return 64U;
     }
-    if (modal_kind == "F-note") {
+    if (modal.kind == ModalKind::QuickNote) {
       return 256U;
     }
-    if (modal_kind == "f-interval") {
+    if (modal.kind == ModalKind::QuickInterval) {
       return kNumericMaximumBytes;
     }
     return kGeneralModalMaximumBytes;
   }
 
-  void open_choice(std::string kind, std::string title,
+  void open_choice(ModalKind kind, std::string title,
                    std::vector<std::string> options,
-                   const std::size_t selected = 0U, std::string parent = {}) {
-    ++modal_id;
-    modal_kind = std::move(kind);
-    modal_title = std::move(title);
-    modal_options = std::move(options);
-    selected_device = modal_options.empty()
-                          ? 0U
-                          : std::min(selected, modal_options.size() - 1U);
-    modal_parent = std::move(parent);
-    edit_value.clear();
-    edit_cursor = 0U;
+                   const std::size_t selected = 0U,
+                   ModalKind parent = ModalKind::None) {
+    ++modal.id;
+    modal.kind = std::move(kind);
+    modal.title = std::move(title);
+    modal.options = std::move(options);
+    modal.selected = modal.options.empty()
+                         ? 0U
+                         : std::min(selected, modal.options.size() - 1U);
+    modal.parent = std::move(parent);
+    modal.editor.value.clear();
+    modal.editor.cursor = 0U;
     mode = RouteMode::Modal;
-  }
-
-  [[nodiscard]] std::string logging_value() const {
-    return logging_candidate.directory + "|" +
-           std::to_string(logging_candidate.max_files) + "|" +
-           std::to_string(logging_candidate.max_total_size_mib) + "|" +
-           std::to_string(logging_candidate.max_file_size_mib);
   }
 
   void open_data_root() {
     open_choice(
-        "D", "Serial Settings",
-        {"Data bits: " + std::to_string(serial_candidate.data_bits),
-         "Stop bits: " + std::to_string(serial_candidate.stop_bits),
-         "Parity: " + std::string{config::to_string(serial_candidate.parity)},
-         "Flow: " +
-             std::string{config::to_string(serial_candidate.flow_control)},
+        ModalKind::DataFormat, "Serial Settings",
+        {"Data bits: " + std::to_string(modal.serial().data_bits),
+         "Stop bits: " + std::to_string(modal.serial().stop_bits),
+         "Parity: " + std::string{config::to_string(modal.serial().parity)},
+         "Flow: " + std::string{config::to_string(modal.serial().flow_control)},
          "Apply"});
   }
 
@@ -1222,26 +1084,26 @@ struct Tui::Impl {
                      : std::string{"HIDDEN"};
     };
     open_choice(
-        "V", "Receive View",
-        {"RX: " + setting(filter_candidate.rx, rx_view_candidate),
-         "TX: " + setting(filter_candidate.tx, tx_view_candidate),
-         std::string{"SYS: "} + (filter_candidate.system ? "TXT" : "HIDDEN"),
-         std::string{"ERR: "} + (filter_candidate.error ? "TXT" : "HIDDEN"),
+        ModalKind::View, "Receive View",
+        {"RX: " + setting(modal.view().filter.rx, modal.view().rx_view),
+         "TX: " + setting(modal.view().filter.tx, modal.view().tx_view),
+         std::string{"SYS: "} + (modal.view().filter.system ? "TXT" : "HIDDEN"),
+         std::string{"ERR: "} + (modal.view().filter.error ? "TXT" : "HIDDEN"),
          "Apply"});
   }
 
   void open_logging_root() {
-    open_choice(
-        "G", "Session Log Settings",
-        {"Directory: " + (logging_candidate.directory.empty()
-                              ? std::string{"<XDG default>"}
-                              : logging_candidate.directory),
-         "Maximum files: " + std::to_string(logging_candidate.max_files),
-         "Maximum total size: " +
-             std::to_string(logging_candidate.max_total_size_mib) + " MiB",
-         "Maximum file size: " +
-             std::to_string(logging_candidate.max_file_size_mib) + " MiB",
-         "Save for Next Session", "Save and Rotate Now", "Cancel"});
+    open_choice(ModalKind::Logging, "Session Log Settings",
+                {"Directory: " + (modal.logging().directory.empty()
+                                      ? std::string{"<XDG default>"}
+                                      : modal.logging().directory),
+                 "Maximum files: " + std::to_string(modal.logging().max_files),
+                 "Maximum total size: " +
+                     std::to_string(modal.logging().max_total_size_mib) +
+                     " MiB",
+                 "Maximum file size: " +
+                     std::to_string(modal.logging().max_file_size_mib) + " MiB",
+                 "Save for Next Session", "Save and Rotate Now", "Cancel"});
   }
 
   void close_overlay() {
@@ -1273,7 +1135,7 @@ struct Tui::Impl {
   [[nodiscard]] static std::string short_value(const std::string_view value) {
     const auto end = utf8_boundary_at_or_before(
         value, std::min(value.size(), std::size_t{64U}));
-    return logging::sanitize_message(value.substr(0U, end)) +
+    return lazycom::sanitize_message(value.substr(0U, end)) +
            (end < value.size() ? "..." : "");
   }
 
@@ -1289,7 +1151,7 @@ struct Tui::Impl {
                       short_value(slot->content)
                 : "[Input please.]"));
     }
-    open_choice(edit ? "F" : "f",
+    open_choice(edit ? ModalKind::QuickSlots : ModalKind::QuickExecuteSlots,
                 edit ? "Quick Slots: Enter edit / Delete remove"
                      : "Quick Send: select a slot",
                 std::move(options), quick_slot - 1U);
@@ -1297,12 +1159,12 @@ struct Tui::Impl {
 
   void open_quick_editor() {
     open_choice(
-        "F-edit", "Edit Slot " + std::to_string(quick_slot),
-        {"Name: " + short_value(quick_candidate.name),
-         "Mode: " + uppercase_ascii(config::to_string(quick_candidate.mode)),
-         "Content: " + short_value(quick_candidate.content),
-         "NewLine: " + std::string{config::to_string(quick_candidate.newline)},
-         "Note: " + short_value(quick_candidate.note), "Preview bytes", "Save",
+        ModalKind::QuickEdit, "Edit Slot " + std::to_string(quick_slot),
+        {"Name: " + short_value(modal.quick().name),
+         "Mode: " + uppercase_ascii(config::to_string(modal.quick().mode)),
+         "Content: " + short_value(modal.quick().content),
+         "NewLine: " + std::string{config::to_string(modal.quick().newline)},
+         "Note: " + short_value(modal.quick().note), "Preview bytes", "Save",
          "Cancel"});
   }
 
@@ -1329,7 +1191,8 @@ struct Tui::Impl {
   }
 
   void open_quick_run() {
-    open_choice("f-run", "Execute Slot " + std::to_string(quick_slot),
+    open_choice(ModalKind::QuickRun,
+                "Execute Slot " + std::to_string(quick_slot),
                 {"Interval: " + std::to_string(quick_interval) + " ms",
                  "Full payload preview",
                  quick_interval == 0U ? "Send once" : "Start periodic task",
@@ -1391,58 +1254,15 @@ struct Tui::Impl {
   }
 
   void run_search() {
-    search_matches =
-        application->search(search_query, search_direction_filter());
-    search_match = 0U;
-    if (!search_matches.empty()) {
-      static_cast<void>(scroll_to_search_match());
-    }
+    receive_view.set_matches(
+        application->search(search_editor.value, search_direction_filter()));
+    static_cast<void>(scroll_to_search_match());
   }
-
   [[nodiscard]] bool scroll_to_search_match() {
-    if (search_match >= search_matches.size()) {
-      return false;
-    }
-    const auto &records = application->snapshot().records;
-    const auto found = std::ranges::find(records, search_matches[search_match],
-                                         &app::VisibleRecord::record_id);
-    if (found == records.end()) {
-      return false;
-    }
-    viewport_anchor = found->record_id;
-    normalize_viewport();
-    return true;
+    return receive_view.scroll_to_match(view_indices());
   }
-
   void prune_search_matches() {
-    if (search_matches.empty()) {
-      return;
-    }
-    const auto &records = application->snapshot().records;
-    if (records.empty()) {
-      search_matches.clear();
-      search_match = 0U;
-      return;
-    }
-    const auto selected =
-        search_matches[std::min(search_match, search_matches.size() - 1U)];
-    const auto first = records.front().record_id;
-    const auto last = records.back().record_id;
-    std::erase_if(search_matches, [first, last](const std::uint64_t sequence) {
-      return sequence < first || sequence > last;
-    });
-    if (search_matches.empty()) {
-      search_match = 0U;
-      return;
-    }
-    const auto retained = std::ranges::find(search_matches, selected);
-    if (retained == search_matches.end()) {
-      search_match = 0U;
-      static_cast<void>(scroll_to_search_match());
-    } else {
-      search_match = static_cast<std::size_t>(
-          std::distance(search_matches.begin(), retained));
-    }
+    receive_view.prune_matches(application->snapshot().records, view_indices());
   }
 
   void cycle_search_direction(const bool forward) {
@@ -1453,7 +1273,7 @@ struct Tui::Impl {
         forward ? static_cast<std::uint8_t>((current + 1U) % count)
                 : static_cast<std::uint8_t>((current + count - 1U) % count);
     search_direction = static_cast<SearchDirection>(next);
-    if (!search_query.empty()) {
+    if (!search_editor.value.empty()) {
       run_search();
     }
   }
@@ -1463,7 +1283,8 @@ struct Tui::Impl {
     switch (action) {
     case RoutedAction::Port: {
       application->request_scan();
-      open_choice("P", "Serial Device (F5 refresh)", {"Scanning..."});
+      open_choice(ModalKind::Port, "Serial Device (F5 refresh)",
+                  {"Scanning..."});
       break;
     }
     case RoutedAction::Baud: {
@@ -1477,32 +1298,37 @@ struct Tui::Impl {
           selected = index;
         }
       }
-      open_choice("B", "Baud Rate", std::move(options), selected);
+      open_choice(ModalKind::Baud, "Baud Rate", std::move(options), selected);
       break;
     }
     case RoutedAction::DataFormat:
-      serial_candidate = state.config.serial;
+      modal.candidate = app::DataFormatCandidate{
+          state.config.serial.data_bits, state.config.serial.stop_bits,
+          state.config.serial.parity, state.config.serial.flow_control};
       open_data_root();
       break;
     case RoutedAction::Newline:
-      open_choice("N", "NewLine Suffix",
+      open_choice(ModalKind::Newline, "NewLine Suffix",
                   {"None", "LF  (0A)", "CR  (0D)", "CRLF  (0D 0A)"},
                   static_cast<std::size_t>(state.config.send.newline));
       break;
     case RoutedAction::View:
-      rx_view_candidate = state.config.receive.rx_view;
-      tx_view_candidate = state.config.receive.tx_view;
-      filter_candidate = state.filter;
+      modal.candidate =
+          app::ViewCandidate{state.config.receive.rx_view,
+                             state.config.receive.tx_view, state.filter};
       open_view_root();
       break;
     case RoutedAction::SendMode:
-      open_choice("H", "Input Type", {"TXT", "HEX"},
+      open_choice(ModalKind::SendMode, "Input Type", {"TXT", "HEX"},
                   state.config.send.mode == config::SendMode::Txt ? 0U : 1U);
       break;
     case RoutedAction::LoggingConfig:
-      logging_candidate = state.config.logging;
-      if (logging_candidate.directory.empty()) {
-        logging_candidate.directory = state.effective_log_directory;
+      modal.candidate = app::LogSettingsCandidate{
+          state.config.logging.directory, state.config.logging.max_files,
+          state.config.logging.max_total_size_mib,
+          state.config.logging.max_file_size_mib};
+      if (modal.logging().directory.empty()) {
+        modal.logging().directory = state.effective_log_directory;
       }
       open_logging_root();
       break;
@@ -1517,7 +1343,8 @@ struct Tui::Impl {
       open_quick_slots(false);
       break;
     case RoutedAction::CommandPalette:
-      open_modal("E", "E  Command: scan/connect/disconnect/help/stop-task", "");
+      open_modal(ModalKind::CommandPalette,
+                 "E  Command: scan/connect/disconnect/help/stop-task", "");
       break;
     default:
       break;
@@ -1526,209 +1353,210 @@ struct Tui::Impl {
 
   void apply_modal() {
     Status result;
-    if (modal_kind == "P") {
+    if (modal.kind == ModalKind::Port) {
       const auto &devices = application->snapshot().devices;
       if (application->snapshot().scanning) {
         result = tl::unexpected(make_error(
             ErrorCode::ValidationInvalidValue, Operation::ValidateConfig,
             "wait for the current device scan to finish"));
-      } else if (devices.empty() || selected_device >= devices.size()) {
+      } else if (devices.empty() || modal.selected >= devices.size()) {
         result = tl::unexpected(make_error(
             ErrorCode::ValidationInvalidValue, Operation::ValidateConfig,
             "no scanned serial device selected"));
-      } else if (devices[selected_device].permission.access ==
+      } else if (devices[modal.selected].permission.access ==
                  serial::DeviceAccess::PermissionDenied) {
         application->publish_permission_alert(
-            devices[selected_device].path, devices[selected_device].permission);
+            devices[modal.selected].path, devices[modal.selected].permission);
         show_alert_if_needed();
         return;
       } else {
-        result = application->apply_port(devices[selected_device].path);
+        result = application->apply_port(devices[modal.selected].path);
       }
-    } else if (modal_kind == "B") {
-      result = application->apply_baud(modal_options[selected_device]);
-    } else if (modal_kind == "D") {
-      if (selected_device == 0U) {
-        open_choice("D-data", "Data Bits", {"5", "6", "7", "8"},
-                    static_cast<std::size_t>(serial_candidate.data_bits - 5),
-                    "D");
+    } else if (modal.kind == ModalKind::Baud) {
+      result = application->apply_baud(config::kBaudPresets[modal.selected]);
+    } else if (modal.kind == ModalKind::DataFormat) {
+      if (modal.selected == 0U) {
+        open_choice(ModalKind::DataBits, "Data Bits", {"5", "6", "7", "8"},
+                    static_cast<std::size_t>(modal.serial().data_bits - 5),
+                    ModalKind::DataFormat);
         return;
       }
-      if (selected_device == 1U) {
-        open_choice("D-stop", "Stop Bits", {"1", "2"},
-                    static_cast<std::size_t>(serial_candidate.stop_bits - 1),
-                    "D");
+      if (modal.selected == 1U) {
+        open_choice(ModalKind::StopBits, "Stop Bits", {"1", "2"},
+                    static_cast<std::size_t>(modal.serial().stop_bits - 1),
+                    ModalKind::DataFormat);
         return;
       }
-      if (selected_device == 2U) {
-        open_choice("D-parity", "Parity",
+      if (modal.selected == 2U) {
+        open_choice(ModalKind::Parity, "Parity",
                     {"None", "Odd", "Even", "Mark", "Space"},
-                    static_cast<std::size_t>(serial_candidate.parity), "D");
+                    static_cast<std::size_t>(modal.serial().parity),
+                    ModalKind::DataFormat);
         return;
       }
-      if (selected_device == 3U) {
-        open_choice("D-flow", "Flow Control", {"None", "RTS/CTS", "XON/XOFF"},
-                    static_cast<std::size_t>(serial_candidate.flow_control),
-                    "D");
+      if (modal.selected == 3U) {
+        open_choice(ModalKind::FlowControl, "Flow Control",
+                    {"None", "RTS/CTS", "XON/XOFF"},
+                    static_cast<std::size_t>(modal.serial().flow_control),
+                    ModalKind::DataFormat);
         return;
       }
       result = application->apply_data_format(
-          std::to_string(serial_candidate.data_bits) + "," +
-          std::to_string(serial_candidate.stop_bits) + "," +
-          std::string{config::to_string(serial_candidate.parity)} + "," +
-          std::string{config::to_string(serial_candidate.flow_control)});
-    } else if (modal_kind == "D-data") {
-      serial_candidate.data_bits =
-          static_cast<std::int32_t>(selected_device + 5U);
+          {modal.serial().data_bits, modal.serial().stop_bits,
+           modal.serial().parity, modal.serial().flow_control});
+    } else if (modal.kind == ModalKind::DataBits) {
+      modal.serial().data_bits = static_cast<std::int32_t>(modal.selected + 5U);
       open_data_root();
       return;
-    } else if (modal_kind == "D-stop") {
-      serial_candidate.stop_bits =
-          static_cast<std::int32_t>(selected_device + 1U);
+    } else if (modal.kind == ModalKind::StopBits) {
+      modal.serial().stop_bits = static_cast<std::int32_t>(modal.selected + 1U);
       open_data_root();
       return;
-    } else if (modal_kind == "D-parity") {
-      serial_candidate.parity = static_cast<config::Parity>(selected_device);
+    } else if (modal.kind == ModalKind::Parity) {
+      modal.serial().parity = static_cast<config::Parity>(modal.selected);
       open_data_root();
       return;
-    } else if (modal_kind == "D-flow") {
-      serial_candidate.flow_control =
-          static_cast<config::FlowControl>(selected_device);
+    } else if (modal.kind == ModalKind::FlowControl) {
+      modal.serial().flow_control =
+          static_cast<config::FlowControl>(modal.selected);
       open_data_root();
       return;
-    } else if (modal_kind == "N") {
-      static constexpr std::array<std::string_view, 4> values{"none", "lf",
-                                                              "cr", "crlf"};
-      result = application->apply_newline(values[selected_device]);
-    } else if (modal_kind == "V") {
-      if (selected_device == 0U) {
-        open_choice("V-rx", "RX View", {"Hidden", "TXT", "HEX", "MIXED"},
-                    filter_candidate.rx
-                        ? static_cast<std::size_t>(rx_view_candidate) + 1U
+    } else if (modal.kind == ModalKind::Newline) {
+      static constexpr std::array values{
+          config::Newline::None, config::Newline::Lf, config::Newline::Cr,
+          config::Newline::CrLf};
+      result = application->apply_newline(values[modal.selected]);
+    } else if (modal.kind == ModalKind::View) {
+      if (modal.selected == 0U) {
+        open_choice(ModalKind::RxView, "RX View",
+                    {"Hidden", "TXT", "HEX", "MIXED"},
+                    modal.view().filter.rx
+                        ? static_cast<std::size_t>(modal.view().rx_view) + 1U
                         : 0U,
-                    "V");
+                    ModalKind::View);
         return;
       }
-      if (selected_device == 1U) {
-        open_choice("V-tx", "TX View", {"Hidden", "TXT", "HEX", "MIXED"},
-                    filter_candidate.tx
-                        ? static_cast<std::size_t>(tx_view_candidate) + 1U
+      if (modal.selected == 1U) {
+        open_choice(ModalKind::TxView, "TX View",
+                    {"Hidden", "TXT", "HEX", "MIXED"},
+                    modal.view().filter.tx
+                        ? static_cast<std::size_t>(modal.view().tx_view) + 1U
                         : 0U,
-                    "V");
+                    ModalKind::View);
         return;
       }
-      if (selected_device == 2U) {
-        open_choice("V-sys", "SYS Records", {"Hidden", "TXT"},
-                    filter_candidate.system ? 1U : 0U, "V");
+      if (modal.selected == 2U) {
+        open_choice(ModalKind::SystemVisibility, "SYS Records",
+                    {"Hidden", "TXT"}, modal.view().filter.system ? 1U : 0U,
+                    ModalKind::View);
         return;
       }
-      if (selected_device == 3U) {
-        open_choice("V-err", "ERR Records", {"Hidden", "TXT"},
-                    filter_candidate.error ? 1U : 0U, "V");
+      if (modal.selected == 3U) {
+        open_choice(ModalKind::ErrorVisibility, "ERR Records",
+                    {"Hidden", "TXT"}, modal.view().filter.error ? 1U : 0U,
+                    ModalKind::View);
         return;
       }
       result = application->apply_view(
-          std::string{config::to_string(rx_view_candidate)} + "," +
-          std::string{config::to_string(tx_view_candidate)} + "," +
-          (filter_candidate.rx ? "1" : "0") + "," +
-          (filter_candidate.tx ? "1" : "0") + "," +
-          (filter_candidate.system ? "1" : "0") + "," +
-          (filter_candidate.error ? "1" : "0"));
-    } else if (modal_kind == "V-rx" || modal_kind == "V-tx") {
-      const bool enabled = selected_device != 0U;
-      if (modal_kind == "V-rx") {
-        filter_candidate.rx = enabled;
+          {modal.view().rx_view, modal.view().tx_view, modal.view().filter});
+    } else if (modal.kind == ModalKind::RxView ||
+               modal.kind == ModalKind::TxView) {
+      const bool enabled = modal.selected != 0U;
+      if (modal.kind == ModalKind::RxView) {
+        modal.view().filter.rx = enabled;
         if (enabled) {
-          rx_view_candidate =
-              static_cast<config::ReceiveView>(selected_device - 1U);
+          modal.view().rx_view =
+              static_cast<config::ReceiveView>(modal.selected - 1U);
         }
       } else {
-        filter_candidate.tx = enabled;
+        modal.view().filter.tx = enabled;
         if (enabled) {
-          tx_view_candidate =
-              static_cast<config::ReceiveView>(selected_device - 1U);
+          modal.view().tx_view =
+              static_cast<config::ReceiveView>(modal.selected - 1U);
         }
       }
       open_view_root();
       return;
-    } else if (modal_kind == "V-sys" || modal_kind == "V-err") {
-      if (modal_kind == "V-sys") {
-        filter_candidate.system = selected_device != 0U;
+    } else if (modal.kind == ModalKind::SystemVisibility ||
+               modal.kind == ModalKind::ErrorVisibility) {
+      if (modal.kind == ModalKind::SystemVisibility) {
+        modal.view().filter.system = modal.selected != 0U;
       } else {
-        filter_candidate.error = selected_device != 0U;
+        modal.view().filter.error = modal.selected != 0U;
       }
       open_view_root();
       return;
-    } else if (modal_kind == "H") {
-      result =
-          application->apply_send_mode(selected_device == 0U ? "txt" : "hex");
-    } else if (modal_kind == "G") {
-      if (selected_device <= 3U) {
-        static constexpr std::array<std::string_view, 4> kinds{
-            "G-dir", "G-files", "G-total", "G-file"};
+    } else if (modal.kind == ModalKind::SendMode) {
+      result = application->apply_send_mode(
+          modal.selected == 0U ? config::SendMode::Txt : config::SendMode::Hex);
+    } else if (modal.kind == ModalKind::Logging) {
+      if (modal.selected <= 3U) {
+        static constexpr std::array<ModalKind, 4> kinds{
+            ModalKind::LogDirectory, ModalKind::LogFiles,
+            ModalKind::LogTotalSize, ModalKind::LogFileSize};
         static constexpr std::array<std::string_view, 4> titles{
             "Log Directory", "Maximum Files", "Maximum Total Size (MiB)",
             "Maximum File Size (MiB)"};
         const std::array<std::string, 4> values{
-            logging_candidate.directory,
-            std::to_string(logging_candidate.max_files),
-            std::to_string(logging_candidate.max_total_size_mib),
-            std::to_string(logging_candidate.max_file_size_mib)};
-        open_modal(std::string{kinds[selected_device]},
-                   std::string{titles[selected_device]},
-                   values[selected_device]);
-        modal_parent = "G";
+            modal.logging().directory,
+            std::to_string(modal.logging().max_files),
+            std::to_string(modal.logging().max_total_size_mib),
+            std::to_string(modal.logging().max_file_size_mib)};
+        open_modal(kinds[modal.selected], std::string{titles[modal.selected]},
+                   values[modal.selected]);
+        modal.parent = ModalKind::Logging;
         return;
       }
-      if (selected_device == 6U) {
+      if (modal.selected == 6U) {
         close_overlay();
         return;
       }
-      result = application->apply_logging(logging_value(),
-                                          selected_device == 4U
+      result = application->apply_logging(modal.logging(),
+                                          modal.selected == 4U
                                               ? app::LogApplyPolicy::NextSession
                                               : app::LogApplyPolicy::RotateNow);
-    } else if (modal_kind == "G-dir" || modal_kind == "G-files" ||
-               modal_kind == "G-total" || modal_kind == "G-file") {
-      auto candidate = logging_candidate;
-      if (modal_kind == "G-dir") {
-        candidate.directory = edit_value;
+    } else if (modal.kind == ModalKind::LogDirectory ||
+               modal.kind == ModalKind::LogFiles ||
+               modal.kind == ModalKind::LogTotalSize ||
+               modal.kind == ModalKind::LogFileSize) {
+      auto candidate = modal.logging();
+      if (modal.kind == ModalKind::LogDirectory) {
+        candidate.directory = modal.editor.value;
       } else {
         std::uint32_t parsed{};
         const auto result_parse = std::from_chars(
-            edit_value.data(), edit_value.data() + edit_value.size(), parsed);
+            modal.editor.value.data(),
+            modal.editor.value.data() + modal.editor.value.size(), parsed);
         if (result_parse.ec != std::errc{} ||
-            result_parse.ptr != edit_value.data() + edit_value.size()) {
+            result_parse.ptr !=
+                modal.editor.value.data() + modal.editor.value.size()) {
           result = tl::unexpected(make_error(
               ErrorCode::ValidationInvalidValue, Operation::ValidateConfig,
               "the logging value must be an unsigned integer"));
-        } else if (modal_kind == "G-files") {
+        } else if (modal.kind == ModalKind::LogFiles) {
           candidate.max_files = parsed;
-        } else if (modal_kind == "G-total") {
+        } else if (modal.kind == ModalKind::LogTotalSize) {
           candidate.max_total_size_mib = parsed;
         } else {
           candidate.max_file_size_mib = parsed;
         }
       }
       if (result) {
-        const auto value = candidate.directory + "|" +
-                           std::to_string(candidate.max_files) + "|" +
-                           std::to_string(candidate.max_total_size_mib) + "|" +
-                           std::to_string(candidate.max_file_size_mib);
-        result = application->validate_logging(value);
+        result = application->validate_logging(candidate);
       }
       if (result) {
-        logging_candidate = std::move(candidate);
+        modal.logging() = std::move(candidate);
         open_logging_root();
         return;
       }
-    } else if (modal_kind == "F" || modal_kind == "f") {
-      quick_slot = static_cast<std::uint32_t>(selected_device + 1U);
+    } else if (modal.kind == ModalKind::QuickSlots ||
+               modal.kind == ModalKind::QuickExecuteSlots) {
+      quick_slot = static_cast<std::uint32_t>(modal.selected + 1U);
       const auto &slot =
-          application->snapshot().quick_send.slots[selected_device];
-      if (modal_kind == "F") {
-        quick_candidate = slot.value_or(config::QuickSendSlot{});
-        quick_candidate.index = quick_slot;
+          application->snapshot().quick_send.slots[modal.selected];
+      if (modal.kind == ModalKind::QuickSlots) {
+        modal.candidate = slot.value_or(config::QuickSendSlot{});
+        modal.quick().index = quick_slot;
         open_quick_editor();
       } else if (slot && prepare_quick_preview(*slot)) {
         open_quick_run();
@@ -1736,38 +1564,39 @@ struct Tui::Impl {
         set_notice("The selected quick-send slot is empty", true);
       }
       return;
-    } else if (modal_kind == "F-edit") {
-      if (selected_device == 0U || selected_device == 2U ||
-          selected_device == 4U) {
-        const auto field = selected_device;
-        open_modal(field == 0U   ? "F-name"
-                   : field == 2U ? "F-content"
-                                 : "F-note",
+    } else if (modal.kind == ModalKind::QuickEdit) {
+      if (modal.selected == 0U || modal.selected == 2U ||
+          modal.selected == 4U) {
+        const auto field = modal.selected;
+        open_modal(field == 0U   ? ModalKind::QuickName
+                   : field == 2U ? ModalKind::QuickContent
+                                 : ModalKind::QuickNote,
                    field == 2U ? "Content: Alt+Enter inserts a newline"
                                : "Edit slot field",
-                   field == 0U   ? quick_candidate.name
-                   : field == 2U ? quick_candidate.content
-                                 : quick_candidate.note);
-        modal_parent = "F-edit";
-      } else if (selected_device == 1U) {
-        open_choice("F-mode", "Slot input mode", {"TXT", "HEX"},
-                    quick_candidate.mode == config::SendMode::Txt ? 0U : 1U,
-                    "F-edit");
-      } else if (selected_device == 3U) {
-        open_choice(
-            "F-newline", "Slot suffix", {"None", "LF", "CR", "CRLF", "Session"},
-            static_cast<std::size_t>(quick_candidate.newline), "F-edit");
-      } else if (selected_device == 5U) {
-        if (prepare_quick_preview(quick_candidate)) {
-          open_modal("quick-preview", "Payload preview", "");
-          modal_parent = "F-edit";
+                   field == 0U   ? modal.quick().name
+                   : field == 2U ? modal.quick().content
+                                 : modal.quick().note);
+        modal.parent = ModalKind::QuickEdit;
+      } else if (modal.selected == 1U) {
+        open_choice(ModalKind::QuickMode, "Slot input mode", {"TXT", "HEX"},
+                    modal.quick().mode == config::SendMode::Txt ? 0U : 1U,
+                    ModalKind::QuickEdit);
+      } else if (modal.selected == 3U) {
+        open_choice(ModalKind::QuickNewline, "Slot suffix",
+                    {"None", "LF", "CR", "CRLF", "Session"},
+                    static_cast<std::size_t>(modal.quick().newline),
+                    ModalKind::QuickEdit);
+      } else if (modal.selected == 5U) {
+        if (prepare_quick_preview(modal.quick())) {
+          open_modal(ModalKind::QuickPreview, "Payload preview", "");
+          modal.parent = ModalKind::QuickEdit;
         }
-      } else if (selected_device == 6U) {
-        result = application->apply_quick_slot(quick_slot, quick_candidate);
+      } else if (modal.selected == 6U) {
+        result = application->apply_quick_slot(quick_slot, modal.quick());
         if (result) {
           awaiting_quick_save = true;
-          quick_save_modal_id = modal_id;
-          modal_title = "Saving quick-send slot...";
+          quick_save_modal_id = modal.id;
+          modal.title = "Saving quick-send slot...";
           return;
         }
       } else {
@@ -1776,32 +1605,35 @@ struct Tui::Impl {
       if (result) {
         return;
       }
-    } else if (modal_kind == "F-name" || modal_kind == "F-content" ||
-               modal_kind == "F-note") {
-      if (modal_kind == "F-name") {
-        quick_candidate.name = edit_value;
-      } else if (modal_kind == "F-content") {
-        quick_candidate.content = edit_value;
+    } else if (modal.kind == ModalKind::QuickName ||
+               modal.kind == ModalKind::QuickContent ||
+               modal.kind == ModalKind::QuickNote) {
+      if (modal.kind == ModalKind::QuickName) {
+        modal.quick().name = modal.editor.value;
+      } else if (modal.kind == ModalKind::QuickContent) {
+        modal.quick().content = modal.editor.value;
       } else {
-        quick_candidate.note = edit_value;
+        modal.quick().note = modal.editor.value;
       }
       open_quick_editor();
       return;
-    } else if (modal_kind == "F-mode" || modal_kind == "F-newline") {
-      if (modal_kind == "F-mode") {
-        quick_candidate.mode = selected_device == 0U ? config::SendMode::Txt
-                                                     : config::SendMode::Hex;
+    } else if (modal.kind == ModalKind::QuickMode ||
+               modal.kind == ModalKind::QuickNewline) {
+      if (modal.kind == ModalKind::QuickMode) {
+        modal.quick().mode = modal.selected == 0U ? config::SendMode::Txt
+                                                  : config::SendMode::Hex;
       } else {
-        quick_candidate.newline = static_cast<config::Newline>(selected_device);
+        modal.quick().newline = static_cast<config::Newline>(modal.selected);
       }
       open_quick_editor();
       return;
-    } else if (modal_kind == "f-interval") {
+    } else if (modal.kind == ModalKind::QuickInterval) {
       std::uint64_t interval{};
       const auto parsed = std::from_chars(
-          edit_value.data(), edit_value.data() + edit_value.size(), interval);
+          modal.editor.value.data(),
+          modal.editor.value.data() + modal.editor.value.size(), interval);
       if (parsed.ec != std::errc{} ||
-          parsed.ptr != edit_value.data() + edit_value.size() ||
+          parsed.ptr != modal.editor.value.data() + modal.editor.value.size() ||
           (interval != 0U &&
            (interval < scheduler::kMinimumPeriodicIntervalMs ||
             interval > scheduler::kMaximumPeriodicIntervalMs))) {
@@ -1811,25 +1643,26 @@ struct Tui::Impl {
         open_quick_run();
       }
       return;
-    } else if (modal_kind == "f-run") {
-      if (selected_device == 0U) {
-        open_modal("f-interval", "Interval in ms: 0 or 10..86400000",
+    } else if (modal.kind == ModalKind::QuickRun) {
+      if (modal.selected == 0U) {
+        open_modal(ModalKind::QuickInterval,
+                   "Interval in ms: 0 or 10..86400000",
                    std::to_string(quick_interval));
-        modal_parent = "f-run";
+        modal.parent = ModalKind::QuickRun;
         return;
       }
-      if (selected_device == 1U) {
+      if (modal.selected == 1U) {
         preview_offset = 0U;
-        open_modal("quick-preview", "Payload preview", "");
-        modal_parent = "f-run";
+        open_modal(ModalKind::QuickPreview, "Payload preview", "");
+        modal.parent = ModalKind::QuickRun;
         return;
       }
-      if (selected_device == 3U) {
+      if (modal.selected == 3U) {
         application->stop_quick_task();
         close_overlay();
         return;
       }
-      if (selected_device == 4U) {
+      if (modal.selected == 4U) {
         close_overlay();
         return;
       }
@@ -1841,10 +1674,10 @@ struct Tui::Impl {
         return;
       }
       result = application->execute_quick(quick_slot, quick_interval);
-    } else if (modal_kind == "E") {
-      if (edit_value == "scan") {
+    } else if (modal.kind == ModalKind::CommandPalette) {
+      if (modal.editor.value == "scan") {
         application->request_scan();
-      } else if (edit_value == "connect") {
+      } else if (modal.editor.value == "connect") {
         if (application->snapshot().connection !=
             app::ConnectionState::Disconnected) {
           result = tl::unexpected(make_error(
@@ -1853,7 +1686,7 @@ struct Tui::Impl {
         } else {
           application->connect();
         }
-      } else if (edit_value == "disconnect") {
+      } else if (modal.editor.value == "disconnect") {
         if (application->snapshot().connection ==
             app::ConnectionState::Disconnected) {
           result = tl::unexpected(make_error(
@@ -1862,11 +1695,11 @@ struct Tui::Impl {
         } else {
           application->disconnect();
         }
-      } else if (edit_value == "help") {
+      } else if (modal.editor.value == "help") {
         close_overlay();
         open_help();
         return;
-      } else if (edit_value == "stop-task") {
+      } else if (modal.editor.value == "stop-task") {
         application->stop_quick_task();
       } else {
         result = tl::unexpected(make_error(ErrorCode::ValidationInvalidValue,
@@ -1883,7 +1716,8 @@ struct Tui::Impl {
       show_alert_if_needed();
       return;
     }
-    const bool should_connect = modal_kind == "P" && connect_after_port;
+    const bool should_connect =
+        modal.kind == ModalKind::Port && connect_after_port;
     connect_after_port = false;
     close_overlay();
     if (should_connect) {
@@ -1891,7 +1725,10 @@ struct Tui::Impl {
     }
   }
 
-  void edit_text(const Event &event, const std::size_t maximum_bytes) {
+  void edit_text(TextEditState &editor, const Event &event,
+                 const std::size_t maximum_bytes) {
+    auto &edit_value = editor.value;
+    auto &edit_cursor = editor.cursor;
     edit_cursor = utf8_boundary_at_or_before(edit_value, edit_cursor);
     if (event == Event::Backspace) {
       static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
@@ -1916,7 +1753,7 @@ struct Tui::Impl {
   }
 
   [[nodiscard]] std::uint64_t paste_context_id() const noexcept {
-    return mode == RouteMode::Modal ? modal_id : 0U;
+    return mode == RouteMode::Modal ? modal.id : 0U;
   }
 
   void start_paste() {
@@ -1930,12 +1767,12 @@ struct Tui::Impl {
     } else if (mode == RouteMode::Search &&
                search_focus == SearchFocus::Query) {
       available = kSearchMaximumBytes -
-                  std::min(kSearchMaximumBytes, search_query.size());
+                  std::min(kSearchMaximumBytes, search_editor.value.size());
       accepts_text = true;
-    } else if (mode == RouteMode::Modal && modal_options.empty() &&
-               modal_kind != "quick-preview") {
+    } else if (mode == RouteMode::Modal && modal.options.empty() &&
+               modal.kind != ModalKind::QuickPreview) {
       const auto maximum = modal_input_limit();
-      available = maximum - std::min(maximum, edit_value.size());
+      available = maximum - std::min(maximum, modal.editor.value.size());
       accepts_text = true;
     }
     paste.start(mode, paste_context_id(), available, accepts_text);
@@ -1964,28 +1801,26 @@ struct Tui::Impl {
       return;
     }
     if (mode == RouteMode::Search && search_focus == SearchFocus::Query) {
-      edit_value = search_query;
-      if (edit_utf8_text(edit_value, edit_cursor, Utf8EditAction::Insert, text,
-                         kSearchMaximumBytes)) {
-        search_query = edit_value;
-      }
+      static_cast<void>(
+          edit_utf8_text(search_editor.value, search_editor.cursor,
+                         Utf8EditAction::Insert, text, kSearchMaximumBytes));
       return;
     }
-    if (mode == RouteMode::Modal && modal_options.empty() &&
-        modal_kind != "quick-preview") {
-      static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
+    if (mode == RouteMode::Modal && modal.options.empty() &&
+        modal.kind != ModalKind::QuickPreview) {
+      static_cast<void>(edit_utf8_text(modal.editor.value, modal.editor.cursor,
                                        Utf8EditAction::Insert, text,
                                        modal_input_limit()));
     }
   }
 
   void scroll(RoutedAction action) {
-    normalize_viewport();
     const auto indices = view_indices();
+    receive_view.normalize_viewport(indices);
     if (indices.empty()) {
       return;
     }
-    auto position = nearest_position(indices, *viewport_anchor);
+    auto position = indices.nearest(*receive_view.anchor());
     switch (action) {
     case RoutedAction::ScrollUp:
       position -= std::min(position, std::size_t{1U});
@@ -2008,9 +1843,7 @@ struct Tui::Impl {
     default:
       break;
     }
-    viewport_anchor =
-        application->snapshot().records[indices[position]].record_id;
-    at_bottom = position + 1U == indices.size();
+    receive_view.anchor(indices, position);
   }
 
   bool handle(Event event) {
@@ -2026,7 +1859,8 @@ struct Tui::Impl {
     }
     if (event == Event::Custom) {
       custom_event_pending.store(false, std::memory_order_release);
-      const bool follow = at_bottom && !application->snapshot().manual_pause &&
+      const bool follow = receive_view.at_bottom() &&
+                          !application->snapshot().manual_pause &&
                           !search_visible() &&
                           application->snapshot().interaction !=
                               app::InteractionState::ReceiveBrowse;
@@ -2037,25 +1871,25 @@ struct Tui::Impl {
         return true;
       }
       show_alert_if_needed();
-      if (mode == RouteMode::Modal && modal_kind == "P") {
+      if (mode == RouteMode::Modal && modal.kind == ModalKind::Port) {
         const auto &devices = application->snapshot().devices;
-        modal_options.clear();
+        modal.options.clear();
         if (application->snapshot().scanning) {
-          modal_options.push_back("Scanning...");
+          modal.options.push_back("Scanning...");
         } else {
           for (const auto &device : devices) {
-            modal_options.push_back(
+            modal.options.push_back(
                 device.path + "  " + device.description +
                 (device.permission.access ==
                          serial::DeviceAccess::PermissionDenied
                      ? "  [Permission denied]"
                      : ""));
           }
-          if (modal_options.empty()) {
-            modal_options.push_back("No scanned serial devices");
+          if (modal.options.empty()) {
+            modal.options.push_back("No scanned serial devices");
           }
         }
-        selected_device = std::min(selected_device, modal_options.size() - 1U);
+        modal.selected = std::min(modal.selected, modal.options.size() - 1U);
       }
       if (search_visible()) {
         prune_search_matches();
@@ -2064,9 +1898,9 @@ struct Tui::Impl {
           !application->snapshot().quick_send_save_pending) {
         awaiting_quick_save = false;
         if (application->snapshot().quick_send_save_failed) {
-          modal_title = "F  Save failed; edit is preserved";
+          modal.title = "F  Save failed; edit is preserved";
         } else {
-          if (mode == RouteMode::Modal && modal_id == quick_save_modal_id) {
+          if (mode == RouteMode::Modal && modal.id == quick_save_modal_id) {
             close_overlay();
           } else {
             for (std::size_t index = 0U; index < overlay_depth; ++index) {
@@ -2147,7 +1981,8 @@ struct Tui::Impl {
     const auto connected =
         application->snapshot().connection == app::ConnectionState::Connected;
     const auto action = route_key(
-        {mode, key, connected, mode == RouteMode::Modal && modal_kind == "P",
+        {mode, key, connected,
+         mode == RouteMode::Modal && modal.kind == ModalKind::Port,
          mode == RouteMode::Search && search_focus == SearchFocus::Direction});
     if (action == RoutedAction::Help) {
       open_help();
@@ -2203,8 +2038,8 @@ struct Tui::Impl {
             set_notice(status_error(result.error()), true);
           } else {
             awaiting_quick_save = true;
-            quick_save_modal_id = modal_id;
-            modal_title = "F  Deleting quick-send slot...";
+            quick_save_modal_id = modal.id;
+            modal.title = "F  Deleting quick-send slot...";
           }
         } else if (confirm_action == ConfirmAction::ReplaceQuickTask) {
           const auto result = application->execute_quick(
@@ -2224,22 +2059,23 @@ struct Tui::Impl {
         return true;
       }
       if (action == RoutedAction::Escape) {
-        if (modal_parent == "D") {
+        if (modal.parent == ModalKind::DataFormat) {
           open_data_root();
-        } else if (modal_parent == "V") {
+        } else if (modal.parent == ModalKind::View) {
           open_view_root();
-        } else if (modal_parent == "G") {
+        } else if (modal.parent == ModalKind::Logging) {
           open_logging_root();
-        } else if (modal_parent == "F-edit") {
+        } else if (modal.parent == ModalKind::QuickEdit) {
           open_quick_editor();
-        } else if (modal_parent == "f-run") {
+        } else if (modal.parent == ModalKind::QuickRun) {
           open_quick_run();
-        } else if (modal_kind == "F-edit" || modal_kind == "f-run") {
-          open_quick_slots(modal_kind == "F-edit");
+        } else if (modal.kind == ModalKind::QuickEdit ||
+                   modal.kind == ModalKind::QuickRun) {
+          open_quick_slots(modal.kind == ModalKind::QuickEdit);
         } else {
           close_overlay();
         }
-      } else if (modal_kind == "quick-preview") {
+      } else if (modal.kind == ModalKind::QuickPreview) {
         if (event == Event::PageDown || event == Event::ArrowDown ||
             (event.is_mouse() && event.mouse().button == Mouse::WheelDown)) {
           const auto next = preview_page_end(preview_offset);
@@ -2261,49 +2097,50 @@ struct Tui::Impl {
         }
       } else if (action == RoutedAction::Scan) {
         application->request_scan();
-        modal_options = {"Scanning..."};
-        selected_device = 0U;
+        modal.options = {"Scanning..."};
+        modal.selected = 0U;
       } else if (action == RoutedAction::Apply) {
         apply_modal();
-      } else if (!modal_options.empty() &&
+      } else if (!modal.options.empty() &&
                  (action == RoutedAction::FocusNext ||
                   action == RoutedAction::FocusPrevious)) {
-        if (action == RoutedAction::FocusPrevious && selected_device != 0U) {
-          --selected_device;
+        if (action == RoutedAction::FocusPrevious && modal.selected != 0U) {
+          --modal.selected;
         } else if (action == RoutedAction::FocusNext &&
-                   selected_device + 1U < modal_options.size()) {
-          ++selected_device;
+                   modal.selected + 1U < modal.options.size()) {
+          ++modal.selected;
         }
-      } else if (modal_kind == "F" && event == Event::Delete) {
-        const auto slot = static_cast<std::uint32_t>(selected_device + 1U);
+      } else if (modal.kind == ModalKind::QuickSlots &&
+                 event == Event::Delete) {
+        const auto slot = static_cast<std::uint32_t>(modal.selected + 1U);
         if (!application->snapshot().quick_send.slots[slot - 1U]) {
           set_notice("The selected quick-send slot is already empty", true);
         } else {
           pending_quick_slot = slot;
           open_confirm(ConfirmAction::DeleteQuickSlot, RouteMode::Modal);
         }
-      } else if (!modal_options.empty() &&
+      } else if (!modal.options.empty() &&
                  (event == Event::Home || event == Event::End)) {
-        selected_device = event == Event::Home ? 0U : modal_options.size() - 1U;
-      } else if (!modal_options.empty() &&
+        modal.selected = event == Event::Home ? 0U : modal.options.size() - 1U;
+      } else if (!modal.options.empty() &&
                  (event == Event::ArrowUp || event == Event::ArrowDown)) {
-        if (event == Event::ArrowUp && selected_device != 0U) {
-          --selected_device;
+        if (event == Event::ArrowUp && modal.selected != 0U) {
+          --modal.selected;
         } else if (event == Event::ArrowDown &&
-                   selected_device + 1U < modal_options.size()) {
-          ++selected_device;
+                   modal.selected + 1U < modal.options.size()) {
+          ++modal.selected;
         }
-      } else if (modal_options.empty()) {
-        if (modal_kind == "F-content" && key == "Alt+Enter") {
-          static_cast<void>(edit_utf8_text(edit_value, edit_cursor,
-                                           Utf8EditAction::Insert, "\n",
-                                           modal_input_limit()));
+      } else if (modal.options.empty()) {
+        if (modal.kind == ModalKind::QuickContent && key == "Alt+Enter") {
+          static_cast<void>(edit_utf8_text(
+              modal.editor.value, modal.editor.cursor, Utf8EditAction::Insert,
+              "\n", modal_input_limit()));
         } else if (event == Event::Home) {
-          edit_cursor = 0U;
+          modal.editor.cursor = 0U;
         } else if (event == Event::End) {
-          edit_cursor = edit_value.size();
+          modal.editor.cursor = modal.editor.value.size();
         } else {
-          edit_text(event, modal_input_limit());
+          edit_text(modal.editor, event, modal_input_limit());
         }
       }
       return true;
@@ -2324,23 +2161,16 @@ struct Tui::Impl {
       } else if (action == RoutedAction::SelectNext ||
                  action == RoutedAction::SelectPrevious) {
         cycle_search_direction(action == RoutedAction::SelectNext);
-      } else if (!search_matches.empty() &&
+      } else if (receive_view.match_count() != 0U &&
                  (action == RoutedAction::SearchNext ||
                   action == RoutedAction::SearchPrevious)) {
-        if (action == RoutedAction::SearchNext) {
-          search_match = (search_match + 1U) % search_matches.size();
-        } else {
-          search_match = search_match == 0U ? search_matches.size() - 1U
-                                            : search_match - 1U;
-        }
+        receive_view.next_match(action == RoutedAction::SearchPrevious);
         if (!scroll_to_search_match()) {
           prune_search_matches();
           static_cast<void>(scroll_to_search_match());
         }
       } else if (search_focus == SearchFocus::Query) {
-        edit_value = search_query;
-        edit_text(event, kSearchMaximumBytes);
-        search_query = edit_value;
+        edit_text(search_editor, event, kSearchMaximumBytes);
       }
       return true;
     }
@@ -2447,11 +2277,11 @@ struct Tui::Impl {
       break;
     case RoutedAction::Search:
       mode = RouteMode::Search;
-      search_query.clear();
-      search_matches.clear();
+      search_editor.value.clear();
+      receive_view.set_matches({});
       search_focus = SearchFocus::Query;
       search_direction = SearchDirection::All;
-      edit_cursor = 0U;
+      search_editor.cursor = 0U;
       normalize_viewport();
       break;
     case RoutedAction::Scan:
@@ -2510,29 +2340,14 @@ struct Tui::Impl {
           color(theme::gold));
     }
     const auto indices = view_indices();
-    std::size_t end = indices.empty() ? 0U
-                      : viewport_anchor
-                          ? nearest_position(indices, *viewport_anchor) + 1U
-                          : indices.size();
-    std::size_t begin = end > 200U ? end - 200U : 0U;
-    if (mode == RouteMode::ReceiveBrowse && receive_cursor) {
-      const auto current = std::ranges::find_if(indices, [&](const auto index) {
-        return state.records[index].record_id == *receive_cursor;
-      });
-      if (current != indices.end()) {
-        const auto position =
-            static_cast<std::size_t>(std::distance(indices.begin(), current));
-        if (position < begin || position >= end) {
-          end = position + 1U;
-          begin = end > 200U ? end - 200U : 0U;
-        }
-      }
-    }
+    const auto [begin, end] =
+        receive_view.viewport(indices, 200U, mode == RouteMode::ReceiveBrowse);
     for (std::size_t position = begin; position < end; ++position) {
       const auto index = indices[position];
       const auto &record = state.records[index];
-      const bool current = mode == RouteMode::ReceiveBrowse && receive_cursor &&
-                           record.record_id == *receive_cursor;
+      const bool current = mode == RouteMode::ReceiveBrowse &&
+                           receive_view.cursor() &&
+                           record.record_id == *receive_view.cursor();
       auto row = text((mode == RouteMode::ReceiveBrowse
                            ? std::string{current ? "> " : "  "}
                            : std::string{}) +
@@ -2770,7 +2585,8 @@ struct Tui::Impl {
         " RXQ:" + std::to_string(state.rx_ingress_bytes / 1024U) + "KiB" +
         " LOGQ:" + std::to_string(state.log_pending) + " | " + task +
         (state.manual_pause ? " | PAUSED" : "") +
-        (!at_bottom ? " | AWAY" : "") + (search_visible() ? " | SEARCH" : "");
+        (!receive_view.at_bottom() ? " | AWAY" : "") +
+        (search_visible() ? " | SEARCH" : "");
     return panel_background(text(metrics) | color(theme::text),
                             theme::overlay) |
            size(HEIGHT, EQUAL, 1);
@@ -2806,8 +2622,8 @@ struct Tui::Impl {
       }
     } else if (mode == RouteMode::Modal) {
       add_action("Esc", "Back");
-      add_action(modal_kind == "quick-preview" ? "PgUp/PgDn" : "Enter",
-                 modal_kind == "quick-preview" ? "Read" : "Select");
+      add_action(modal.kind == ModalKind::QuickPreview ? "PgUp/PgDn" : "Enter",
+                 modal.kind == ModalKind::QuickPreview ? "Read" : "Select");
       if (width >= 70) {
         add_action("Tab", "Focus");
       }
@@ -2993,7 +2809,7 @@ struct Tui::Impl {
     if (mode == RouteMode::Search) {
       auto query =
           text(std::string{search_focus == SearchFocus::Query ? "> " : "  "} +
-               "Query: " + logging::sanitize_message(search_query));
+               "Query: " + lazycom::sanitize_message(search_editor.value));
       auto direction = text(
           std::string{search_focus == SearchFocus::Direction ? "> " : "  "} +
           "Direction: " + std::string{search_direction_text()});
@@ -3005,7 +2821,7 @@ struct Tui::Impl {
       return window(text(" Search ") | bold,
                     vbox({std::move(query), std::move(direction),
                           text("Matches: " +
-                               std::to_string(search_matches.size())),
+                               std::to_string(receive_view.match_count())),
                           text("Tab focus | Left/Right/Space direction | "
                                "Enter search | F3/Shift+F3 navigate | End "
                                "latest | Esc close") |
@@ -3014,7 +2830,7 @@ struct Tui::Impl {
     }
     if (mode == RouteMode::Modal) {
       Elements body;
-      if (modal_kind == "quick-preview") {
+      if (modal.kind == ModalKind::QuickPreview) {
         body.push_back(text(quick_preview_summary) | color(theme::gold));
         const auto end = preview_page_end(preview_offset, &body);
         body.push_back(text("Preview " + std::to_string(preview_offset) + ".." +
@@ -3022,45 +2838,49 @@ struct Tui::Impl {
                             std::to_string(quick_preview.size())) |
                        dim);
         body.push_back(text("PgUp/PgDn read | Home first | Esc back") | bold);
-      } else if (modal_options.empty()) {
-        const auto cursor = utf8_boundary_at_or_before(edit_value, edit_cursor);
+      } else if (modal.options.empty()) {
+        const auto cursor =
+            utf8_boundary_at_or_before(modal.editor.value, modal.editor.cursor);
         const auto begin = utf8_boundary_at_or_before(
-            edit_value, cursor - std::min(cursor, std::size_t{64U}));
+            modal.editor.value, cursor - std::min(cursor, std::size_t{64U}));
         const auto end = utf8_boundary_at_or_before(
-            edit_value, std::min(edit_value.size(), cursor + 64U));
+            modal.editor.value,
+            std::min(modal.editor.value.size(), cursor + 64U));
         body.push_back(
-            paragraph(
-                (begin == 0U ? "" : "...") +
-                logging::sanitize_message(std::string_view{edit_value}.substr(
-                    begin, cursor - begin)) +
-                "|" +
-                logging::sanitize_message(
-                    std::string_view{edit_value}.substr(cursor, end - cursor)) +
-                (end == edit_value.size() ? "" : "...")) |
+            paragraph((begin == 0U ? "" : "...") +
+                      lazycom::sanitize_message(
+                          std::string_view{modal.editor.value}.substr(
+                              begin, cursor - begin)) +
+                      "|" +
+                      lazycom::sanitize_message(
+                          std::string_view{modal.editor.value}.substr(
+                              cursor, end - cursor)) +
+                      (end == modal.editor.value.size() ? "" : "...")) |
             inverted);
         body.push_back(text("Cursor " + std::to_string(cursor) + "/" +
-                            std::to_string(edit_value.size()) + " bytes") |
+                            std::to_string(modal.editor.value.size()) +
+                            " bytes") |
                        dim);
       } else {
-        if (modal_kind == "f-run") {
+        if (modal.kind == ModalKind::QuickRun) {
           body.push_back(text(quick_preview_summary) | color(theme::gold));
           body.push_back(paragraph(short_value(quick_preview)));
         }
-        if (modal_kind == "P" && application->snapshot().scanning) {
+        if (modal.kind == ModalKind::Port && application->snapshot().scanning) {
           body.push_back(text("Scanning...") | color(theme::gold));
         }
-        const auto begin = selected_device > 8U ? selected_device - 8U : 0U;
-        const auto end = std::min(modal_options.size(), begin + 18U);
+        const auto begin = modal.selected > 8U ? modal.selected - 8U : 0U;
+        const auto end = std::min(modal.options.size(), begin + 18U);
         for (std::size_t index = begin; index < end; ++index) {
-          auto item = text((index == selected_device ? "> " : "  ") +
-                           logging::sanitize_message(modal_options[index]));
-          if (modal_kind == "P" &&
+          auto item = text((index == modal.selected ? "> " : "  ") +
+                           lazycom::sanitize_message(modal.options[index]));
+          if (modal.kind == ModalKind::Port &&
               index < application->snapshot().devices.size() &&
               application->snapshot().devices[index].permission.access ==
                   serial::DeviceAccess::PermissionDenied) {
             item |= color(theme::love);
           }
-          if (index == selected_device) {
+          if (index == modal.selected) {
             item |= bold;
             item |= inverted;
             item |= focus;
@@ -3069,10 +2889,10 @@ struct Tui::Impl {
         }
       }
       body.push_back(separator());
-      if (modal_kind != "quick-preview") {
+      if (modal.kind != ModalKind::QuickPreview) {
         body.push_back(text("Enter apply | Esc back | F1 help") | dim);
       }
-      return window(text(" " + modal_title + " ") | bold,
+      return window(text(" " + modal.title + " ") | bold,
                     vbox(std::move(body)) | yframe) |
              size(WIDTH, LESS_THAN,
                   std::min(88, std::max(Terminal::Size().dimx - 4, 1))) |

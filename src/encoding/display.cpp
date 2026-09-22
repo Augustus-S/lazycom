@@ -1,3 +1,4 @@
+#include <lazycom/base/text.hpp>
 #include <lazycom/encoding/display.hpp>
 
 #include <algorithm>
@@ -26,27 +27,6 @@ namespace {
     return 4U;
   }
   return 0U;
-}
-
-[[nodiscard]] bool valid_sequence(const std::span<const std::byte> bytes,
-                                  const std::size_t length) noexcept {
-  for (std::size_t index = 1U; index < length; ++index) {
-    const auto value = octet(bytes[index]);
-    if (value < 0x80U || value > 0xBFU) {
-      return false;
-    }
-  }
-  const auto first = octet(bytes[0]);
-  if (length >= 2U) {
-    const auto second = octet(bytes[1]);
-    if ((first == 0xE0U && second < 0xA0U) ||
-        (first == 0xEDU && second > 0x9FU) ||
-        (first == 0xF0U && second < 0x90U) ||
-        (first == 0xF4U && second > 0x8FU)) {
-      return false;
-    }
-  }
-  return true;
 }
 
 [[nodiscard]] bool invalid_prefix(const std::span<const std::byte> bytes,
@@ -78,8 +58,8 @@ decode(const std::span<const std::byte> bytes) noexcept {
   }
   value &= static_cast<std::uint32_t>(0x7FU >> length);
   for (std::size_t index = 1U; index < length; ++index) {
-    value = (value << 6U) |
-            static_cast<std::uint32_t>(octet(bytes[index]) & 0x3FU);
+    value =
+        (value << 6U) | static_cast<std::uint32_t>(octet(bytes[index]) & 0x3FU);
   }
   return value;
 }
@@ -163,7 +143,7 @@ std::string SafeUtf8Display::append(const std::span<const std::byte> bytes) {
       break;
     }
     const auto sequence = remaining.first(length);
-    if (!valid_sequence(sequence, length)) {
+    if (!is_strict_utf8(sequence)) {
       append_hex_escape(output, octet(pending_[consumed]));
       ++consumed;
       continue;

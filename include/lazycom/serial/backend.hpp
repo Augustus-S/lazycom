@@ -1,7 +1,7 @@
 #pragma once
 
 #include <lazycom/base/error.hpp>
-#include <lazycom/config/schema.hpp>
+#include <lazycom/config/types.hpp>
 
 #include <cstddef>
 #include <cstdint>

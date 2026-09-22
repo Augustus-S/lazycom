@@ -29,7 +29,6 @@ target_link_libraries(lazycom_tests
     lazycom_data_path
     lazycom_diagnostics
     lazycom_logging
-    lazycom_scheduler
     lazycom_serial
     lazycom_ui
     lazycom_project_options
@@ -58,6 +57,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_executable(lazycom_serial_backend_viability_tests
     integration/serial_backend_viability_test.cpp
     integration/serial_owner_pty_test.cpp
+  )
+  target_include_directories(lazycom_serial_backend_viability_tests
+    PRIVATE "${PROJECT_SOURCE_DIR}/tests"
   )
   target_compile_definitions(lazycom_serial_backend_viability_tests
     PRIVATE CATCH_CONFIG_NO_COUNTER _GNU_SOURCE

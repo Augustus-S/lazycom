@@ -1,5 +1,5 @@
-#include <lazycom/app/signals.hpp>
 #include <lazycom/base/ids.hpp>
+#include <lazycom/base/worker_signals.hpp>
 #include <lazycom/diagnostics/diagnostics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -15,7 +15,6 @@
 #include <vector>
 
 using namespace lazycom;
-using namespace lazycom::app;
 
 static_assert([] {
   ConnectionGeneration generation{41};
@@ -77,35 +76,4 @@ TEST_CASE("concurrent and later fatal publishers preserve exactly one winner",
   CHECK(slot.load()->worker == WorkerKind::Serial);
   CHECK(slot.load()->code == ErrorCode::InternalInvariantBroken);
   CHECK(slot.additional_count() == publisher_count);
-}
-
-TEST_CASE("worker trampoline separates normal exceptions from fatal failures",
-          "[signals]") {
-  const auto normal = run_worker_trampoline(
-      WorkerKind::Scanner, Operation::EnumerateDevices,
-      [] { throw std::runtime_error("enumeration failed"); },
-      ErrorCode::DiagnosticsUnavailable);
-  REQUIRE(normal.has_error());
-  REQUIRE_FALSE(normal.is_fatal());
-  REQUIRE(normal.error->detail == "enumeration failed");
-  REQUIRE(normal.stopped.reason == WorkerExitReason::RecoverableError);
-
-  const auto oom =
-      run_worker_trampoline(WorkerKind::Persistence, Operation::SaveConfig,
-                            [] { throw std::bad_alloc{}; });
-  REQUIRE(oom.is_fatal());
-  REQUIRE_FALSE(oom.has_error());
-  REQUIRE(oom.fatal->reason == FatalReason::OutOfMemory);
-  REQUIRE(oom.fatal->code == ErrorCode::InternalOutOfMemory);
-
-  const auto unknown = run_worker_trampoline(
-      WorkerKind::Serial, Operation::ReadSerial, [] { throw 7; });
-  REQUIRE(unknown.is_fatal());
-  REQUIRE(unknown.fatal->reason == FatalReason::UnknownException);
-
-  const auto completed = run_worker_trampoline(
-      WorkerKind::Diagnostics, Operation::WriteSessionLog, [] {});
-  REQUIRE_FALSE(completed.is_fatal());
-  REQUIRE_FALSE(completed.has_error());
-  REQUIRE(completed.stopped.reason == WorkerExitReason::Completed);
 }

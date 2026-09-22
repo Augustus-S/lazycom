@@ -82,7 +82,7 @@ struct DeviceScanner::Impl {
   }
 
   void thread_main(const std::stop_token token) noexcept {
-    app::WorkerExitReason reason = app::WorkerExitReason::Completed;
+    WorkerExitReason reason = WorkerExitReason::Completed;
     try {
       const std::stop_callback stop_wakeup(token,
                                            [this] { condition.notify_all(); });
@@ -111,11 +111,11 @@ struct DeviceScanner::Impl {
         completion.generation = request.generation;
         if (token.stop_requested() ||
             stop_requested.load(std::memory_order_acquire)) {
-          completion.outcome = app::OperationOutcome::Cancelled;
+          completion.outcome = OperationOutcome::Cancelled;
         } else if (devices) {
           completion.devices = std::move(*devices);
         } else {
-          completion.outcome = app::OperationOutcome::Failed;
+          completion.outcome = OperationOutcome::Failed;
           completion.error = std::move(devices.error());
         }
         {
@@ -133,15 +133,15 @@ struct DeviceScanner::Impl {
     } catch (const std::bad_alloc &) {
       static_cast<void>(fatal.publish(
           {ErrorCode::InternalOutOfMemory, Operation::EnumerateDevices,
-           app::WorkerKind::Scanner, app::FatalReason::OutOfMemory,
-           app::SignalSourceLocation::current()}));
-      reason = app::WorkerExitReason::Fatal;
+           WorkerKind::Scanner, FatalReason::OutOfMemory,
+           SignalSourceLocation::current()}));
+      reason = WorkerExitReason::Fatal;
     } catch (...) {
       static_cast<void>(fatal.publish(
           {ErrorCode::InternalInvariantBroken, Operation::EnumerateDevices,
-           app::WorkerKind::Scanner, app::FatalReason::UnknownException,
-           app::SignalSourceLocation::current()}));
-      reason = app::WorkerExitReason::Fatal;
+           WorkerKind::Scanner, FatalReason::UnknownException,
+           SignalSourceLocation::current()}));
+      reason = WorkerExitReason::Fatal;
     }
 
     {
@@ -149,12 +149,11 @@ struct DeviceScanner::Impl {
       const auto cancel = [this](const ScanRequest &request) {
         auto *const slot = find_slot(request.operation_id);
         if (slot != nullptr && !slot->completion) {
-          slot->completion.emplace(
-              ScanCompletion{request.operation_id,
-                             request.generation,
-                             app::OperationOutcome::Cancelled,
-                             {},
-                             std::nullopt});
+          slot->completion.emplace(ScanCompletion{request.operation_id,
+                                                  request.generation,
+                                                  OperationOutcome::Cancelled,
+                                                  {},
+                                                  std::nullopt});
           slot->completion_order = ++last_completion_order;
         }
       };
@@ -167,8 +166,7 @@ struct DeviceScanner::Impl {
       }
       requests.clear();
     }
-    stopped = {app::WorkerKind::Scanner, app::WorkerLifecycle::AtReturnPoint,
-               reason};
+    stopped = {WorkerKind::Scanner, WorkerLifecycle::AtReturnPoint, reason};
     stopped_ready.store(true, std::memory_order_release);
     condition.notify_all();
     notify_ui();
@@ -185,8 +183,8 @@ struct DeviceScanner::Impl {
   std::atomic_bool stop_requested{false};
   std::atomic_bool stopped_ready{false};
   std::atomic_bool ui_wakeup_pending{false};
-  app::FatalSignalSlot fatal;
-  app::WorkerStoppedSignal stopped{};
+  FatalSignalSlot fatal;
+  WorkerStoppedSignal stopped{};
   UiWakeCallback wake_callback{};
   void *wake_context{};
   std::jthread worker;
@@ -311,11 +309,11 @@ bool DeviceScanner::wait_until_stopped(
   }
 }
 
-std::optional<app::FatalSignal> DeviceScanner::fatal_signal() const noexcept {
+std::optional<FatalSignal> DeviceScanner::fatal_signal() const noexcept {
   return impl_->fatal.load();
 }
 
-std::optional<app::WorkerStoppedSignal>
+std::optional<WorkerStoppedSignal>
 DeviceScanner::worker_stopped_signal() const noexcept {
   if (!impl_->stopped_ready.load(std::memory_order_acquire)) {
     return std::nullopt;

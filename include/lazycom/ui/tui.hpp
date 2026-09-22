@@ -1,7 +1,5 @@
 #pragma once
 
-#include <lazycom/app/application.hpp>
-
 #include <cstddef>
 #include <cstdint>
 #include <memory>

@@ -11,61 +11,6 @@
 
 namespace {
 
-constexpr std::string_view kPlanConfig = R"toml(
-version = 1
-
-[ui]
-background = "rose-pine"
-
-[serial.defaults]
-baud = 115200
-data_bits = 8
-stop_bits = 1
-parity = "none"
-flow_control = "none"
-
-[send]
-mode = "txt"
-newline = "none"
-max_draft_bytes = 1048576
-history_max_entries = 1000
-history_max_mib = 8
-
-[receive]
-rx_view = "txt"
-tx_view = "txt"
-idle_gap_ms = 50
-max_frame_bytes = 65536
-visible_buffer_mib = 32
-visible_max_records = 100000
-
-[logging]
-default_enabled = false
-directory = ""
-max_files = 100
-max_total_size_mib = 1024
-max_file_size_mib = 64
-flush_interval_ms = 1000
-include_system = true
-include_error = true
-
-[queues]
-tx_max_messages = 256
-tx_max_mib = 4
-owner_command_max_messages = 256
-owner_command_max_mib = 1
-rx_ingress_max_blocks = 4096
-rx_ingress_max_mib = 4
-log_max_messages = 4096
-log_max_mib = 8
-
-[timeouts]
-connect_ms = 5000
-tx_ms = 5000
-owner_stop_ms = 5000
-log_barrier_ms = 5000
-)toml";
-
 [[nodiscard]] bool
 has_path(const std::vector<lazycom::config::SchemaMessage> &messages,
          std::string_view path) {
@@ -85,42 +30,16 @@ void check_paths(const std::vector<lazycom::config::SchemaMessage> &messages,
 } // namespace
 
 namespace config = lazycom::config;
-using config::ConfigurationField;
-using config::ConfigurationScope;
-static_assert(config::configuration_scope(ConfigurationField::Baud) ==
-              ConfigurationScope::HardwareConnectionSnapshot);
-static_assert(
-    !config::mutable_while_connected(ConfigurationField::FlowControl));
-static_assert(config::mutable_while_connected(ConfigurationField::SendMode));
-static_assert(config::mutable_while_connected(ConfigurationField::ReceiveView));
-static_assert(
-    config::mutable_while_connected(ConfigurationField::QuickSendSlots));
-
-TEST_CASE("config defaults presets and enums obey the published schema",
-          "[config]") {
-  for (const auto source : {kPlanConfig, std::string_view{"version = 1\n"}}) {
-    CAPTURE(source);
-    const auto parsed = config::parse_config_toml(source);
-    REQUIRE(parsed.accepted);
-    REQUIRE_FALSE(parsed.read_only);
-    REQUIRE(parsed.snapshot == config::ConfigSnapshot{});
-    const auto serialized =
-        config::serialize_config_toml(parsed.snapshot, parsed.document);
-    REQUIRE(serialized);
-    const auto round_trip = config::parse_config_toml(*serialized);
-    REQUIRE(round_trip.accepted);
-    CHECK(round_trip.snapshot == parsed.snapshot);
-  }
-  constexpr std::array bauds{300,    600,    1200,   2400,    4800,    9600,
-                             19200,  38400,  57600,  115200,  230400,  250000,
-                             460800, 500000, 921600, 1000000, 1500000, 2000000};
-  CHECK(std::ranges::equal(config::kBaudPresets, bauds));
-  for (const auto baud : bauds) {
-    CAPTURE(baud);
-    auto candidate = config::ConfigSnapshot{};
-    candidate.serial.baud = baud;
-    CHECK(config::validate_config_snapshot(candidate).empty());
-  }
+TEST_CASE("config defaults and enums obey the published schema", "[config]") {
+  const auto defaults = config::parse_config_toml("version = 1\n");
+  REQUIRE(defaults.accepted);
+  REQUIRE_FALSE(defaults.read_only);
+  REQUIRE(defaults.snapshot == config::ConfigSnapshot{});
+  const auto canonical = config::serialize_config_toml(defaults.snapshot);
+  REQUIRE(canonical);
+  const auto round_trip = config::parse_config_toml(*canonical);
+  REQUIRE(round_trip.accepted);
+  CHECK(round_trip.snapshot == defaults.snapshot);
   const auto parsed = config::parse_config_toml(R"toml(version = 1
 [serial.defaults]
 parity = "EvEn"

@@ -1,3 +1,4 @@
+#include <lazycom/scheduler/scheduler.hpp>
 #include <lazycom/serial/service.hpp>
 
 #include <algorithm>
@@ -97,11 +98,14 @@ template <class Integer>
           .tv_nsec = static_cast<long>(nanoseconds.count())};
 }
 
+enum class OperationClass : std::uint8_t { Normal, Tx, Control };
+
 enum class MailboxKind : std::uint8_t {
   Connect,
   Tx,
   Disconnect,
   TaskStop,
+  TaskStart,
 };
 
 struct CompletionSlot {
@@ -121,7 +125,7 @@ public:
       : normal_(normal), tx_(tx), control_(control) {}
 
   [[nodiscard]] bool reserve(const OperationId operation_id,
-                             const app::OperationClass operation_class,
+                             const OperationClass operation_class,
                              const MailboxKind kind) noexcept {
     if (!valid(operation_id) || find(operation_id) != nullptr) {
       return false;
@@ -185,6 +189,13 @@ public:
     return result;
   }
 
+  [[nodiscard]] std::size_t pending_tx_count() const noexcept {
+    return static_cast<std::size_t>(
+        std::count_if(tx_.begin(), tx_.end(), [](const CompletionSlot &slot) {
+          return slot.reserved && !slot.completion;
+        }));
+  }
+
   [[nodiscard]] bool has_completed() const noexcept {
     return completed_count() != 0;
   }
@@ -201,6 +212,8 @@ private:
             return MailboxKind::Tx;
           } else if constexpr (std::is_same_v<Value, DisconnectCompletion>) {
             return MailboxKind::Disconnect;
+          } else if constexpr (std::is_same_v<Value, TaskStartCompletion>) {
+            return MailboxKind::TaskStart;
           } else {
             return MailboxKind::TaskStop;
           }
@@ -209,11 +222,11 @@ private:
   }
 
   [[nodiscard]] std::vector<CompletionSlot> &
-  select(const app::OperationClass operation_class) noexcept {
-    if (operation_class == app::OperationClass::Tx) {
+  select(const OperationClass operation_class) noexcept {
+    if (operation_class == OperationClass::Tx) {
       return tx_;
     }
-    if (operation_class == app::OperationClass::Control) {
+    if (operation_class == OperationClass::Control) {
       return control_;
     }
     return normal_;
@@ -278,6 +291,7 @@ struct QueuedTx {
   std::size_t charged_bytes{};
   std::array<std::size_t, 2> terminal_slots{kNoReservedSlot, kNoReservedSlot};
   Observation last_write{};
+  std::optional<scheduler::ScheduledRequestToken> scheduled_token;
 };
 
 [[nodiscard]] std::size_t
@@ -326,7 +340,7 @@ struct SerialService::Impl {
        const UiWakeCallback callback, void *const callback_context)
       : backend(std::move(serial_backend)), options(service_options),
         wake_fd(event_fd),
-        mailbox(options.command_max_messages, options.tx_max_messages, 3U),
+        mailbox(options.command_max_messages, options.tx_max_messages, 4U),
         wake_callback(callback), wake_context(callback_context) {
     reserved_events.resize(options.command_max_messages +
                            options.tx_max_messages * 2U + 2U);
@@ -416,6 +430,84 @@ struct SerialService::Impl {
     }
   }
 
+  Result<OperationId> admit_tx(
+      TxRequest request,
+      std::optional<scheduler::ScheduledRequestToken> token = std::nullopt) {
+    const auto operation_id = request.command.operation_id;
+    const std::size_t payload_size = request.payload.size();
+    const std::size_t bytes =
+        saturated_add(sizeof(QueuedTx), request.payload.capacity());
+    operation_ids.observe(operation_id);
+    std::lock_guard lock(mutex);
+    if (!valid(operation_id) || !valid(request.command.generation) ||
+        !valid(request.command.session_id) || payload_size == 0U ||
+        payload_size > config::kMaximumPayloadBytes) {
+      return tl::unexpected(submission_error(
+          "invalid serial TX request", Operation::WriteSerial, operation_id));
+    }
+    if (stop_requested.load(std::memory_order_acquire)) {
+      return tl::unexpected(submission_error(
+          "serial service is stopping", Operation::WriteSerial, operation_id));
+    }
+    if (!connected || disconnecting ||
+        generation != request.command.generation ||
+        session_id != request.command.session_id) {
+      return tl::unexpected(submission_error("stale or disconnected TX session",
+                                             Operation::WriteSerial,
+                                             operation_id));
+    }
+    if (request.command.task_generation && stop_task &&
+        stop_task->generation == *request.command.task_generation) {
+      return tl::unexpected(submission_error(
+          "serial task is stopping", Operation::WriteSerial, operation_id));
+    }
+    if (tx_messages >= options.tx_max_messages ||
+        bytes >
+            options.tx_max_bytes - std::min(tx_bytes, options.tx_max_bytes)) {
+      return tl::unexpected(submission_error(
+          "serial TX queue is full", Operation::WriteSerial, operation_id));
+    }
+    // Two terminal data slots cover the accepted TX prefix plus a following
+    // ERR. They are reserved with completion capacity before the request is
+    // visible.
+    if (!mailbox.reserve(operation_id, OperationClass::Tx, MailboxKind::Tx)) {
+      return tl::unexpected(submission_error(
+          "TX completion capacity is full or operation is duplicate",
+          Operation::WriteSerial, operation_id));
+    }
+    const std::array terminal_slots{take_tx_slot_locked(),
+                                    take_tx_slot_locked()};
+    if (terminal_slots[0] == kNoReservedSlot ||
+        terminal_slots[1] == kNoReservedSlot) {
+      release_reserved_slot_locked(terminal_slots[0]);
+      release_reserved_slot_locked(terminal_slots[1]);
+      mailbox.cancel(operation_id);
+      return tl::unexpected(
+          submission_error("TX terminal capacity is unavailable",
+                           Operation::WriteSerial, operation_id));
+    }
+    try {
+      tx_queue.push_back(QueuedTx{std::move(request),
+                                  std::nullopt,
+                                  0U,
+                                  bytes,
+                                  terminal_slots,
+                                  {},
+                                  token});
+    } catch (...) {
+      release_reserved_slot_locked(terminal_slots[0]);
+      release_reserved_slot_locked(terminal_slots[1]);
+      mailbox.cancel(operation_id);
+      return tl::unexpected(make_error(
+          ErrorCode::InternalOutOfMemory, Operation::WriteSerial,
+          "cannot enqueue TX operation", {}, std::nullopt, operation_id));
+    }
+    ++tx_messages;
+    tx_bytes += bytes;
+    wake_owner();
+    return operation_id;
+  }
+
   void start() {
     worker = std::jthread(
         [this](const std::stop_token token) { thread_main(token); });
@@ -461,30 +553,28 @@ struct SerialService::Impl {
       accepted = mailbox.complete(std::move(value));
     }
     if (!accepted) {
-      publish_fatal(app::FatalReason::InvariantBroken,
-                    Operation::CoordinateFatal);
+      publish_fatal(FatalReason::InvariantBroken, Operation::CoordinateFatal);
       return false;
     }
     notify_ui();
     return true;
   }
 
-  void publish_fatal(const app::FatalReason reason,
+  void publish_fatal(const FatalReason reason,
                      const Operation operation) noexcept {
-    const auto code = reason == app::FatalReason::OutOfMemory
+    const auto code = reason == FatalReason::OutOfMemory
                           ? ErrorCode::InternalOutOfMemory
                           : ErrorCode::InternalInvariantBroken;
-    static_cast<void>(
-        fatal.publish({code, operation, app::WorkerKind::Serial, reason,
-                       app::SignalSourceLocation::current()}));
+    static_cast<void>(fatal.publish({code, operation, WorkerKind::Serial,
+                                     reason, SignalSourceLocation::current()}));
     notify_ui();
   }
 
-  void publish_stopped(const app::WorkerExitReason reason) noexcept {
+  void publish_stopped(const WorkerExitReason reason) noexcept {
     {
       std::lock_guard lock(mutex);
-      stopped_signal = {app::WorkerKind::Serial,
-                        app::WorkerLifecycle::AtReturnPoint, reason};
+      stopped_signal = {WorkerKind::Serial, WorkerLifecycle::AtReturnPoint,
+                        reason};
       stopped_ready.store(true, std::memory_order_release);
     }
     stopped_cv.notify_all();
@@ -492,7 +582,7 @@ struct SerialService::Impl {
   }
 
   void thread_main(const std::stop_token token) noexcept {
-    app::WorkerExitReason exit_reason = app::WorkerExitReason::Completed;
+    WorkerExitReason exit_reason = WorkerExitReason::Completed;
     try {
       const std::stop_callback stop_wakeup(token, [this] {
         stop_requested.store(true, std::memory_order_release);
@@ -500,17 +590,16 @@ struct SerialService::Impl {
       });
       owner_loop();
       if (fatal.load()) {
-        exit_reason = app::WorkerExitReason::Fatal;
+        exit_reason = WorkerExitReason::Fatal;
       }
     } catch (const std::bad_alloc &) {
       settle_after_exception();
-      publish_fatal(app::FatalReason::OutOfMemory, Operation::CoordinateFatal);
-      exit_reason = app::WorkerExitReason::Fatal;
+      publish_fatal(FatalReason::OutOfMemory, Operation::CoordinateFatal);
+      exit_reason = WorkerExitReason::Fatal;
     } catch (...) {
       settle_after_exception();
-      publish_fatal(app::FatalReason::UnknownException,
-                    Operation::CoordinateFatal);
-      exit_reason = app::WorkerExitReason::Fatal;
+      publish_fatal(FatalReason::UnknownException, Operation::CoordinateFatal);
+      exit_reason = WorkerExitReason::Fatal;
     }
     publish_stopped(exit_reason);
   }
@@ -555,6 +644,8 @@ struct SerialService::Impl {
       }
       activate_tx();
       process_tx_deadline();
+      process_scheduler();
+      activate_tx();
 
       const auto now = Clock::now();
       std::array<pollfd, 2> wait_set{};
@@ -633,6 +724,10 @@ struct SerialService::Impl {
     if (tx_retry_at && (!result || *tx_retry_at < *result)) {
       result = tx_retry_at;
     }
+    if (const auto task_deadline = task_scheduler.next_deadline();
+        task_deadline && (!result || *task_deadline < *result)) {
+      result = task_deadline;
+    }
     return result;
   }
 
@@ -648,13 +743,12 @@ struct SerialService::Impl {
 
     const auto &request = active_connect->request;
     if (Clock::now() - active_connect->accepted_at >= options.connect_timeout) {
-      finish_active_connect_failure(app::OperationOutcome::TimedOut,
-                                    std::nullopt);
+      finish_active_connect_failure(OperationOutcome::TimedOut, std::nullopt);
       return;
     }
     auto opened = backend->open(request.path, request.config);
     if (!opened) {
-      finish_active_connect_failure(app::OperationOutcome::Failed,
+      finish_active_connect_failure(OperationOutcome::Failed,
                                     std::move(opened.error()));
       return;
     }
@@ -664,13 +758,12 @@ struct SerialService::Impl {
       Error error = wait_handle.error();
       static_cast<void>(backend->close());
       port_open = false;
-      finish_active_connect_failure(app::OperationOutcome::Failed,
-                                    std::move(error));
+      finish_active_connect_failure(OperationOutcome::Failed, std::move(error));
       return;
     }
     serial_fd = *wait_handle;
 
-    std::optional<app::CancelConnectCommand> cancellation;
+    std::optional<CancelConnectCommand> cancellation;
     {
       std::lock_guard lock(mutex);
       if (cancel_connect &&
@@ -682,14 +775,14 @@ struct SerialService::Impl {
         Clock::now() - active_connect->accepted_at >= options.connect_timeout) {
       const auto outcome =
           cancellation || stop_requested.load(std::memory_order_acquire)
-              ? app::OperationOutcome::Cancelled
-              : app::OperationOutcome::TimedOut;
+              ? OperationOutcome::Cancelled
+              : OperationOutcome::TimedOut;
       static_cast<void>(backend->close());
       port_open = false;
       serial_fd = -1;
       finish_active_connect_failure(outcome, std::nullopt);
       if (cancellation) {
-        finish_cancel(*cancellation, app::OperationOutcome::Succeeded);
+        finish_cancel(*cancellation, OperationOutcome::Succeeded);
         std::lock_guard lock(mutex);
         cancel_connect.reset();
       }
@@ -701,10 +794,9 @@ struct SerialService::Impl {
       static_cast<void>(backend->close());
       port_open = false;
       serial_fd = -1;
-      publish_fatal(app::FatalReason::InvariantBroken,
-                    Operation::CoordinateFatal);
+      publish_fatal(FatalReason::InvariantBroken, Operation::CoordinateFatal);
       finish_active_connect_failure(
-          app::OperationOutcome::Failed,
+          OperationOutcome::Failed,
           invariant_error("session identifier exhausted",
                           Operation::OpenSerial));
       return;
@@ -724,16 +816,15 @@ struct SerialService::Impl {
     }
     static_cast<void>(complete(ConnectCompletion{
         request.command.operation_id, request.command.generation, session,
-        app::OperationOutcome::Succeeded, std::nullopt, established.observed_at,
+        OperationOutcome::Succeeded, std::nullopt, established.observed_at,
         established.time_utc}));
     active_connect.reset();
   }
 
-  void finish_active_connect_failure(const app::OperationOutcome outcome,
+  void finish_active_connect_failure(const OperationOutcome outcome,
                                      std::optional<Error> error) {
     if (!active_connect) {
-      publish_fatal(app::FatalReason::InvariantBroken,
-                    Operation::CoordinateFatal);
+      publish_fatal(FatalReason::InvariantBroken, Operation::CoordinateFatal);
       return;
     }
     finish_connect_failure(*active_connect, outcome, std::move(error));
@@ -741,7 +832,7 @@ struct SerialService::Impl {
   }
 
   void finish_connect_failure(QueuedConnect &command,
-                              const app::OperationOutcome outcome,
+                              const OperationOutcome outcome,
                               std::optional<Error> error) {
     {
       std::lock_guard lock(mutex);
@@ -766,9 +857,9 @@ struct SerialService::Impl {
   }
 
   void process_controls() {
-    std::optional<app::CancelConnectCommand> cancellation;
-    std::optional<app::DisconnectCommand> disconnection;
-    std::optional<app::StopTaskCommand> task_stop;
+    std::optional<CancelConnectCommand> cancellation;
+    std::optional<DisconnectCommand> disconnection;
+    std::optional<StopTaskCommand> task_stop;
     std::optional<QueuedConnect> cancelled_queued_connect;
     {
       std::lock_guard lock(mutex);
@@ -804,10 +895,10 @@ struct SerialService::Impl {
       static_cast<void>(complete(ConnectCompletion{
           cancelled_queued_connect->request.command.operation_id,
           cancelled_queued_connect->request.command.generation, std::nullopt,
-          app::OperationOutcome::Cancelled, std::nullopt}));
+          OperationOutcome::Cancelled, std::nullopt}));
     }
     if (cancellation) {
-      finish_cancel(*cancellation, app::OperationOutcome::Succeeded);
+      finish_cancel(*cancellation, OperationOutcome::Succeeded);
       std::lock_guard lock(mutex);
       cancel_connect.reset();
     }
@@ -821,16 +912,16 @@ struct SerialService::Impl {
       std::lock_guard lock(mutex);
       disconnect.reset();
     }
+    process_task_start();
   }
 
-  void stop_task_barrier(const app::StopTaskCommand &command) {
+  void cancel_task_tx(TaskGeneration target) {
     const auto observation = observe();
-    if (active_tx &&
-        active_tx->request.command.task_generation == command.generation) {
+    if (active_tx && active_tx->request.command.task_generation == target) {
       auto cancelled = std::move(*active_tx);
       active_tx.reset();
       reset_tx_backoff();
-      finish_tx(std::move(cancelled), app::OperationOutcome::Cancelled, nullptr,
+      finish_tx(std::move(cancelled), OperationOutcome::Cancelled, nullptr,
                 observation);
     }
     while (true) {
@@ -839,8 +930,7 @@ struct SerialService::Impl {
         std::lock_guard lock(mutex);
         const auto found = std::find_if(
             tx_queue.begin(), tx_queue.end(), [&](const QueuedTx &request) {
-              return request.request.command.task_generation ==
-                     command.generation;
+              return request.request.command.task_generation == target;
             });
         if (found != tx_queue.end()) {
           cancelled.emplace(std::move(*found));
@@ -850,16 +940,13 @@ struct SerialService::Impl {
       if (!cancelled) {
         break;
       }
-      finish_tx(std::move(*cancelled), app::OperationOutcome::Cancelled,
-                nullptr, observation);
+      finish_tx(std::move(*cancelled), OperationOutcome::Cancelled, nullptr,
+                observation);
     }
-    static_cast<void>(
-        complete(TaskStopCompletion{command.operation_id, command.generation,
-                                    app::OperationOutcome::Succeeded}));
   }
 
-  void finish_cancel(const app::CancelConnectCommand &command,
-                     const app::OperationOutcome outcome) {
+  void finish_cancel(const CancelConnectCommand &command,
+                     const OperationOutcome outcome) {
     static_cast<void>(
         complete(DisconnectCompletion{command.operation_id, command.generation,
                                       std::nullopt, outcome, std::nullopt}));
@@ -893,7 +980,7 @@ struct SerialService::Impl {
       auto timed_out = std::move(*active_tx);
       active_tx.reset();
       reset_tx_backoff();
-      finish_tx(std::move(timed_out), app::OperationOutcome::TimedOut);
+      finish_tx(std::move(timed_out), OperationOutcome::TimedOut);
       activate_tx();
     }
   }
@@ -918,8 +1005,12 @@ struct SerialService::Impl {
     }
     std::lock_guard lock(mutex);
     return disconnect.has_value() ||
+           (generation_to_check && start_task &&
+            start_task->expected_replacement == generation_to_check) ||
            (generation_to_check && stop_task &&
-            stop_task->generation == *generation_to_check);
+            (stop_task->generation == *generation_to_check ||
+             (stop_task->starting_operation &&
+              stop_task->starting_operation == active_task_start)));
   }
 
   void write_ready() {
@@ -947,7 +1038,7 @@ struct SerialService::Impl {
         auto failed = std::move(request);
         active_tx.reset();
         reset_tx_backoff();
-        finish_tx(std::move(failed), app::OperationOutcome::Failed, &error,
+        finish_tx(std::move(failed), OperationOutcome::Failed, &error,
                   observation);
         handle_fault(make_error(ErrorCode::SerialDeviceGone,
                                 Operation::WriteSerial,
@@ -972,46 +1063,46 @@ struct SerialService::Impl {
       if (request.offset == request.request.payload.size()) {
         auto completed = std::move(request);
         active_tx.reset();
-        finish_tx(std::move(completed), app::OperationOutcome::Succeeded);
+        finish_tx(std::move(completed), OperationOutcome::Succeeded);
         activate_tx();
       }
     }
   }
 
-  void terminal_failure(const app::FatalReason reason) noexcept {
+  void terminal_failure(const FatalReason reason) noexcept {
     stop_requested.store(true, std::memory_order_release);
     publish_fatal(reason, Operation::CoordinateFatal);
   }
 
-  void finish_tx(QueuedTx request, const app::OperationOutcome outcome,
+  void finish_tx(QueuedTx request, const OperationOutcome outcome,
                  const Error *const source_error = nullptr,
                  const Observation observation = observe()) noexcept {
     std::optional<Error> error;
     try {
       if (source_error != nullptr) {
         error = *source_error;
-      } else if (outcome == app::OperationOutcome::TimedOut) {
+      } else if (outcome == OperationOutcome::TimedOut) {
         error =
             make_error(ErrorCode::SerialOperationTimedOut,
                        Operation::WriteSerial, "serial TX operation timed out",
                        {}, request.request.command.session_id,
                        request.request.command.operation_id);
-      } else if (outcome == app::OperationOutcome::Cancelled) {
+      } else if (outcome == OperationOutcome::Cancelled) {
         error = make_error(ErrorCode::SerialOperationCancelled,
                            Operation::WriteSerial,
                            "serial TX operation was cancelled", {},
                            request.request.command.session_id,
                            request.request.command.operation_id);
-      } else if (outcome == app::OperationOutcome::Failed) {
+      } else if (outcome == OperationOutcome::Failed) {
         error = make_error(ErrorCode::SerialDeviceGone, Operation::WriteSerial,
                            "serial TX operation failed", {},
                            request.request.command.session_id,
                            request.request.command.operation_id);
       }
     } catch (const std::bad_alloc &) {
-      terminal_failure(app::FatalReason::OutOfMemory);
+      terminal_failure(FatalReason::OutOfMemory);
     } catch (...) {
-      terminal_failure(app::FatalReason::UnknownException);
+      terminal_failure(FatalReason::UnknownException);
     }
     if (error) {
       if (!error->session_id) {
@@ -1022,6 +1113,16 @@ struct SerialService::Impl {
       }
     }
 
+    task_scheduler.on_deadline(observation.observed_at, true);
+    if (request.scheduled_token) {
+      scheduler::TxBoundary boundary;
+      boundary.completed_request = request.scheduled_token;
+      boundary.completed_successfully = outcome == OperationOutcome::Succeeded;
+      boundary.manual_pending = true;
+      static_cast<void>(
+          task_scheduler.on_tx_boundary(observation.observed_at, boundary));
+    }
+    publish_task_snapshot();
     const bool charge_retained =
         publish_tx_terminal(request, error, observation);
     if (!charge_retained) {
@@ -1053,10 +1154,10 @@ struct SerialService::Impl {
         accepted->bytes = std::move(request.request.payload);
       }
     } catch (const std::bad_alloc &) {
-      terminal_failure(app::FatalReason::OutOfMemory);
+      terminal_failure(FatalReason::OutOfMemory);
       accepted.reset();
     } catch (...) {
-      terminal_failure(app::FatalReason::UnknownException);
+      terminal_failure(FatalReason::UnknownException);
       accepted.reset();
     }
 
@@ -1072,10 +1173,10 @@ struct SerialService::Impl {
         terminal->time_utc = observation.time_utc;
         terminal->error = error;
       } catch (const std::bad_alloc &) {
-        terminal_failure(app::FatalReason::OutOfMemory);
+        terminal_failure(FatalReason::OutOfMemory);
         terminal.reset();
       } catch (...) {
-        terminal_failure(app::FatalReason::UnknownException);
+        terminal_failure(FatalReason::UnknownException);
         terminal.reset();
       }
     }
@@ -1108,8 +1209,8 @@ struct SerialService::Impl {
                std::numeric_limits<std::uint64_t>::max() - next_data_order)) {
         static_cast<void>(fatal.publish(
             {ErrorCode::InternalInvariantBroken, Operation::CoordinateFatal,
-             app::WorkerKind::Serial, app::FatalReason::InvariantBroken,
-             app::SignalSourceLocation::current()}));
+             WorkerKind::Serial, FatalReason::InvariantBroken,
+             SignalSourceLocation::current()}));
         stop_requested.store(true, std::memory_order_release);
       } else if (event_count != 0U) {
         std::size_t slot_offset = 0U;
@@ -1216,8 +1317,8 @@ struct SerialService::Impl {
                 std::numeric_limits<std::size_t>::max() - retained_data_bytes) {
           static_cast<void>(fatal.publish(
               {ErrorCode::InternalInvariantBroken, Operation::CoordinateFatal,
-               app::WorkerKind::Serial, app::FatalReason::InvariantBroken,
-               app::SignalSourceLocation::current()}));
+               WorkerKind::Serial, FatalReason::InvariantBroken,
+               SignalSourceLocation::current()}));
           stop_requested.store(true, std::memory_order_release);
           return false;
         }
@@ -1243,10 +1344,9 @@ struct SerialService::Impl {
 
   void handle_fault_locked(Error error) {
     // Called only to publish the fixed fatal slot while mutex is held.
-    static_cast<void>(
-        fatal.publish({error.code, error.operation, app::WorkerKind::Serial,
-                       app::FatalReason::InvariantBroken,
-                       app::SignalSourceLocation::current()}));
+    static_cast<void>(fatal.publish(
+        {error.code, error.operation, WorkerKind::Serial,
+         FatalReason::InvariantBroken, SignalSourceLocation::current()}));
   }
 
   void handle_fault(Error error, const bool tx_error_already_published = false,
@@ -1254,6 +1354,7 @@ struct SerialService::Impl {
     if (!port_open) {
       return;
     }
+    invalidate_tasks();
     std::optional<ConnectionGeneration> fault_generation;
     std::optional<SessionId> fault_session;
     std::optional<std::size_t> cleanup_slot;
@@ -1266,7 +1367,7 @@ struct SerialService::Impl {
       connecting = false;
       disconnecting = true;
     }
-    cancel_all_tx(app::OperationOutcome::Failed, &error, observation);
+    cancel_all_tx(OperationOutcome::Failed, &error, observation);
     const Status closed = backend->close();
     const auto close_observation = observe();
     port_open = false;
@@ -1296,7 +1397,7 @@ struct SerialService::Impl {
     }
   }
 
-  void cancel_all_tx(const app::OperationOutcome outcome,
+  void cancel_all_tx(const OperationOutcome outcome,
                      const Error *const error = nullptr,
                      const Observation observation = observe()) {
     if (active_tx) {
@@ -1321,7 +1422,8 @@ struct SerialService::Impl {
     }
   }
 
-  void disconnect_barrier(const app::DisconnectCommand &command) {
+  void disconnect_barrier(const DisconnectCommand &command) {
+    invalidate_tasks();
     std::optional<ConnectionGeneration> old_generation;
     std::optional<SessionId> old_session;
     std::optional<std::size_t> cleanup_slot;
@@ -1332,7 +1434,7 @@ struct SerialService::Impl {
       cleanup_slot = active_cleanup_slot;
       connected = false;
     }
-    cancel_all_tx(app::OperationOutcome::Cancelled);
+    cancel_all_tx(OperationOutcome::Cancelled);
     Status close_status;
     if (port_open) {
       close_status = backend->close();
@@ -1360,8 +1462,7 @@ struct SerialService::Impl {
     }
     static_cast<void>(complete(DisconnectCompletion{
         command.operation_id, command.generation, command.session_id,
-        error ? app::OperationOutcome::Failed
-              : app::OperationOutcome::Succeeded,
+        error ? OperationOutcome::Failed : OperationOutcome::Succeeded,
         std::move(error)}));
   }
 
@@ -1373,7 +1474,7 @@ struct SerialService::Impl {
     SerialDataEvent event;
     event.generation = event_generation;
     event.session_id = event_session;
-    event.origin = app::SessionEventOrigin::Cleanup;
+    event.origin = SessionEventOrigin::Cleanup;
     event.kind = SerialDataKind::Cleanup;
     event.observed_at = observation.observed_at;
     event.time_utc = observation.time_utc;
@@ -1392,8 +1493,8 @@ struct SerialService::Impl {
               std::numeric_limits<std::size_t>::max() - retained_data_bytes) {
         static_cast<void>(fatal.publish(
             {ErrorCode::InternalInvariantBroken, Operation::CoordinateFatal,
-             app::WorkerKind::Serial, app::FatalReason::InvariantBroken,
-             app::SignalSourceLocation::current()}));
+             WorkerKind::Serial, FatalReason::InvariantBroken,
+             SignalSourceLocation::current()}));
         if (slot_valid) {
           release_reserved_slot_locked(cleanup_slot);
         }
@@ -1413,10 +1514,11 @@ struct SerialService::Impl {
   }
 
   void stop_cleanup() {
+    invalidate_tasks();
     std::optional<QueuedConnect> pending_connect;
-    std::optional<app::CancelConnectCommand> pending_cancel;
-    std::optional<app::DisconnectCommand> pending_disconnect;
-    std::optional<app::StopTaskCommand> pending_task_stop;
+    std::optional<CancelConnectCommand> pending_cancel;
+    std::optional<DisconnectCommand> pending_disconnect;
+    std::optional<StopTaskCommand> pending_task_stop;
     {
       std::lock_guard lock(mutex);
       if (active_connect) {
@@ -1440,22 +1542,22 @@ struct SerialService::Impl {
       static_cast<void>(complete(ConnectCompletion{
           pending_connect->request.command.operation_id,
           pending_connect->request.command.generation, std::nullopt,
-          app::OperationOutcome::Cancelled, std::nullopt}));
+          OperationOutcome::Cancelled, std::nullopt}));
     }
-    cancel_all_tx(app::OperationOutcome::Cancelled);
+    cancel_all_tx(OperationOutcome::Cancelled);
     if (pending_cancel) {
-      finish_cancel(*pending_cancel, app::OperationOutcome::Cancelled);
+      finish_cancel(*pending_cancel, OperationOutcome::Cancelled);
     }
     if (pending_disconnect) {
       static_cast<void>(complete(DisconnectCompletion{
           pending_disconnect->operation_id, pending_disconnect->generation,
-          pending_disconnect->session_id, app::OperationOutcome::Cancelled,
+          pending_disconnect->session_id, OperationOutcome::Cancelled,
           std::nullopt}));
     }
     if (pending_task_stop) {
       static_cast<void>(complete(TaskStopCompletion{
           pending_task_stop->operation_id, pending_task_stop->generation,
-          app::OperationOutcome::Cancelled}));
+          OperationOutcome::Cancelled}));
     }
     if (port_open) {
       const auto old_generation = generation;
@@ -1481,6 +1583,217 @@ struct SerialService::Impl {
     active_cleanup_slot.reset();
   }
 
+  void publish_task_snapshot(TaskNotice notice = TaskNotice::None) noexcept {
+    const auto current = task_scheduler.snapshot();
+    bool changed = false;
+    {
+      std::lock_guard lock(mutex);
+      changed = task_projection.task != current;
+      task_projection.task = current;
+      if (notice != TaskNotice::None) {
+        task_projection.notice = notice;
+        if (task_projection.notice_revision !=
+            std::numeric_limits<std::uint64_t>::max()) {
+          ++task_projection.notice_revision;
+        } else {
+          static_cast<void>(fatal.publish(
+              {ErrorCode::InternalInvariantBroken, Operation::CoordinateFatal,
+               WorkerKind::Serial, FatalReason::InvariantBroken,
+               SignalSourceLocation::current()}));
+          stop_requested.store(true, std::memory_order_release);
+        }
+        changed = true;
+      }
+    }
+    if (changed) {
+      notify_ui();
+    }
+  }
+
+  void invalidate_tasks() {
+    std::array<std::optional<StartTaskRequest>, 2> cancelled;
+    {
+      std::lock_guard lock(mutex);
+      cancelled[0] = std::exchange(active_task_command, std::nullopt);
+      cancelled[1] = std::exchange(start_task, std::nullopt);
+    }
+    for (auto &pending : cancelled) {
+      if (!pending) {
+        continue;
+      }
+      static_cast<void>(complete(TaskStartCompletion{
+          pending->operation_id, pending->generation, pending->session_id,
+          OperationOutcome::Cancelled,
+          scheduler::TaskStartStatus::StopInProgress, std::nullopt}));
+    }
+    const auto stopped = task_scheduler.invalidate_for_disconnect();
+    if (stopped.generation_to_stop) {
+      static_cast<void>(task_scheduler.confirm_stopped(
+          *stopped.generation_to_stop, Clock::now()));
+    }
+    active_task_start.reset();
+    publish_task_snapshot();
+  }
+
+  void stop_task_barrier(const StopTaskCommand &command) {
+    std::optional<StartTaskRequest> cancelled;
+    {
+      std::lock_guard lock(mutex);
+      if (start_task &&
+          (command.starting_operation == start_task->operation_id ||
+           (command.generation &&
+            command.generation == start_task->expected_replacement))) {
+        cancelled = std::exchange(start_task, std::nullopt);
+      }
+    }
+    if (cancelled) {
+      static_cast<void>(complete(TaskStartCompletion{
+          cancelled->operation_id, cancelled->generation, cancelled->session_id,
+          OperationOutcome::Cancelled,
+          scheduler::TaskStartStatus::StopInProgress, std::nullopt}));
+    }
+    const auto current = task_scheduler.snapshot();
+    auto target = command.generation;
+    if (command.starting_operation &&
+        command.starting_operation == active_task_start) {
+      target = current.generation;
+    }
+    if (target) {
+      if (current.generation == target) {
+        static_cast<void>(task_scheduler.request_stop());
+      }
+      cancel_task_tx(*target);
+      static_cast<void>(task_scheduler.confirm_stopped(*target, Clock::now()));
+      if (current.generation == target) {
+        active_task_start.reset();
+      }
+    }
+    publish_task_snapshot();
+    static_cast<void>(complete(TaskStopCompletion{
+        command.operation_id, target, OperationOutcome::Succeeded}));
+  }
+
+  void process_task_start() {
+    bool session_matches = false;
+    {
+      std::lock_guard lock(mutex);
+      if (!start_task || stop_task || disconnect ||
+          stop_requested.load(std::memory_order_acquire)) {
+        return;
+      }
+      active_task_command = std::exchange(start_task, std::nullopt);
+      const auto &pending = active_task_command;
+      session_matches = connected && !disconnecting &&
+                        generation == pending->generation &&
+                        session_id == pending->session_id;
+    }
+    auto &pending = active_task_command;
+    TaskStartCompletion completion{pending->operation_id,
+                                   pending->generation,
+                                   pending->session_id,
+                                   OperationOutcome::Failed,
+                                   scheduler::TaskStartStatus::StopInProgress,
+                                   std::nullopt};
+    if (session_matches) {
+      const auto current = task_scheduler.snapshot();
+      if (current.generation == pending->expected_replacement &&
+          current.state != scheduler::SchedulerState::Stopping) {
+        auto started =
+            task_scheduler.start(std::move(pending->task), Clock::now(),
+                                 pending->expected_replacement.has_value());
+        completion.status = started.status;
+        completion.started_generation = started.started_generation;
+        if (started.status ==
+                scheduler::TaskStartStatus::ReplacementStopRequested &&
+            started.generation_to_stop) {
+          cancel_task_tx(*started.generation_to_stop);
+          const auto replaced = task_scheduler.confirm_stopped(
+              *started.generation_to_stop, Clock::now());
+          completion.started_generation = replaced.started_generation;
+          completion.status =
+              replaced.started_generation ? scheduler::TaskStartStatus::Started
+              : replaced.status ==
+                      scheduler::StopConfirmationStatus::DeadlineOverflow
+                  ? scheduler::TaskStartStatus::DeadlineOverflow
+                  : scheduler::TaskStartStatus::GenerationOverflow;
+        }
+        if (completion.started_generation) {
+          completion.outcome = OperationOutcome::Succeeded;
+          active_task_start = pending->operation_id;
+        }
+      } else {
+        completion.status =
+            scheduler::TaskStartStatus::ReplacementConfirmationRequired;
+      }
+    } else {
+      completion.outcome = OperationOutcome::Cancelled;
+    }
+    publish_task_snapshot();
+    static_cast<void>(complete(std::move(completion)));
+    std::lock_guard lock(mutex);
+    active_task_command.reset();
+  }
+
+  bool process_automatic_task_stop(Clock::time_point now) {
+    if (const auto automatic = task_scheduler.take_automatic_stop_request()) {
+      cancel_task_tx(automatic->generation);
+      static_cast<void>(
+          task_scheduler.confirm_stopped(automatic->generation, now));
+      active_task_start.reset();
+      publish_task_snapshot(
+          automatic->reason == scheduler::AutomaticStopReason::DeadlineOverflow
+              ? TaskNotice::DeadlineOverflow
+              : TaskNotice::SequenceOverflow);
+      return true;
+    }
+    return false;
+  }
+
+  void process_scheduler() {
+    bool busy = active_tx.has_value();
+    std::optional<ConnectionGeneration> owner_generation;
+    std::optional<SessionId> owner_session;
+    {
+      std::lock_guard lock(mutex);
+      if (!connected || disconnecting || stop_task || disconnect ||
+          stop_requested.load(std::memory_order_acquire)) {
+        return;
+      }
+      busy = busy || !tx_queue.empty();
+      owner_generation = generation;
+      owner_session = session_id;
+    }
+    const auto now = Clock::now();
+    task_scheduler.on_deadline(now, busy);
+    if (process_automatic_task_stop(now)) {
+      return;
+    }
+    scheduler::TxBoundary boundary;
+    boundary.manual_pending = busy;
+    if (const auto send = task_scheduler.on_tx_boundary(now, boundary)) {
+      OperationId id;
+      if (operation_ids.issue(id) != IdIncrementResult::Advanced) {
+        terminal_failure(FatalReason::InvariantBroken);
+        return;
+      }
+      TxRequest request{
+          {id, *owner_generation, *owner_session, send->token.generation},
+          send->execution->bytes,
+          send->execution->mode};
+      if (!admit_tx(std::move(request), send->token)) {
+        boundary.completed_request = send->token;
+        boundary.completed_successfully = false;
+        boundary.manual_pending = true;
+        static_cast<void>(task_scheduler.on_tx_boundary(now, boundary));
+        publish_task_snapshot(TaskNotice::AdmissionRejected);
+        return;
+      }
+    }
+    if (!process_automatic_task_stop(now)) {
+      publish_task_snapshot();
+    }
+  }
+
   std::unique_ptr<ISerialBackend> backend;
   SerialServiceOptions options;
   int wake_fd{-1};
@@ -1490,9 +1803,15 @@ struct SerialService::Impl {
   std::deque<QueuedTx> tx_queue;
   std::optional<QueuedTx> active_tx;
   std::optional<Clock::time_point> tx_retry_at;
-  std::optional<app::CancelConnectCommand> cancel_connect;
-  std::optional<app::DisconnectCommand> disconnect;
-  std::optional<app::StopTaskCommand> stop_task;
+  std::optional<CancelConnectCommand> cancel_connect;
+  std::optional<DisconnectCommand> disconnect;
+  std::optional<StopTaskCommand> stop_task;
+  std::optional<StartTaskRequest> start_task;
+  std::optional<StartTaskRequest> active_task_command;
+  scheduler::Scheduler task_scheduler;
+  SerialTaskSnapshot task_projection;
+  std::optional<OperationId> active_task_start;
+  OperationIdIssuer operation_ids;
   std::optional<std::size_t> active_cleanup_slot;
   std::deque<SerialDataEvent> data_queue;
   std::vector<ReservedEventSlot> reserved_events;
@@ -1523,8 +1842,8 @@ struct SerialService::Impl {
   IdSequence<SessionId> session_ids;
   SerialOverflowSignal overflow{};
   bool overflow_ready{};
-  app::FatalSignalSlot fatal;
-  app::WorkerStoppedSignal stopped_signal{};
+  FatalSignalSlot fatal;
+  WorkerStoppedSignal stopped_signal{};
   std::atomic_bool stopped_ready{false};
   mutable std::condition_variable stopped_cv;
   std::atomic_bool stop_requested{false};
@@ -1598,6 +1917,7 @@ Result<std::unique_ptr<SerialService>> SerialService::create(
 SerialService::~SerialService() = default;
 
 Result<OperationId> SerialService::submit_connect(ConnectRequest request) {
+  impl_->operation_ids.observe(request.command.operation_id);
   const auto operation_id = request.command.operation_id;
   const std::size_t bytes = saturated_add(
       saturated_add(sizeof(QueuedConnect), request.path.requested.capacity()),
@@ -1633,7 +1953,7 @@ Result<OperationId> SerialService::submit_connect(ConnectRequest request) {
   }
   // Admission reserves both the typed completion and the eventual cleanup data
   // slot under the same lock. Every later failure rolls both reservations back.
-  if (!impl_->mailbox.reserve(operation_id, app::OperationClass::Normal,
+  if (!impl_->mailbox.reserve(operation_id, OperationClass::Normal,
                               MailboxKind::Connect)) {
     return tl::unexpected(submission_error(
         "connect completion capacity is full or operation is duplicate",
@@ -1667,77 +1987,17 @@ Result<OperationId> SerialService::submit_connect(ConnectRequest request) {
 }
 
 Result<OperationId> SerialService::submit_tx(TxRequest request) {
-  const auto operation_id = request.command.operation_id;
-  const std::size_t payload_size = request.payload.size();
-  const std::size_t bytes =
-      saturated_add(sizeof(QueuedTx), request.payload.capacity());
-  std::lock_guard lock(impl_->mutex);
-  if (!valid(operation_id) || !valid(request.command.generation) ||
-      !valid(request.command.session_id) || payload_size == 0U ||
-      payload_size > config::kMaximumPayloadBytes) {
-    return tl::unexpected(submission_error(
-        "invalid serial TX request", Operation::WriteSerial, operation_id));
-  }
-  if (impl_->stop_requested.load(std::memory_order_acquire)) {
-    return tl::unexpected(submission_error(
-        "serial service is stopping", Operation::WriteSerial, operation_id));
-  }
-  if (!impl_->connected || impl_->disconnecting ||
-      impl_->generation != request.command.generation ||
-      impl_->session_id != request.command.session_id) {
-    return tl::unexpected(submission_error("stale or disconnected TX session",
-                                           Operation::WriteSerial,
-                                           operation_id));
-  }
-  if (request.command.task_generation && impl_->stop_task &&
-      impl_->stop_task->generation == *request.command.task_generation) {
-    return tl::unexpected(submission_error(
-        "serial task is stopping", Operation::WriteSerial, operation_id));
-  }
-  if (impl_->tx_messages >= impl_->options.tx_max_messages ||
-      bytes > impl_->options.tx_max_bytes -
-                  std::min(impl_->tx_bytes, impl_->options.tx_max_bytes)) {
-    return tl::unexpected(submission_error(
-        "serial TX queue is full", Operation::WriteSerial, operation_id));
-  }
-  // Two terminal data slots cover the accepted TX prefix plus a following ERR.
-  // They are reserved with completion capacity before the request is visible.
-  if (!impl_->mailbox.reserve(operation_id, app::OperationClass::Tx,
-                              MailboxKind::Tx)) {
-    return tl::unexpected(submission_error(
-        "TX completion capacity is full or operation is duplicate",
-        Operation::WriteSerial, operation_id));
-  }
-  const std::array terminal_slots{impl_->take_tx_slot_locked(),
-                                  impl_->take_tx_slot_locked()};
-  if (terminal_slots[0] == kNoReservedSlot ||
-      terminal_slots[1] == kNoReservedSlot) {
-    impl_->release_reserved_slot_locked(terminal_slots[0]);
-    impl_->release_reserved_slot_locked(terminal_slots[1]);
-    impl_->mailbox.cancel(operation_id);
+  if (request.command.task_generation) {
     return tl::unexpected(
-        submission_error("TX terminal capacity is unavailable",
-                         Operation::WriteSerial, operation_id));
+        submission_error("scheduled TX must originate in the owner",
+                         Operation::WriteSerial, request.command.operation_id));
   }
-  try {
-    impl_->tx_queue.push_back(
-        QueuedTx{std::move(request), std::nullopt, 0U, bytes, terminal_slots});
-  } catch (...) {
-    impl_->release_reserved_slot_locked(terminal_slots[0]);
-    impl_->release_reserved_slot_locked(terminal_slots[1]);
-    impl_->mailbox.cancel(operation_id);
-    return tl::unexpected(make_error(
-        ErrorCode::InternalOutOfMemory, Operation::WriteSerial,
-        "cannot enqueue TX operation", {}, std::nullopt, operation_id));
-  }
-  ++impl_->tx_messages;
-  impl_->tx_bytes += bytes;
-  impl_->wake_owner();
-  return operation_id;
+  return impl_->admit_tx(std::move(request));
 }
 
 Result<SubmitStatus>
-SerialService::request_cancel_connect(const app::CancelConnectCommand command) {
+SerialService::request_cancel_connect(const CancelConnectCommand command) {
+  impl_->operation_ids.observe(command.operation_id);
   std::lock_guard lock(impl_->mutex);
   if (!valid(command.operation_id) || !valid(command.generation)) {
     return tl::unexpected(submission_error("invalid cancel-connect identifiers",
@@ -1757,8 +2017,7 @@ SerialService::request_cancel_connect(const app::CancelConnectCommand command) {
                                            Operation::CloseSerial,
                                            command.operation_id));
   }
-  if (!impl_->mailbox.reserve(command.operation_id,
-                              app::OperationClass::Control,
+  if (!impl_->mailbox.reserve(command.operation_id, OperationClass::Control,
                               MailboxKind::Disconnect)) {
     return tl::unexpected(
         submission_error("cancel completion capacity is unavailable",
@@ -1771,7 +2030,8 @@ SerialService::request_cancel_connect(const app::CancelConnectCommand command) {
 }
 
 Result<SubmitStatus>
-SerialService::request_disconnect(const app::DisconnectCommand command) {
+SerialService::request_disconnect(const DisconnectCommand command) {
+  impl_->operation_ids.observe(command.operation_id);
   std::lock_guard lock(impl_->mutex);
   if (!valid(command.operation_id) || !valid(command.generation) ||
       !command.session_id || !valid(*command.session_id)) {
@@ -1793,8 +2053,7 @@ SerialService::request_disconnect(const app::DisconnectCommand command) {
                                            Operation::CloseSerial,
                                            command.operation_id));
   }
-  if (!impl_->mailbox.reserve(command.operation_id,
-                              app::OperationClass::Control,
+  if (!impl_->mailbox.reserve(command.operation_id, OperationClass::Control,
                               MailboxKind::Disconnect)) {
     return tl::unexpected(
         submission_error("disconnect completion capacity is unavailable",
@@ -1807,9 +2066,13 @@ SerialService::request_disconnect(const app::DisconnectCommand command) {
 }
 
 Result<SubmitStatus>
-SerialService::request_stop_task(const app::StopTaskCommand command) {
+SerialService::request_stop_task(const StopTaskCommand command) {
+  impl_->operation_ids.observe(command.operation_id);
   std::lock_guard lock(impl_->mutex);
-  if (!valid(command.operation_id) || !valid(command.generation)) {
+  if (!valid(command.operation_id) ||
+      (!command.generation && !command.starting_operation) ||
+      (command.generation && !valid(*command.generation)) ||
+      (command.starting_operation && !valid(*command.starting_operation))) {
     return tl::unexpected(submission_error("invalid task-stop identifiers",
                                            Operation::WriteSerial,
                                            command.operation_id));
@@ -1822,8 +2085,7 @@ SerialService::request_stop_task(const app::StopTaskCommand command) {
   if (impl_->stop_task) {
     return SubmitStatus::AlreadyPending;
   }
-  if (!impl_->mailbox.reserve(command.operation_id,
-                              app::OperationClass::Control,
+  if (!impl_->mailbox.reserve(command.operation_id, OperationClass::Control,
                               MailboxKind::TaskStop)) {
     return tl::unexpected(
         submission_error("task-stop completion capacity is unavailable",
@@ -1832,6 +2094,58 @@ SerialService::request_stop_task(const app::StopTaskCommand command) {
   impl_->stop_task = command;
   impl_->wake_owner();
   return SubmitStatus::Accepted;
+}
+
+Result<OperationId> SerialService::submit_task(StartTaskRequest request) {
+  impl_->operation_ids.observe(request.operation_id);
+  const auto id = request.operation_id;
+  if (!valid(id) || !valid(request.generation) || !valid(request.session_id) ||
+      (request.expected_replacement && !valid(*request.expected_replacement)) ||
+      !scheduler::valid_interval(request.task.interval_ms) ||
+      request.task.execution.bytes.empty() ||
+      request.task.execution.bytes.capacity() > config::kMaximumPayloadBytes ||
+      request.task.execution.name.size() > 64U ||
+      request.task.execution.name.capacity() > 128U ||
+      request.task.execution.note.size() > 256U ||
+      request.task.execution.note.capacity() > 512U) {
+    return tl::unexpected(submission_error("invalid quick-send task",
+                                           Operation::WriteSerial, id));
+  }
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->stop_requested.load(std::memory_order_acquire) ||
+      !impl_->connected || impl_->disconnecting ||
+      impl_->generation != request.generation ||
+      impl_->session_id != request.session_id) {
+    return tl::unexpected(submission_error("stale or disconnected task session",
+                                           Operation::WriteSerial, id));
+  }
+  if (impl_->start_task || impl_->active_task_command || impl_->stop_task ||
+      !impl_->mailbox.reserve(id, OperationClass::Control,
+                              MailboxKind::TaskStart)) {
+    return tl::unexpected(submission_error(
+        "task command capacity is unavailable", Operation::WriteSerial, id));
+  }
+  impl_->start_task = std::move(request);
+  impl_->wake_owner();
+  return id;
+}
+
+std::size_t SerialService::pending_tx_requests() const noexcept {
+  std::lock_guard lock(impl_->mutex);
+  return impl_->mailbox.pending_tx_count();
+}
+
+SerialTaskSnapshot SerialService::task_snapshot() const noexcept {
+  std::lock_guard lock(impl_->mutex);
+  return impl_->task_projection;
+}
+
+IdIncrementResult SerialService::issue_operation(OperationId &issued) noexcept {
+  const auto result = impl_->operation_ids.issue(issued);
+  if (result != IdIncrementResult::Advanced) {
+    impl_->terminal_failure(FatalReason::InvariantBroken);
+  }
+  return result;
 }
 
 void SerialService::request_stop() noexcept { impl_->request_stop(); }
@@ -1934,11 +2248,11 @@ SerialService::overflow_signal() const noexcept {
   return impl_->overflow_ready ? std::optional{impl_->overflow} : std::nullopt;
 }
 
-std::optional<app::FatalSignal> SerialService::fatal_signal() const noexcept {
+std::optional<FatalSignal> SerialService::fatal_signal() const noexcept {
   return impl_->fatal.load();
 }
 
-std::optional<app::WorkerStoppedSignal>
+std::optional<WorkerStoppedSignal>
 SerialService::worker_stopped_signal() const noexcept {
   if (!impl_->stopped_ready.load(std::memory_order_acquire)) {
     return std::nullopt;

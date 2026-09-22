@@ -1,5 +1,7 @@
 #pragma once
 
+#include <lazycom/base/text.hpp>
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -53,59 +55,6 @@ namespace detail {
 }
 
 } // namespace detail
-
-/**
- * @brief Validates structural UTF-8 without normalization.
- * @return true for well-formed UTF-8, including empty input and encoded control
- * characters; false for overlong, surrogate, truncated, or out-of-range input.
- * @note Structural validity does not make text safe for terminal display.
- */
-[[nodiscard]] inline bool is_strict_utf8(const std::string_view text) noexcept {
-  std::size_t index = 0U;
-  while (index < text.size()) {
-    const auto first = static_cast<unsigned char>(text[index]);
-    if (first <= 0x7FU) {
-      ++index;
-      continue;
-    }
-
-    std::size_t continuation_count = 0U;
-    std::uint32_t code_point = 0U;
-    std::uint32_t minimum = 0U;
-    if ((first & 0xE0U) == 0xC0U) {
-      continuation_count = 1U;
-      code_point = first & 0x1FU;
-      minimum = 0x80U;
-    } else if ((first & 0xF0U) == 0xE0U) {
-      continuation_count = 2U;
-      code_point = first & 0x0FU;
-      minimum = 0x800U;
-    } else if ((first & 0xF8U) == 0xF0U) {
-      continuation_count = 3U;
-      code_point = first & 0x07U;
-      minimum = 0x10000U;
-    } else {
-      return false;
-    }
-    if (continuation_count > text.size() - index - 1U) {
-      return false;
-    }
-    for (std::size_t offset = 1U; offset <= continuation_count; ++offset) {
-      const auto continuation =
-          static_cast<unsigned char>(text[index + offset]);
-      if ((continuation & 0xC0U) != 0x80U) {
-        return false;
-      }
-      code_point = (code_point << 6U) | (continuation & 0x3FU);
-    }
-    if (code_point < minimum || code_point > 0x10FFFFU ||
-        (code_point >= 0xD800U && code_point <= 0xDFFFU)) {
-      return false;
-    }
-    index += continuation_count + 1U;
-  }
-  return true;
-}
 
 /**
  * @brief Converts strict UTF-8 text to its exact byte representation.

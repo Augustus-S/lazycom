@@ -1,3 +1,4 @@
+#include <lazycom/base/text.hpp>
 #include <lazycom/config/schema.hpp>
 
 #include <lazycom/config/safe_file.hpp>
@@ -83,53 +84,6 @@ void add_error(std::vector<SchemaMessage> &errors, std::string path,
                          : character);
   }
   return result;
-}
-
-[[nodiscard]] bool is_valid_utf8(std::string_view text) noexcept {
-  std::size_t index = 0;
-  while (index < text.size()) {
-    const auto first = static_cast<unsigned char>(text[index]);
-    if (first <= 0x7FU) {
-      ++index;
-      continue;
-    }
-
-    std::size_t continuation_count = 0;
-    std::uint32_t code_point = 0;
-    std::uint32_t minimum = 0;
-    if ((first & 0xE0U) == 0xC0U) {
-      continuation_count = 1;
-      code_point = first & 0x1FU;
-      minimum = 0x80U;
-    } else if ((first & 0xF0U) == 0xE0U) {
-      continuation_count = 2;
-      code_point = first & 0x0FU;
-      minimum = 0x800U;
-    } else if ((first & 0xF8U) == 0xF0U) {
-      continuation_count = 3;
-      code_point = first & 0x07U;
-      minimum = 0x10000U;
-    } else {
-      return false;
-    }
-    if (continuation_count > text.size() - index - 1U) {
-      return false;
-    }
-    for (std::size_t offset = 1; offset <= continuation_count; ++offset) {
-      const auto continuation =
-          static_cast<unsigned char>(text[index + offset]);
-      if ((continuation & 0xC0U) != 0x80U) {
-        return false;
-      }
-      code_point = (code_point << 6U) | (continuation & 0x3FU);
-    }
-    if (code_point < minimum || code_point > 0x10FFFFU ||
-        (code_point >= 0xD800U && code_point <= 0xDFFFU)) {
-      return false;
-    }
-    index += continuation_count + 1U;
-  }
-  return true;
 }
 
 [[nodiscard]] bool is_hex_digit(char character) noexcept {
@@ -608,13 +562,13 @@ void validate_quick_slot(const QuickSendSlot &slot, std::string_view base,
   if (slot.name.size() > 64U) {
     add_error(errors, path("name"), "must not exceed 64 UTF-8 bytes");
   }
-  if (!is_valid_utf8(slot.name)) {
+  if (!is_strict_utf8(slot.name)) {
     add_error(errors, path("name"), "must be valid UTF-8");
   }
   if (slot.note.size() > 256U) {
     add_error(errors, path("note"), "must not exceed 256 UTF-8 bytes");
   }
-  if (!is_valid_utf8(slot.note)) {
+  if (!is_strict_utf8(slot.note)) {
     add_error(errors, path("note"), "must be valid UTF-8");
   }
   if (slot.newline != Newline::Session && slot.newline != Newline::None &&
@@ -623,7 +577,7 @@ void validate_quick_slot(const QuickSendSlot &slot, std::string_view base,
     add_error(errors, path("newline"), "is invalid");
   }
   if (slot.mode == SendMode::Txt) {
-    if (!is_valid_utf8(slot.content)) {
+    if (!is_strict_utf8(slot.content)) {
       add_error(errors, path("content"), "TXT content must be valid UTF-8");
     }
     if (slot.content.size() > kMaximumPayloadBytes) {

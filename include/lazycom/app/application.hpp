@@ -1,11 +1,15 @@
 #pragma once
+#include <thread>
 
-#include <lazycom/app/completion.hpp>
+#include <lazycom/app/session_log_coordinator.hpp>
+#include <lazycom/app/session_records.hpp>
+#include <lazycom/app/settings_coordinator.hpp>
+#include <lazycom/app/state.hpp>
 #include <lazycom/config/persistence.hpp>
 #include <lazycom/encoding/display.hpp>
 #include <lazycom/framing/rx_framer.hpp>
 #include <lazycom/logging/session_writer.hpp>
-#include <lazycom/scheduler/scheduler.hpp>
+#include <lazycom/scheduler/task.hpp>
 #include <lazycom/serial/scanner.hpp>
 #include <lazycom/serial/service.hpp>
 
@@ -25,24 +29,24 @@
 
 namespace lazycom::app {
 
-enum class RecordDirection : std::uint8_t { Rx, Tx, System, Error };
-
-struct VisibleRecord {
-  std::uint64_t record_id{};
-  std::uint64_t sequence{};
-  RecordDirection direction{RecordDirection::System};
-  std::string time_utc;
-  std::vector<std::byte> payload;
-  std::string message;
-  std::optional<ErrorCode> error_code;
-  std::optional<OperationId> operation_id;
+struct DataFormatCandidate {
+  std::int32_t data_bits{8};
+  std::int32_t stop_bits{1};
+  config::Parity parity{config::Parity::None};
+  config::FlowControl flow_control{config::FlowControl::None};
 };
 
-struct DirectionFilter {
-  bool rx{true};
-  bool tx{true};
-  bool system{true};
-  bool error{true};
+struct ViewCandidate {
+  config::ReceiveView rx_view{config::ReceiveView::Txt};
+  config::ReceiveView tx_view{config::ReceiveView::Txt};
+  DirectionFilter filter;
+};
+
+struct LogSettingsCandidate {
+  std::string directory;
+  std::uint32_t max_files{100U};
+  std::uint32_t max_total_size_mib{1024U};
+  std::uint32_t max_file_size_mib{64U};
 };
 
 struct UserAlert {
@@ -54,6 +58,8 @@ struct UserAlert {
 enum class LogApplyPolicy : std::uint8_t { NextSession, RotateNow };
 
 struct ApplicationSnapshot {
+  explicit ApplicationSnapshot(const std::deque<VisibleRecord> &source)
+      : records{source} {}
   ConnectionState connection{ConnectionState::Disconnected};
   InteractionState interaction{InteractionState::Normal};
   LogState log{LogState::Off};
@@ -69,7 +75,7 @@ struct ApplicationSnapshot {
   bool notice_error{};
   std::string configuration_notice;
   std::vector<serial::DeviceInfo> devices;
-  std::deque<VisibleRecord> records;
+  const std::deque<VisibleRecord> &records;
   scheduler::SchedulerSnapshot task;
   std::uint64_t rx_bytes{};
   std::uint64_t tx_bytes{};
@@ -98,6 +104,7 @@ struct ApplicationDependencies {
   void *wake_context{};
   std::optional<config::PersistencePaths> paths;
   std::optional<std::filesystem::path> log_directory;
+  model::GlobalMemoryBudget memory_budget{};
 };
 
 /**
@@ -166,8 +173,9 @@ public:
   void connection_control();
   void set_interaction(InteractionState state) noexcept;
   /**
-   * @brief Replaces the editable draft, truncating it to the configured bytes.
-   * @note Byte truncation does not preserve a UTF-8 code-point boundary.
+   * @brief Replaces the draft after strict UTF-8 and configured byte
+   * validation.
+   * @note Rejection preserves the previous draft.
    */
   void set_draft(std::string draft);
   /**
@@ -200,15 +208,15 @@ public:
    */
   [[nodiscard]] Status apply_port(std::string_view value);
   /** @brief Applies a preset baud and asynchronously persists the snapshot. */
-  [[nodiscard]] Status apply_baud(std::string_view value);
+  [[nodiscard]] Status apply_baud(std::int32_t value);
   /** @brief Applies a complete preset data-bits/parity/stop/flow format. */
-  [[nodiscard]] Status apply_data_format(std::string_view value);
+  [[nodiscard]] Status apply_data_format(const DataFormatCandidate &value);
   /** @brief Applies the runtime TX newline setting. */
-  [[nodiscard]] Status apply_newline(std::string_view value);
+  [[nodiscard]] Status apply_newline(config::Newline value);
   /** @brief Applies RX/TX display modes and direction visibility together. */
-  [[nodiscard]] Status apply_view(std::string_view value);
+  [[nodiscard]] Status apply_view(const ViewCandidate &value);
   /** @brief Applies TXT or HEX draft interpretation. */
-  [[nodiscard]] Status apply_send_mode(std::string_view value);
+  [[nodiscard]] Status apply_send_mode(config::SendMode value);
   /**
    * @brief Applies the complete logging-settings candidate.
    * @note Status success means validation and save admission, not durable
@@ -216,11 +224,12 @@ public:
    * NextSession preserves an active file; RotateNow closes and restarts it.
    */
   [[nodiscard]] Status
-  apply_logging(std::string_view value,
+  apply_logging(const LogSettingsCandidate &value,
                 LogApplyPolicy policy = LogApplyPolicy::RotateNow);
   /** @brief Validates a complete logging-settings candidate without applying
    * it. */
-  [[nodiscard]] Status validate_logging(std::string_view value) const;
+  [[nodiscard]] Status
+  validate_logging(const LogSettingsCandidate &value) const;
   /**
    * @brief Validates and asynchronously saves one complete quick-send slot.
    * @param index User-facing slot number, 1 through 20.
@@ -269,7 +278,7 @@ private:
   Application(ApplicationDependencies dependencies, LoadedConfiguration loaded,
               std::unique_ptr<serial::SerialService> serial_service,
               std::unique_ptr<serial::DeviceScanner> scanner,
-              std::unique_ptr<logging::SessionWriter> writer);
+              std::unique_ptr<SessionLogCoordinator> logs);
 
   [[nodiscard]] static Result<LoadedConfiguration>
   load_configuration(const std::optional<config::PersistencePaths> &paths,
@@ -288,11 +297,12 @@ private:
   bool process_serial_data();
   void process_serial_completions();
   void process_scan_completions();
+  [[nodiscard]] LogContext log_context() const noexcept;
+  void synchronize_log_state();
+  void capture_log_session();
   void process_log_commands();
   void process_save_completions();
-  void process_scheduler();
-  [[nodiscard]] bool request_quick_task_stop(TaskGeneration generation,
-                                             std::string_view notice);
+  void update_task_projection();
   [[nodiscard]] bool log_rollover_pending() const noexcept;
   void begin_log_session();
   void end_log_session(ConnectionGeneration generation, SessionId session_id);
@@ -308,93 +318,53 @@ private:
                  std::chrono::system_clock::time_point time_utc =
                      std::chrono::system_clock::now(),
                  std::optional<config::SendMode> input_mode = std::nullopt);
+  void synchronize_records() noexcept;
   void enqueue_frames(std::vector<framing::RxFrame> frames,
                       SessionEventOrigin origin);
-  [[nodiscard]] bool
-  submit_tx(std::vector<std::byte> payload, config::SendMode input_mode,
-            std::optional<TaskGeneration> task_generation,
-            std::optional<scheduler::ScheduledRequestToken> scheduled_token =
-                std::nullopt);
+  [[nodiscard]] bool submit_tx(std::vector<std::byte> payload,
+                               config::SendMode input_mode);
   Status save_config();
   void save_state();
   void update_worker_state();
   void enter_fatal_stopping(const FatalSignal &signal) noexcept;
   void reconfigure_log_writer_if_inactive();
 
-  struct LogSessionOwner {
-    ConnectionGeneration generation{};
-    SessionId session_id{};
-    auto operator<=>(const LogSessionOwner &) const = default;
-  };
-
-  struct PendingLogCommand {
-    std::future<logging::SessionCommandResult> completion;
-    enum class Kind : std::uint8_t { Start, End, Disable } kind{Kind::Start};
-    std::optional<LogSessionOwner> owner;
-    bool close_after_start{};
-    std::chrono::steady_clock::time_point deadline;
-  };
-
-  struct PendingLogRecord {
-    LogSessionOwner owner;
-    logging::Record record;
-  };
-
+  model::GlobalMemoryBudget memory_budget_;
+  SessionRecords records_{memory_budget_};
   ApplicationSnapshot snapshot_;
   ConnectionStateMachine connection_;
-  InteractionStateMachine interaction_;
-  LogStateMachine log_state_;
-  IdSequence<OperationId> operation_ids_;
   IdSequence<ConnectionGeneration> connection_ids_;
   IdSequence<ScanGeneration> scan_ids_;
   std::unique_ptr<serial::SerialService> serial_;
   std::unique_ptr<serial::DeviceScanner> scanner_;
-  std::unique_ptr<logging::SessionWriter> writer_;
-  std::unique_ptr<config::PersistenceWorker> persistence_;
-  config::PersistencePaths paths_;
-  config::ConfigLoadResult config_load_;
-  config::QuickSendLoadResult quick_load_;
-  config::StateLoadResult state_load_;
+  std::unique_ptr<SessionLogCoordinator> logs_;
+  std::unique_ptr<SettingsCoordinator> settings_;
   std::filesystem::path default_log_directory_;
   std::string device_path_;
   std::optional<ScanGeneration> latest_scan_generation_;
   std::optional<serial::PortConfig> connected_port_config_;
-  std::unique_ptr<framing::RxFramer> framer_;
-  scheduler::Scheduler scheduler_;
-  std::unordered_map<std::uint64_t, scheduler::ScheduledRequestToken>
-      scheduled_operations_;
+  struct PendingTaskStart {
+    OperationId operation_id;
+    std::uint32_t slot{};
+    std::uint64_t interval_ms{};
+  };
+  std::optional<PendingTaskStart> pending_task_start_;
+  std::optional<OperationId> pending_task_stop_;
+  std::uint64_t task_notice_revision_{};
   std::deque<std::string> history_;
   std::size_t history_bytes_{};
   std::optional<std::size_t> history_index_;
   std::string history_sentinel_;
-  std::uint64_t next_record_id_{1U};
-  std::uint64_t next_sequence_{1U};
-  std::chrono::steady_clock::time_point session_started_{};
-  std::chrono::system_clock::time_point session_started_utc_{};
   std::optional<std::chrono::steady_clock::time_point> notice_deadline_;
   std::string fatal_notice_{
       "Fatal worker signal; emergency shutdown requested"};
-  std::optional<std::chrono::steady_clock::time_point> writer_stop_deadline_;
-  std::optional<PendingLogCommand> log_command_;
-  std::deque<PendingLogRecord> log_backlog_;
-  std::size_t log_backlog_bytes_{};
-  std::optional<LogSessionOwner> restart_log_owner_;
   std::optional<LogSessionOwner> processed_cleanup_;
-  std::optional<LogSessionOwner> closed_log_owner_;
   std::optional<serial::DisconnectCompletion> deferred_disconnect_completion_;
-  std::array<std::optional<std::future<config::SaveCompletion>>, 3>
-      save_completions_;
-  std::optional<config::QuickSendSnapshot> pending_quick_send_;
-  std::size_t active_tx_count_{};
   bool manual_pause_{};
   bool startup_scan_alert_pending_{true};
-  bool config_save_dirty_{};
-  bool state_save_dirty_{};
-  bool writer_reconfigure_pending_{};
   bool connect_after_log_{};
   bool cancel_race_disconnect_pending_{};
-  MainThreadFatalGuard fatal_guard_;
-  WorkerLifecycleRegistry workers_;
+  const std::thread::id main_thread_{std::this_thread::get_id()};
   bool stopped_{};
 };
 

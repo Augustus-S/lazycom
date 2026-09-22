@@ -1,3 +1,4 @@
+#include <lazycom/base/text.hpp>
 #include <lazycom/model/session_record.hpp>
 
 #include <algorithm>
@@ -46,22 +47,21 @@ saturating_multiply(const std::size_t value,
   return true;
 }
 
-[[nodiscard]] bool
-valid_direction(const logging::Direction direction) noexcept {
+[[nodiscard]] bool valid_direction(const Direction direction) noexcept {
   switch (direction) {
-  case logging::Direction::Rx:
-  case logging::Direction::Tx:
-  case logging::Direction::Sys:
-  case logging::Direction::Err:
+  case Direction::Rx:
+  case Direction::Tx:
+  case Direction::Sys:
+  case Direction::Err:
     return true;
   }
   return false;
 }
 
-[[nodiscard]] bool valid_input_mode(const logging::InputMode mode) noexcept {
+[[nodiscard]] bool valid_input_mode(const InputMode mode) noexcept {
   switch (mode) {
-  case logging::InputMode::Text:
-  case logging::InputMode::Hex:
+  case InputMode::Text:
+  case InputMode::Hex:
     return true;
   }
   return false;
@@ -69,15 +69,19 @@ valid_direction(const logging::Direction direction) noexcept {
 
 } // namespace
 
-SessionRecord::SessionRecord(const std::uint64_t seq, RecordDraft draft)
-    : seq_(seq), direction_(draft.direction), time_(std::move(draft.time)),
-      payload_(std::move(draft.payload)), input_mode_(draft.input_mode),
-      message_(logging::sanitize_message(draft.message)),
+SessionRecord::SessionRecord(const std::uint64_t seq, RecordDraft draft,
+                             BudgetReservation reservation)
+    : reservation_(std::move(reservation)), seq_(seq),
+      direction_(draft.direction), time_(std::move(draft.time)),
+      payload_(draft.payload.begin(), draft.payload.end()),
+      input_mode_(draft.input_mode),
+      message_(lazycom::sanitize_message(draft.message)),
       code_(std::move(draft.code)), operation_id_(draft.operation_id) {}
 
 std::size_t SessionRecord::logical_bytes() const noexcept {
   auto result = sizeof(SessionRecord);
-  result = saturating_add(result, payload_.size());
+  result = saturating_add(result, payload_.capacity());
+  result = saturating_add(result, time_.time_utc.capacity());
   result = saturating_add(result, message_.capacity());
   if (code_) {
     result = saturating_add(result, code_->capacity());
@@ -85,91 +89,40 @@ std::size_t SessionRecord::logical_bytes() const noexcept {
   return result;
 }
 
-logging::Record SessionRecord::to_log_record() const {
-  logging::Record output;
-  output.seq = seq_;
-  output.time_utc = time_.time_utc;
-  output.elapsed_ns = time_.elapsed_ns;
-  output.direction = direction_;
-  output.input_mode = input_mode_;
-  if (direction_ == logging::Direction::Rx ||
-      direction_ == logging::Direction::Tx) {
-    const auto source = payload_.bytes();
-    output.payload.assign(source.begin(), source.end());
-  } else {
-    output.message = message_;
-    output.code = code_;
-  }
-  return output;
-}
-
-SessionRecordBatch::SessionRecordBatch(const SessionId session_id,
-                                       const std::uint64_t first_seq,
-                                       std::vector<RecordDraft> drafts,
-                                       BudgetReservation reservation)
-    : session_id_(session_id), reservation_(std::move(reservation)) {
-  records_.reserve(drafts.size());
-  auto seq = first_seq;
-  for (auto &draft : drafts) {
-    records_.push_back(SessionRecord{seq, std::move(draft)});
-    logical_bytes_ =
-        saturating_add(logical_bytes_, records_.back().logical_bytes());
-    ++seq;
-  }
-}
-
-std::uint64_t SessionRecordBatch::first_seq() const noexcept {
-  return records_.empty() ? 0U : records_.front().seq();
-}
-
-std::uint64_t SessionRecordBatch::last_seq() const noexcept {
-  return records_.empty() ? 0U : records_.back().seq();
-}
-
 bool valid_record_draft(const RecordDraft &draft) noexcept {
-  if (!logging::is_valid_utc(draft.time.time_utc) ||
+  if (!lazycom::is_valid_utc(draft.time.time_utc) ||
       !valid_direction(draft.direction) ||
       (draft.input_mode && !valid_input_mode(*draft.input_mode))) {
     return false;
   }
-  const bool payload_direction = draft.direction == logging::Direction::Rx ||
-                                 draft.direction == logging::Direction::Tx;
+  const bool payload_direction =
+      draft.direction == Direction::Rx || draft.direction == Direction::Tx;
   if (payload_direction) {
-    return draft.payload.size() <= logging::kMaxPayloadBytes &&
-           draft.message.empty() && !draft.code &&
-           (!draft.input_mode || draft.direction == logging::Direction::Tx);
+    return draft.payload.size() <= kMaxPayloadBytes && draft.message.empty() &&
+           !draft.code &&
+           (!draft.input_mode || draft.direction == Direction::Tx);
   }
   if (!draft.payload.empty() || draft.input_mode) {
     return false;
   }
-  if (draft.direction == logging::Direction::Err) {
+  if (draft.direction == Direction::Err) {
     return draft.code && stable_error_code(*draft.code);
   }
-  return draft.direction == logging::Direction::Sys && !draft.code;
+  return draft.direction == Direction::Sys && !draft.code;
 }
 
-std::size_t
-estimate_batch_metadata(const std::span<const RecordDraft> drafts) noexcept {
-  auto result = sizeof(SessionRecordBatch);
-  if (drafts.size() > (std::numeric_limits<std::size_t>::max() - result) /
-                          sizeof(SessionRecord)) {
-    return std::numeric_limits<std::size_t>::max();
+std::size_t estimate_record_memory(const RecordDraft &draft) noexcept {
+  // Covers the shared object/control block and dynamic allocation metadata.
+  auto result =
+      saturating_add(sizeof(SessionRecord) + 128U, draft.payload.size());
+  result = saturating_add(result, draft.time.time_utc.capacity());
+  if (draft.direction == Direction::Sys || draft.direction == Direction::Err) {
+    const auto maximum_output = std::min(
+        kMaxMessageBytes, saturating_multiply(draft.message.size(), 4U));
+    result = saturating_add(result, saturating_multiply(maximum_output, 2U));
   }
-  result += drafts.size() * sizeof(SessionRecord);
-  for (const auto &draft : drafts) {
-    result = saturating_add(result, draft.time.time_utc.capacity());
-    if (draft.direction == logging::Direction::Sys ||
-        draft.direction == logging::Direction::Err) {
-      result = saturating_add(result, draft.message.capacity());
-      const auto maximum_output =
-          std::min(logging::kMaxMessageBytes,
-                   saturating_multiply(draft.message.size(), 4U));
-      result = saturating_add(result, saturating_multiply(maximum_output, 2U));
-    }
-    if (draft.code) {
-      result = saturating_add(result, draft.code->capacity());
-    }
-  }
+  if (draft.code)
+    result = saturating_add(result, draft.code->capacity());
   return result;
 }
 

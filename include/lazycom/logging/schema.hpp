@@ -10,6 +10,8 @@
  * or fatal-signal paths.
  */
 
+#include <lazycom/model/record_types.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -20,12 +22,16 @@
 
 #include <tl/expected.hpp>
 
+namespace lazycom::model {
+class SessionRecord;
+}
+
 namespace lazycom::logging {
 
 inline constexpr std::uint32_t kSchemaMajor = 1;
 inline constexpr std::uint32_t kSchemaMinor = 0;
-inline constexpr std::size_t kMaxPayloadBytes = 1024U * 1024U;
-inline constexpr std::size_t kMaxMessageBytes = 4096U;
+using model::kMaxMessageBytes;
+using model::kMaxPayloadBytes;
 inline constexpr std::size_t kMaxMetadataBytes = 4096U;
 inline constexpr std::size_t kMaxPhysicalLineBytes = 2U * 1024U * 1024U;
 inline constexpr std::size_t kMaxNdjsonDocumentBytes = 16U * 1024U * 1024U;
@@ -37,9 +43,9 @@ struct SchemaVersion {
   auto operator<=>(const SchemaVersion &) const = default;
 };
 
-enum class Direction { Rx, Tx, Sys, Err };
+using model::Direction;
 enum class PayloadEncoding { Utf8, Base64 };
-enum class InputMode { Text, Hex };
+using model::InputMode;
 enum class Parity { None, Odd, Even, Mark, Space };
 enum class FlowControl { None, RtsCts, XonXoff };
 
@@ -122,30 +128,6 @@ struct NdjsonDocument {
 };
 
 /**
- * @brief Validates structural UTF-8 without terminal-safety filtering.
- * @note Valid controls, NUL, ESC, and bidi formatting code points remain valid
- * UTF-8 and require a separate safe-display projection.
- */
-[[nodiscard]] bool is_strict_utf8(std::span<const std::byte> bytes) noexcept;
-/**
- * @brief Validates `YYYY-MM-DDTHH:MM:SS[.fraction]Z` UTC timestamps.
- * @note Fractions contain one to nine digits; offsets and leap seconds are not
- * accepted.
- */
-[[nodiscard]] bool is_valid_utc(std::string_view value) noexcept;
-
-/**
- * @brief Produces bounded terminal-safe UTF-8 from untrusted message text.
- *
- * Invalid bytes, controls, DEL, and bidi formatting characters are escaped.
- * Output is truncated only at complete UTF-8 or escape boundaries.
- *
- * @warning This is a display-safety projection, not secret redaction and not a
- * reversible payload codec.
- */
-[[nodiscard]] std::string sanitize_message(std::string_view message);
-
-/**
  * @brief Encodes a validated header as one ASCII JSON line.
  * @return A line ending in exactly one LF, or a schema error.
  */
@@ -154,6 +136,10 @@ encode_header_line(const Header &header);
 /** @brief Encodes one validated record as an LF-terminated JSON line. */
 [[nodiscard]] SchemaResult<std::string>
 encode_record_line(const Record &record);
+/** @brief Encodes shared bytes directly without making an owning record copy.
+ */
+[[nodiscard]] SchemaResult<std::string>
+encode_record_line(const model::SessionRecord &record);
 /**
  * @brief Encodes one header and a strictly increasing record sequence.
  * @return A complete bounded NDJSON document or a schema error.

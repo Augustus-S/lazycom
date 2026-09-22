@@ -1,7 +1,5 @@
 #include <lazycom/app/state.hpp>
 
-#include <algorithm>
-
 namespace lazycom::app {
 
 namespace {
@@ -15,24 +13,6 @@ namespace {
 [[nodiscard]] bool valid(const SessionId id) noexcept { return id.value != 0; }
 
 } // namespace
-
-bool ConnectionStateMachine::transition_allowed(
-    const ConnectionState from, const ConnectionState to) noexcept {
-  switch (from) {
-  case ConnectionState::Disconnected:
-    return to == ConnectionState::Connecting;
-  case ConnectionState::Connecting:
-    return to == ConnectionState::Connected || to == ConnectionState::Error ||
-           to == ConnectionState::Disconnecting;
-  case ConnectionState::Connected:
-    return to == ConnectionState::Disconnecting || to == ConnectionState::Error;
-  case ConnectionState::Error:
-    return to == ConnectionState::Disconnecting;
-  case ConnectionState::Disconnecting:
-    return to == ConnectionState::Disconnected;
-  }
-  return false;
-}
 
 bool ConnectionStateMachine::matches_generation(
     const ConnectionGeneration generation) const noexcept {
@@ -184,15 +164,6 @@ bool ConnectionStateMachine::accepts(
   return state_ == ConnectionState::Disconnecting;
 }
 
-StateChange
-InteractionStateMachine::enter(const InteractionState state) noexcept {
-  if (state_ == state) {
-    return StateChange::NoChange;
-  }
-  state_ = state;
-  return StateChange::Applied;
-}
-
 bool LogStateMachine::transition_allowed(const LogState from,
                                          const LogState to) noexcept {
   switch (from) {
@@ -253,66 +224,6 @@ StateChange LogStateMachine::connection_closed() noexcept {
 
 StateChange LogStateMachine::fail() noexcept {
   return transition(LogState::Error);
-}
-
-WorkerLifecycle
-WorkerLifecycleRegistry::state(const WorkerKind worker) const noexcept {
-  return states_[index(worker)];
-}
-
-StateChange
-WorkerLifecycleRegistry::mark_running(const WorkerKind worker) noexcept {
-  auto &lifecycle = states_[index(worker)];
-  if (lifecycle != WorkerLifecycle::NotStarted) {
-    return StateChange::InvalidTransition;
-  }
-  lifecycle = WorkerLifecycle::Running;
-  return StateChange::Applied;
-}
-
-StateChange WorkerLifecycleRegistry::mark_at_return_point(
-    const WorkerStoppedSignal &signal) noexcept {
-  if (signal.lifecycle != WorkerLifecycle::AtReturnPoint) {
-    return StateChange::InvalidTransition;
-  }
-  auto &lifecycle = states_[index(signal.worker)];
-  if (lifecycle == WorkerLifecycle::AtReturnPoint) {
-    return StateChange::NoChange;
-  }
-  if (lifecycle != WorkerLifecycle::Running) {
-    return StateChange::InvalidTransition;
-  }
-  lifecycle = WorkerLifecycle::AtReturnPoint;
-  return StateChange::Applied;
-}
-
-bool WorkerLifecycleRegistry::should_wait_for(
-    const WorkerKind worker) const noexcept {
-  return state(worker) == WorkerLifecycle::Running;
-}
-
-std::size_t WorkerLifecycleRegistry::running_count() const noexcept {
-  return static_cast<std::size_t>(
-      std::count(states_.begin(), states_.end(), WorkerLifecycle::Running));
-}
-
-MainThreadFatalGuard::MainThreadFatalGuard() noexcept
-    : owner_(std::this_thread::get_id()) {}
-
-StateChange MainThreadFatalGuard::enter_fatal_stopping() noexcept {
-  return enter_fatal_stopping_from(std::this_thread::get_id());
-}
-
-StateChange MainThreadFatalGuard::enter_fatal_stopping_from(
-    const std::thread::id caller) noexcept {
-  if (caller != owner_) {
-    return StateChange::Unauthorized;
-  }
-  if (state_ == ProcessLifecycle::FatalStopping) {
-    return StateChange::NoChange;
-  }
-  state_ = ProcessLifecycle::FatalStopping;
-  return StateChange::Applied;
 }
 
 } // namespace lazycom::app

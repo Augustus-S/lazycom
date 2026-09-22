@@ -1,3 +1,4 @@
+#include <lazycom/ui/receive_view_model.hpp>
 #include <lazycom/ui/tui.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -14,6 +15,59 @@ using lazycom::ui::RoutedAction;
 using lazycom::ui::RouteInput;
 using lazycom::ui::RouteMode;
 using lazycom::ui::Utf8EditAction;
+
+TEST_CASE(
+    "receive coordinates retain stable IDs through filtering and eviction",
+    "[ui]") {
+  using namespace lazycom;
+  std::deque<app::VisibleRecord> records;
+  for (std::uint64_t id = 1U; id <= 6U; ++id) {
+    app::VisibleRecord record;
+    record.record_id = id;
+    record.sequence = id <= 3U ? id : id - 3U;
+    record.direction =
+        id % 2U == 0U ? app::RecordDirection::Tx : app::RecordDirection::Rx;
+    records.push_back(std::move(record));
+  }
+  const app::DirectionFilter rx_only{true, false, false, false};
+  ui::ReceiveViewModel view;
+  {
+    const ui::ReceiveCoordinates coordinates{records, rx_only};
+    REQUIRE(coordinates.size() == 3U);
+    view.normalize_cursor(coordinates, true);
+    CHECK(view.cursor() == 5U);
+    const auto [begin, end] = view.viewport(coordinates, 2U, true);
+    CHECK(coordinates.id(begin) == 3U);
+    CHECK(end == 3U);
+    view.move(coordinates, false, 1U);
+    CHECK(view.cursor() == 3U);
+    CHECK_FALSE(view.at_bottom());
+    view.set_matches({1U, 3U, 5U});
+    REQUIRE(view.scroll_to_match(coordinates));
+    CHECK(view.anchor() == 1U);
+  }
+  while (records.front().record_id < 4U) {
+    records.pop_front();
+  }
+  {
+    const ui::ReceiveCoordinates coordinates{records, rx_only};
+    view.normalize_cursor(coordinates);
+    CHECK(view.cursor() == 5U);
+    CHECK(view.at_bottom());
+    view.prune_matches(records, coordinates);
+    CHECK(view.match_count() == 1U);
+    CHECK(view.anchor() == 5U);
+    view.next_match(true);
+    REQUIRE(view.scroll_to_match(coordinates));
+  }
+  records.clear();
+  const ui::ReceiveCoordinates empty{records, rx_only};
+  view.normalize_cursor(empty);
+  view.prune_matches(records, empty);
+  CHECK_FALSE(view.cursor());
+  CHECK_FALSE(view.anchor());
+  CHECK(view.match_count() == 0U);
+}
 
 TEST_CASE("key routing respects mode priority and connection guards", "[ui]") {
   struct Route {

@@ -2,6 +2,7 @@
 #include <lazycom/serial/service.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <support/serial.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -23,7 +24,6 @@
 namespace {
 using namespace std::chrono_literals;
 using namespace lazycom;
-using namespace lazycom::app;
 using namespace lazycom::serial;
 
 class Gate {
@@ -174,15 +174,7 @@ std::vector<std::byte> bytes(std::string_view text) {
     result.push_back(static_cast<std::byte>(value));
   return result;
 }
-bool wait_until(const auto &predicate, std::chrono::milliseconds timeout = 1s) {
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (!predicate()) {
-    if (std::chrono::steady_clock::now() >= deadline)
-      return false;
-    std::this_thread::sleep_for(1ms);
-  }
-  return true;
-}
+using test::wait_until;
 std::size_t retained_event_bytes(const SerialDataEvent &event) {
   return sizeof(SerialDataEvent) + event.bytes.capacity() +
          (event.error ? event.error->detail.capacity() : 0U);
@@ -218,15 +210,7 @@ struct SerialFixture {
       std::terminate();
   }
   std::vector<SerialCompletion> completions(std::size_t count) {
-    std::vector<SerialCompletion> result;
-    REQUIRE(wait_until([&] {
-      auto batch = service->drain_completions();
-      result.insert(result.end(), std::make_move_iterator(batch.begin()),
-                    std::make_move_iterator(batch.end()));
-      return result.size() >= count;
-    }));
-    REQUIRE(result.size() == count);
-    return result;
+    return test::collect_completions(*service, count);
   }
   void connect(std::uint64_t operation = 1U, std::uint64_t generation = 1U) {
     REQUIRE(service->submit_connect(
@@ -239,11 +223,27 @@ struct SerialFixture {
     REQUIRE(connected.outcome == OperationOutcome::Succeeded);
     REQUIRE(connected.session_id);
   }
-  Result<OperationId> send(std::uint64_t id, std::vector<std::byte> payload,
-                           std::optional<TaskGeneration> task = std::nullopt) {
-    return service->submit_tx(
-        {{OperationId{id}, connected.generation, *connected.session_id, task},
-         std::move(payload)});
+  Result<OperationId> send(std::uint64_t id, std::vector<std::byte> payload) {
+    return service->submit_tx({{OperationId{id}, connected.generation,
+                                *connected.session_id, std::nullopt},
+                               std::move(payload)});
+  }
+  Result<OperationId>
+  start_task(std::uint64_t id, std::string_view payload,
+             std::uint64_t interval = 0U,
+             std::optional<TaskGeneration> replacement = {}) {
+    scheduler::QuickSendExecution execution{1U,
+                                            "test",
+                                            config::SendMode::Txt,
+                                            config::Newline::None,
+                                            config::Newline::None,
+                                            "",
+                                            bytes(payload)};
+    return service->submit_task({OperationId{id},
+                                 connected.generation,
+                                 *connected.session_id,
+                                 replacement,
+                                 {std::move(execution), interval}});
   }
   auto disconnect(std::uint64_t id) {
     return service->request_disconnect(
@@ -364,13 +364,24 @@ TEST_CASE("partial TX never interleaves and manual TX wins the next boundary",
   test.backend->write_gate.block();
   REQUIRE(test.send(2U, bytes("Abcd")));
   REQUIRE(test.backend->write_gate.wait());
-  REQUIRE(test.send(3U, bytes("Qq"), TaskGeneration{7}));
+  REQUIRE(test.start_task(3U, "Qq"));
   REQUIRE(test.send(4U, bytes("Bb")));
   test.backend->write_gate.release();
-  const auto result = test.completions(3U);
-  tx_result(result[0], 2U, OperationOutcome::Succeeded);
-  tx_result(result[1], 4U, OperationOutcome::Succeeded);
-  tx_result(result[2], 3U, OperationOutcome::Succeeded);
+  const auto result = test.completions(4U);
+  std::vector<TxCompletion> sent;
+  for (const auto &completion : result) {
+    if (const auto *tx = std::get_if<TxCompletion>(&completion)) {
+      CHECK(tx->outcome == OperationOutcome::Succeeded);
+      sent.push_back(*tx);
+    } else {
+      CHECK(std::get<TaskStartCompletion>(completion).outcome ==
+            OperationOutcome::Succeeded);
+    }
+  }
+  REQUIRE(sent.size() == 3U);
+  CHECK(sent[0].operation_id == OperationId{2});
+  CHECK(sent[1].operation_id == OperationId{4});
+  CHECK(sent[2].operation_id.value > 4U);
   CHECK(test.backend->written() == bytes("AbcdBbQq"));
   CHECK_FALSE(test.service->fatal_signal());
 }
@@ -631,31 +642,33 @@ TEST_CASE(
     blocked = true;
   }
   SECTION("stop arrives after the backend accepted a prefix") {}
-  REQUIRE(test.send(2U, bytes("ABC"), TaskGeneration{7}));
+  REQUIRE(test.start_task(2U, "ABC", 10U));
   REQUIRE(test.backend->write_gate.wait());
+  const auto started = std::get<TaskStartCompletion>(test.completions(1U)[0]);
+  REQUIRE(started.started_generation);
   if (!blocked)
     REQUIRE(wait_until([&] { return test.backend->written() == bytes("A"); }));
-  REQUIRE(test.service->request_stop_task({OperationId{3}, TaskGeneration{7}}));
+  REQUIRE(test.service->request_stop_task(
+      {OperationId{10}, started.started_generation}));
   if (blocked) {
-    const auto raced = test.send(4U, bytes("B"), TaskGeneration{7});
-    REQUIRE_FALSE(raced);
-    CHECK(raced.error().detail == "serial task is stopping");
+    REQUIRE_FALSE(test.start_task(11U, "B", 10U, started.started_generation));
   }
   test.backend->write_gate.release();
   const auto results = test.completions(2U);
-  const auto &tx = tx_result(results[0], 2U, OperationOutcome::Cancelled);
+  const auto &tx = tx_result(results[0], 3U, OperationOutcome::Cancelled);
   CHECK(tx.accepted_bytes == 1U);
   REQUIRE(tx.error);
   CHECK(tx.error->code == ErrorCode::SerialOperationCancelled);
   REQUIRE(std::holds_alternative<TaskStopCompletion>(results[1]));
   CHECK(std::get<TaskStopCompletion>(results[1]).generation ==
-        TaskGeneration{7});
+        started.started_generation);
+  std::this_thread::sleep_for(30ms);
   CHECK(test.backend->written() == bytes("A"));
   const auto queued = test.service->queued_data_bytes();
   const auto prefix = test.service->drain_data(1U);
   REQUIRE(prefix.size() == 1U);
   CHECK(prefix[0].kind == SerialDataKind::Tx);
-  const auto rejected = test.send(5U, bytes("D"));
+  const auto rejected = test.send(12U, bytes("D"));
   REQUIRE_FALSE(rejected);
   CHECK(rejected.error().detail == "serial TX queue is full");
   const auto terminal = test.service->drain_data(1U);
@@ -668,10 +681,146 @@ TEST_CASE(
         retained_event_bytes(prefix) + retained_event_bytes(terminal));
   CHECK(test.service->queued_data_bytes() == 0U);
   test.backend->resume_writes();
-  REQUIRE(test.send(6U, bytes("E")));
+  REQUIRE(test.send(13U, bytes("E")));
   test.completions(1U);
   test.drain_events(1U);
   CHECK_FALSE(test.service->fatal_signal());
+}
+
+TEST_CASE(
+    "owner task commands settle cancellation and reject stale replacement",
+    "[serial][owner][scheduler]") {
+  SerialFixture test;
+  test.connect();
+  test.backend->write_gate.block();
+  REQUIRE(test.send(2U, bytes("M")));
+  REQUIRE(test.backend->write_gate.wait());
+  REQUIRE(test.start_task(3U, "Q", 1000U));
+  SECTION("a pending task can be stopped before it starts") {
+    REQUIRE(test.service->request_stop_task(
+        {OperationId{4}, std::nullopt, OperationId{3}}));
+    test.backend->write_gate.release();
+    const auto completions = test.completions(3U);
+    REQUIRE(std::get<TaskStartCompletion>(completions[1]).outcome ==
+            OperationOutcome::Cancelled);
+    REQUIRE(std::get<TaskStopCompletion>(completions[2]).outcome ==
+            OperationOutcome::Succeeded);
+    CHECK(test.backend->written() == bytes("M"));
+    CHECK(test.service->task_snapshot().task.state ==
+          scheduler::SchedulerState::Idle);
+  }
+  SECTION("shutdown settles the accepted start without sending it") {
+    test.service->request_stop();
+    test.backend->write_gate.release();
+    REQUIRE(test.service->wait_until_stopped(std::chrono::steady_clock::now() +
+                                             1s));
+    const auto completions = test.completions(2U);
+    CHECK(std::get<TaskStartCompletion>(completions[1]).outcome ==
+          OperationOutcome::Cancelled);
+    CHECK(test.backend->written() == bytes("M"));
+  }
+  SECTION("replacement is tied to the exact task that was confirmed") {
+    test.backend->write_gate.release();
+    const auto completions = test.completions(3U);
+    std::optional<TaskGeneration> first;
+    for (const auto &completion : completions) {
+      if (const auto *started = std::get_if<TaskStartCompletion>(&completion))
+        first = started->started_generation;
+    }
+    REQUIRE(first);
+    REQUIRE(test.start_task(10U, "R", 1000U, first));
+    const auto replaced = test.completions(2U);
+    const auto next =
+        std::get<TaskStartCompletion>(replaced[0]).started_generation;
+    REQUIRE(next);
+    REQUIRE(next != first);
+    REQUIRE(test.start_task(20U, "S", 1000U, first));
+    const auto stale = std::get<TaskStartCompletion>(test.completions(1U)[0]);
+    CHECK(stale.outcome == OperationOutcome::Failed);
+    CHECK(stale.status ==
+          scheduler::TaskStartStatus::ReplacementConfirmationRequired);
+    CHECK(test.service->task_snapshot().task.generation == next);
+    CHECK(test.backend->written() == bytes("MQR"));
+  }
+  CHECK_FALSE(test.service->fatal_signal());
+}
+
+TEST_CASE("owner advances task boundaries without a main thread wake",
+          "[serial][owner][scheduler]") {
+  SerialServiceOptions options;
+  options.tx_timeout = 100ms;
+  SerialFixture test{options};
+  test.connect();
+  SECTION("manual timeout releases an initial one-shot trigger") {
+    test.backend->stall_writes();
+    REQUIRE(test.send(2U, bytes("M")));
+    REQUIRE(test.start_task(3U, "Q"));
+    const auto completed = test.completions(2U);
+    bool timed_out = false;
+    for (const auto &completion : completed) {
+      if (const auto *tx = std::get_if<TxCompletion>(&completion)) {
+        CHECK(tx->operation_id == OperationId{2});
+        timed_out = tx->outcome == OperationOutcome::TimedOut;
+      }
+    }
+    REQUIRE(timed_out);
+    // This backend change does not wake the owner.
+    test.backend->resume_writes();
+    const auto sent = test.completions(1U);
+    CHECK(std::get<TxCompletion>(sent[0]).outcome ==
+          OperationOutcome::Succeeded);
+    CHECK(test.backend->written() == bytes("Q"));
+  }
+  SECTION("confirmed replacement stops the unwritten old-task suffix") {
+    test.backend->set_write_steps({1, 64});
+    test.backend->write_gate.block();
+    REQUIRE(test.start_task(2U, "OLD", 1000U));
+    REQUIRE(test.backend->write_gate.wait());
+    const auto started = std::get<TaskStartCompletion>(test.completions(1U)[0]);
+    REQUIRE(started.started_generation);
+    REQUIRE(test.start_task(10U, "NEW", 1000U, started.started_generation));
+    test.backend->write_gate.release();
+    const auto completed = test.completions(3U);
+    const auto &cancelled =
+        tx_result(completed[0], 3U, OperationOutcome::Cancelled);
+    CHECK(cancelled.accepted_bytes == 1U);
+    CHECK(std::get<TaskStartCompletion>(completed[1]).outcome ==
+          OperationOutcome::Succeeded);
+    CHECK(std::get<TxCompletion>(completed[2]).outcome ==
+          OperationOutcome::Succeeded);
+    CHECK(test.backend->written() == bytes("ONEW"));
+    const auto events = test.drain_events(3U);
+    CHECK(events[0].bytes == bytes("O"));
+    CHECK(events[1].kind == SerialDataKind::Error);
+    CHECK(events[2].bytes == bytes("NEW"));
+  }
+  SECTION("task admission bounds retained payload and metadata capacity") {
+    for (const auto field : {0, 1, 2}) {
+      CAPTURE(field);
+      scheduler::QuickSendExecution execution{1U,
+                                              "test",
+                                              config::SendMode::Txt,
+                                              config::Newline::None,
+                                              config::Newline::None,
+                                              "",
+                                              bytes("Q")};
+      if (field == 0)
+        execution.bytes.reserve(config::kMaximumPayloadBytes + 1U);
+      if (field == 1)
+        execution.name.reserve(1024U);
+      if (field == 2)
+        execution.note.assign(257U, 'x');
+      REQUIRE_FALSE(test.service->submit_task({OperationId{2},
+                                               test.connected.generation,
+                                               *test.connected.session_id,
+                                               std::nullopt,
+                                               {std::move(execution), 0U}}));
+    }
+    CHECK(test.backend->written().empty());
+    CHECK(test.service->drain_completions().empty());
+    CHECK(test.service->task_snapshot().task.state ==
+          scheduler::SchedulerState::Idle);
+  }
 }
 
 TEST_CASE("late sessions are rejected and device loss performs cleanup",

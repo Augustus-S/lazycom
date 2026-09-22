@@ -1,7 +1,8 @@
 #pragma once
 
-#include <lazycom/app/completion.hpp>
-#include <lazycom/app/signals.hpp>
+#include <lazycom/base/worker_signals.hpp>
+#include <lazycom/model/session_types.hpp>
+#include <lazycom/scheduler/task.hpp>
 #include <lazycom/serial/backend.hpp>
 
 #include <atomic>
@@ -36,22 +37,52 @@ struct SerialServiceOptions {
 };
 
 struct ConnectRequest {
-  app::ConnectCommand command;
+  ConnectCommand command;
   DevicePath path;
   PortConfig config;
 };
 
 struct TxRequest {
-  app::SendCommand command;
+  SendCommand command;
   std::vector<std::byte> payload;
   config::SendMode input_mode{config::SendMode::Txt};
+};
+
+struct StartTaskRequest {
+  OperationId operation_id{};
+  ConnectionGeneration generation{};
+  SessionId session_id{};
+  std::optional<TaskGeneration> expected_replacement;
+  scheduler::TaskRequest task;
+};
+
+struct TaskStartCompletion {
+  OperationId operation_id{};
+  ConnectionGeneration generation{};
+  SessionId session_id{};
+  OperationOutcome outcome{OperationOutcome::Failed};
+  scheduler::TaskStartStatus status{
+      scheduler::TaskStartStatus::InvalidExecution};
+  std::optional<TaskGeneration> started_generation;
+};
+
+enum class TaskNotice {
+  None,
+  AdmissionRejected,
+  DeadlineOverflow,
+  SequenceOverflow
+};
+struct SerialTaskSnapshot {
+  scheduler::SchedulerSnapshot task;
+  TaskNotice notice{TaskNotice::None};
+  std::uint64_t notice_revision{};
 };
 
 struct ConnectCompletion {
   OperationId operation_id{};
   ConnectionGeneration generation{};
   std::optional<SessionId> session_id;
-  app::OperationOutcome outcome{app::OperationOutcome::Succeeded};
+  OperationOutcome outcome{OperationOutcome::Succeeded};
   std::optional<Error> error;
   /** @brief Paired owner observations of successful session establishment. */
   std::chrono::steady_clock::time_point observed_at{};
@@ -63,7 +94,7 @@ struct TxCompletion {
   ConnectionGeneration generation{};
   SessionId session_id{};
   std::size_t accepted_bytes{};
-  app::OperationOutcome outcome{app::OperationOutcome::Succeeded};
+  OperationOutcome outcome{OperationOutcome::Succeeded};
   std::optional<Error> error;
 };
 
@@ -71,18 +102,19 @@ struct DisconnectCompletion {
   OperationId operation_id{};
   ConnectionGeneration generation{};
   std::optional<SessionId> session_id;
-  app::OperationOutcome outcome{app::OperationOutcome::Succeeded};
+  OperationOutcome outcome{OperationOutcome::Succeeded};
   std::optional<Error> error;
 };
 
 struct TaskStopCompletion {
   OperationId operation_id{};
-  TaskGeneration generation{};
-  app::OperationOutcome outcome{app::OperationOutcome::Succeeded};
+  std::optional<TaskGeneration> generation;
+  OperationOutcome outcome{OperationOutcome::Succeeded};
 };
 
-using SerialCompletion = std::variant<ConnectCompletion, TxCompletion,
-                                      DisconnectCompletion, TaskStopCompletion>;
+using SerialCompletion =
+    std::variant<ConnectCompletion, TxCompletion, DisconnectCompletion,
+                 TaskStopCompletion, TaskStartCompletion>;
 
 enum class SerialDataKind : std::uint8_t {
   Rx,
@@ -95,7 +127,7 @@ struct SerialDataEvent {
   std::uint64_t owner_order{};
   ConnectionGeneration generation{};
   SessionId session_id{};
-  app::SessionEventOrigin origin{app::SessionEventOrigin::Normal};
+  SessionEventOrigin origin{SessionEventOrigin::Normal};
   SerialDataKind kind{SerialDataKind::Rx};
   std::optional<OperationId> operation_id;
   std::vector<std::byte> bytes;
@@ -178,22 +210,28 @@ public:
    * failure/cancellation/timeout.
    */
   [[nodiscard]] Result<OperationId> submit_tx(TxRequest request);
+  /** Admits an immutable task; replacement matches the confirmed generation. */
+  [[nodiscard]] Result<OperationId> submit_task(StartTaskRequest request);
+  [[nodiscard]] SerialTaskSnapshot task_snapshot() const noexcept;
+  [[nodiscard]] std::size_t pending_tx_requests() const noexcept;
+  /** Use this domain for every operation when the owner generates periodic TX.
+   */
+  [[nodiscard]] IdIncrementResult issue_operation(OperationId &issued) noexcept;
   /**
    * @brief Requests cancellation through the dedicated connect-control slot.
    * @return Accepted when this operation owns a future completion, or
    * AlreadyPending when an earlier control request remains authoritative.
    */
   [[nodiscard]] Result<SubmitStatus>
-  request_cancel_connect(app::CancelConnectCommand command);
+  request_cancel_connect(CancelConnectCommand command);
   /** @brief Requests ordered close and final Cleanup for the exact session. */
   [[nodiscard]] Result<SubmitStatus>
-  request_disconnect(app::DisconnectCommand command);
+  request_disconnect(DisconnectCommand command);
   /**
    * @brief Cancels matching scheduled TX and establishes a generation barrier.
    * @post After successful terminal completion, no matching write may occur.
    */
-  [[nodiscard]] Result<SubmitStatus>
-  request_stop_task(app::StopTaskCommand command);
+  [[nodiscard]] Result<SubmitStatus> request_stop_task(StopTaskCommand command);
 
   /**
    * @brief Idempotently closes admission and settles all accepted operations.
@@ -225,8 +263,8 @@ public:
   [[nodiscard]] SerialConnectionSnapshot connection_snapshot() const noexcept;
   [[nodiscard]] std::optional<SerialOverflowSignal>
   overflow_signal() const noexcept;
-  [[nodiscard]] std::optional<app::FatalSignal> fatal_signal() const noexcept;
-  [[nodiscard]] std::optional<app::WorkerStoppedSignal>
+  [[nodiscard]] std::optional<FatalSignal> fatal_signal() const noexcept;
+  [[nodiscard]] std::optional<WorkerStoppedSignal>
   worker_stopped_signal() const noexcept;
   [[nodiscard]] std::uint64_t wait_count() const noexcept;
   [[nodiscard]] std::size_t queued_data_bytes() const noexcept;

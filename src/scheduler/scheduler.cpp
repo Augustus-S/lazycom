@@ -1,3 +1,4 @@
+#include <lazycom/base/text.hpp>
 #include <lazycom/scheduler/scheduler.hpp>
 
 #include <lazycom/encoding/tx.hpp>
@@ -129,8 +130,8 @@ PayloadParseResult parse_payload(const config::SendMode mode,
   const auto maximum = config::kMaximumPayloadBytes - suffix_size;
   encoding::ParsedTxBytes parsed;
   if (mode == config::SendMode::Txt) {
-    // Preserve scheduler's invalid-text-before-size error precedence.
-    if (!encoding::is_strict_utf8(content)) {
+    // parse_text checks UTF-8 unless size fails first; retain error precedence.
+    if (content.size() > maximum && !lazycom::is_strict_utf8(content)) {
       result.status = PayloadParseStatus::InvalidText;
       return result;
     }

@@ -1,3 +1,4 @@
+#include <lazycom/app/session_records.hpp>
 #include <lazycom/config/persistence.hpp>
 #include <lazycom/logging/session_writer.hpp>
 
@@ -26,7 +27,7 @@ struct FakeLogState {
   std::condition_variable condition;
   std::vector<std::string> records;
   bool fail_flush{}, throw_append{}, block_close{}, close_entered{},
-      release_close{};
+      release_close{}, block_append{}, append_entered{}, release_append{};
   std::size_t flushes{}, closes{};
 };
 class FakeLogFileSystem final : public SessionLogFileSystem {
@@ -39,7 +40,12 @@ public:
     return {};
   }
   Status append_line(std::string_view record) override {
-    std::scoped_lock lock{state_->mutex};
+    std::unique_lock lock{state_->mutex};
+    state_->append_entered = true;
+    state_->condition.notify_all();
+    state_->condition.wait(lock, [this] {
+      return !state_->block_append || state_->release_append;
+    });
     if (state_->throw_append)
       throw std::runtime_error{"append exception"};
     state_->records.emplace_back(record);
@@ -90,8 +96,11 @@ template <typename T> T ready(std::future<T> future) {
   return future.get();
 }
 struct LogFixture {
-  explicit LogFixture(SessionWriterOptions options = writer_options())
-      : writer{options, std::make_unique<FakeLogFileSystem>(fake)} {}
+  explicit LogFixture(
+      SessionWriterOptions options = writer_options(),
+      model::GlobalMemoryBudget budget = model::GlobalMemoryBudget{})
+      : writer{options, std::make_unique<FakeLogFileSystem>(fake),
+               std::move(budget)} {}
   ~LogFixture() {
     release_close();
     writer.request_stop();
@@ -106,6 +115,7 @@ struct LogFixture {
   void release_close() {
     std::scoped_lock lock{fake->mutex};
     fake->release_close = true;
+    fake->release_append = true;
     fake->condition.notify_all();
   }
   std::shared_ptr<FakeLogState> fake{std::make_shared<FakeLogState>()};
@@ -168,8 +178,10 @@ TEST_CASE("session writer orders records and completes a flushed barrier",
           "[logging][worker]") {
   LogFixture test;
   test.start();
-  REQUIRE(test.writer.try_enqueue({record(1U, "one"), record(2U, "two")}) ==
-          EnqueueResult::Accepted);
+  for (auto value : {record(1U, "one"), record(2U, "two")}) {
+    REQUIRE(test.writer.try_enqueue(lazycom::test::session_record(
+                std::move(value))) == EnqueueResult::Accepted);
+  }
   const auto barrier = ready(test.writer.barrier(2U));
   CHECK(barrier.state == BarrierState::Confirmed);
   CHECK(barrier.processed_through_seq == 2U);
@@ -181,14 +193,102 @@ TEST_CASE("session writer orders records and completes a flushed barrier",
   CHECK(test.fake->flushes == 1U);
 }
 
+TEST_CASE(
+    "production records share storage through UI eviction and log completion",
+    "[application][logging][budget]") {
+  model::GlobalMemoryBudget budget;
+  app::SessionRecords records{budget};
+  config::ReceiveSettings limits;
+  limits.visible_max_records = 2U;
+  const auto steady = std::chrono::steady_clock::now();
+  const auto utc = std::chrono::system_clock::now();
+  records.start(limits, steady, utc);
+  const auto payload = test::bytes("payload");
+  const auto append = [&](SessionEventOrigin origin =
+                              SessionEventOrigin::Normal) {
+    return records.append(limits, origin, app::RecordDirection::Rx, payload, {},
+                          {}, {}, steady, utc, {});
+  };
+  auto first = append();
+  REQUIRE(first.status == model::SequenceStatus::Accepted);
+  REQUIRE(records.visible().front().owner == first.record);
+  CHECK(records.visible().front().payload.data() ==
+        first.record->payload().data());
+  std::weak_ptr<const model::SessionRecord> retained = first.record;
+  LogFixture log{writer_options(), budget};
+  log.start();
+  {
+    std::scoped_lock lock{log.fake->mutex};
+    log.fake->block_append = true;
+  }
+  REQUIRE(log.writer.try_enqueue(first.record) == EnqueueResult::Accepted);
+  {
+    std::unique_lock lock{log.fake->mutex};
+    REQUIRE(log.fake->condition.wait_for(
+        lock, 1s, [&] { return log.fake->append_entered; }));
+  }
+  first = {};
+  records.clear();
+  CHECK_FALSE(retained.expired());
+  CHECK(budget.used(model::BudgetCategory::UiRecords) > 0U);
+  log.release_close();
+  REQUIRE(ready(log.writer.barrier(1U)).state == BarrierState::Confirmed);
+  CHECK(retained.expired());
+  CHECK(budget.total_used() == 0U);
+  for (int index = 0; index < 3; ++index) {
+    REQUIRE(append().status == model::SequenceStatus::Accepted);
+  }
+  REQUIRE(records.visible().size() == 2U);
+  CHECK(records.visible().front().record_id == 3U);
+  CHECK(records.gap_records() == 1U);
+  records.finish();
+  CHECK(append().status == model::SequenceStatus::Closed);
+  records.start(limits, steady, utc);
+  REQUIRE(append().status == model::SequenceStatus::Accepted);
+  CHECK(records.visible().back().record_id == 5U);
+  CHECK(records.visible().back().sequence == 1U);
+  REQUIRE(append(SessionEventOrigin::Cleanup).status ==
+          model::SequenceStatus::Accepted);
+  CHECK(append().status == model::SequenceStatus::InvalidOrigin);
+  records.finish();
+  records.clear();
+  CHECK(budget.total_used() == 0U);
+
+  auto small_limits = model::BudgetLimits::defaults();
+  small_limits
+      .category[static_cast<std::size_t>(model::BudgetCategory::UiRecords)] =
+      8U * 1024U;
+  model::GlobalMemoryBudget small{small_limits};
+  app::SessionRecords pressured{small};
+  pressured.start(limits, steady, utc);
+  const std::vector<std::byte> large_payload(4096U, std::byte{'x'});
+  const auto large = [&] {
+    return pressured.append(limits, SessionEventOrigin::Normal,
+                            app::RecordDirection::Rx, large_payload, {}, {}, {},
+                            steady, utc, {});
+  };
+  REQUIRE(large().status == model::SequenceStatus::Accepted);
+  auto held = large();
+  REQUIRE(held.status == model::SequenceStatus::Accepted);
+  CHECK(pressured.gap_records() == 1U);
+  CHECK(pressured.visible().front().record_id == 2U);
+  // A log owner can retain the physical allocation after display eviction.
+  CHECK(large().status == model::SequenceStatus::BudgetExhausted);
+  CHECK(pressured.last_sequence() == 2U);
+  CHECK(pressured.visible().empty());
+  CHECK(small.total_used() <= 8U * 1024U);
+  held = {};
+  CHECK(small.total_used() == 0U);
+}
+
 TEST_CASE("session queue overload is nonblocking and terminal",
           "[logging][worker]") {
   auto options = writer_options();
   options.queue_max_bytes = 1U;
   LogFixture test{options};
   test.start();
-  CHECK(test.writer.try_enqueue({record(1U, "too large")}) ==
-        EnqueueResult::QueueFull);
+  CHECK(test.writer.try_enqueue(lazycom::test::session_record(
+            record(1U, "too large"))) == EnqueueResult::QueueFull);
   CHECK(test.writer.state() == SessionLogState::Error);
   CHECK(ready(test.writer.barrier(1U)).state == BarrierState::WriterFailed);
 }
@@ -201,8 +301,8 @@ TEST_CASE("session IO failures and exceptions complete queued futures",
     test.fake->throw_append = true;
   }
   test.start();
-  REQUIRE(test.writer.try_enqueue({record(1U, "one")}) ==
-          EnqueueResult::Accepted);
+  REQUIRE(test.writer.try_enqueue(lazycom::test::session_record(
+              record(1U, "one"))) == EnqueueResult::Accepted);
   CHECK(ready(test.writer.barrier(1U)).state == BarrierState::WriterFailed);
   CHECK(test.writer.state() == SessionLogState::Error);
   CHECK(ready(test.writer.shutdown()).state == SessionLogState::Error);
@@ -224,8 +324,8 @@ TEST_CASE("disable shares one close while enforcing its waiter capacity",
     REQUIRE(test.fake->condition.wait_for(
         lock, 1s, [&] { return test.fake->close_entered; }));
   }
-  CHECK(test.writer.try_enqueue({record(1U, "after disable")}) ==
-        EnqueueResult::NotRecording);
+  CHECK(test.writer.try_enqueue(lazycom::test::session_record(
+            record(1U, "after disable"))) == EnqueueResult::NotRecording);
   for (std::size_t i = 1U; i < 256U; ++i)
     waiters.push_back(test.writer.disable());
   const auto overflow = ready(test.writer.disable());
