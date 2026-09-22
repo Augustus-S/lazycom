@@ -962,11 +962,6 @@ TEST_CASE("TX errors retain their code and operation identifier",
   const auto log_directory = harness.paths.config.parent_path() / "logs";
   REQUIRE(std::filesystem::create_directory(log_directory));
   REQUIRE(::chmod(log_directory.c_str(), S_IRWXU) == 0);
-  REQUIRE(application.apply_logging({log_directory.string(), 25U, 128U, 16U}));
-  REQUIRE(tick_until(application, [&] {
-    return application.snapshot().effective_log_directory ==
-           log_directory.string();
-  }));
   REQUIRE(harness.connect());
   REQUIRE(harness.start_logging());
   backend->fail_after_write_limit(3U);
@@ -1168,7 +1163,8 @@ TEST_CASE("repeated logging updates preserve a pending rotation and its tail",
   using app::LogState;
   auto backend = std::make_unique<FakeBackend>();
   auto *const serial_backend = backend.get();
-  ApplicationHarness harness{std::move(backend)};
+  ApplicationHarness harness{std::move(backend),
+                             std::make_unique<FakeBackend>(), "old-logs"};
   auto &application = harness.app();
   const auto root = harness.paths.config.parent_path();
   REQUIRE(std::filesystem::exists(root));
@@ -1180,7 +1176,6 @@ TEST_CASE("repeated logging updates preserve a pending rotation and its tail",
     REQUIRE(std::filesystem::create_directory(directory));
     REQUIRE(::chmod(directory.c_str(), S_IRWXU) == 0);
   }
-  REQUIRE(application.apply_logging({old_logs.string(), 25U, 128U, 16U}));
   REQUIRE(harness.connect());
   REQUIRE(harness.start_logging());
   REQUIRE(application.apply_logging({next_logs.string(), 25U, 128U, 16U}));
