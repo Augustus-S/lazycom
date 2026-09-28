@@ -47,6 +47,7 @@ checked-in `configure`/`Makefile.in`. Removed from the upstream 0.1.2 archive:
 
 - `examples/` (only listed in `EXTRA_DIST`)
 - `test_timing.c` (`make check` only)
+- `autostuff/test-driver` (upstream test runner, preserved in `lazycom-test`)
 - `Doxyfile`
 - `macosx.c`, `windows.c`, `freebsd.c` (automake conditionals not active on
   Linux; the generated Linux Makefile never references them)

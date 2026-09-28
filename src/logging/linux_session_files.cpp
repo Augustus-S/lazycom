@@ -379,7 +379,7 @@ public:
         return created;
       }
     } else {
-      auto capacity = ensure_capacity(0U, amount);
+      auto capacity = enforce_capacity(0U, amount);
       if (!capacity) {
         return capacity;
       }
@@ -712,6 +712,12 @@ private:
     if (!refreshed) {
       return refreshed;
     }
+    return enforce_capacity(additional_files, additional_bytes);
+  }
+
+  // Requires a successful inventory refresh for the current active file.
+  [[nodiscard]] Status enforce_capacity(std::size_t additional_files,
+                                        std::uint64_t additional_bytes) {
     auto &observed = inventory_cache_;
     std::size_t index = 0;
     const auto exceeds = [&] {
@@ -749,7 +755,9 @@ private:
     observed.deletable.erase(observed.deletable.begin(),
                              observed.deletable.begin() +
                                  static_cast<std::ptrdiff_t>(index));
-    update_inventory_stamp();
+    if (index != 0U) {
+      update_inventory_stamp();
+    }
     return {};
   }
 

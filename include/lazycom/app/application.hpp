@@ -134,11 +134,13 @@ public:
    * @brief Creates independent default libserialport backends and the app.
    * @param wake_callback Optional worker-safe coalesced UI wake callback.
    * @param wake_context Borrowed callback context valid through shutdown.
+   * @param budget Shared accounting for application storage and UI caches.
    * @throws std::bad_alloc if backend allocation fails before error adaptation.
    */
-  [[nodiscard]] static Result<std::unique_ptr<Application>>
-  create_default(serial::UiWakeCallback wake_callback = nullptr,
-                 void *wake_context = nullptr);
+  [[nodiscard]] static Result<std::unique_ptr<Application>> create_default(
+      serial::UiWakeCallback wake_callback = nullptr,
+      void *wake_context = nullptr,
+      model::GlobalMemoryBudget budget = model::GlobalMemoryBudget{});
 
   ~Application();
   Application(const Application &) = delete;

@@ -11,8 +11,6 @@
       "hidden": true,
       "generator": "Ninja",
       "cacheVariables": {
-        "BUILD_TESTING": "ON",
-        "LAZYCOM_BUILD_TESTS": "ON",
         "LAZYCOM_BUILD_DIAGNOSTICS": "ON",
         "LAZYCOM_USE_SYSTEM_LIBSERIALPORT": "OFF",
         "LAZYCOM_WARNINGS_AS_ERRORS": "ON"
@@ -75,51 +73,29 @@
     }
   ],
   "buildPresets": [
-    { "name": "gcc-debug", "configurePreset": "gcc-debug" },
-    { "name": "clang-debug", "configurePreset": "clang-debug" },
-    { "name": "gcc-release", "configurePreset": "gcc-release" },
-    { "name": "gcc-debug-no-diagnostics", "configurePreset": "gcc-debug-no-diagnostics" },
-    { "name": "gcc-asan-ubsan", "configurePreset": "gcc-asan-ubsan" },
-    { "name": "gcc-tsan", "configurePreset": "gcc-tsan" }
-  ],
-  "testPresets": [
     {
       "name": "gcc-debug",
-      "configurePreset": "gcc-debug",
-      "output": { "outputOnFailure": true }
-    },
-    {
-      "name": "gcc-debug-fast",
-      "inherits": "gcc-debug",
-      "filter": { "exclude": { "label": "^(build|extended)$" } }
+      "configurePreset": "gcc-debug"
     },
     {
       "name": "clang-debug",
-      "configurePreset": "clang-debug",
-      "output": { "outputOnFailure": true }
+      "configurePreset": "clang-debug"
     },
     {
       "name": "gcc-release",
-      "configurePreset": "gcc-release",
-      "output": { "outputOnFailure": true }
+      "configurePreset": "gcc-release"
     },
     {
       "name": "gcc-debug-no-diagnostics",
-      "configurePreset": "gcc-debug-no-diagnostics",
-      "output": { "outputOnFailure": true }
+      "configurePreset": "gcc-debug-no-diagnostics"
     },
     {
       "name": "gcc-asan-ubsan",
-      "configurePreset": "gcc-asan-ubsan",
-      "environment": {
-        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"
-      },
-      "output": { "outputOnFailure": true }
+      "configurePreset": "gcc-asan-ubsan"
     },
     {
       "name": "gcc-tsan",
-      "configurePreset": "gcc-tsan",
-      "output": { "outputOnFailure": true }
+      "configurePreset": "gcc-tsan"
     }
   ]
 }

@@ -3,6 +3,15 @@
 本文件适用于整个仓库，定义 AI 辅助开发的默认约束。子目录中的更具体
 `AGENTS.md` 可以为对应子树补充或覆盖这些规则。
 
+## 测试仓库与执行权限
+
+本仓库只维护生产代码，不得在这里新增测试代码、测试项、测试 target 或自动测试入口。
+全部测试、辅助代码、Catch2、测试清单和打包验证脚本由独立 Git 仓库
+`../lazycom-test` 管理。未经用户明确指令，不得新增或运行测试，也不得执行测试发现、
+benchmark、压力测试或安装冒烟验证。普通开发、修复、构建和审查请求不自动授权测试。
+此规则优先于历史计划、报告和技能文件中的默认测试门禁；文档列出的验收要求不构成
+执行授权。确需测试时，应说明尚未验证的范围，等待用户明确指令。
+
 ## 1. 项目概览
 
 LazyCom 是使用 C++20 开发的 Linux 优先 TUI 串口助手。项目使用：
@@ -12,7 +21,7 @@ LazyCom 是使用 C++20 开发的 Linux 优先 TUI 串口助手。项目使用�
 - toml++：配置文件解析和序列化。
 - nlohmann/json：NDJSON 会话日志。
 - tl::expected：通过项目的 `Result<T>` 别名返回显式错误。
-- Catch2：单元和集成测试。
+- Catch2：由 `../lazycom-test` 独立维护，仅用于获明确授权的测试。
 
 当前支持基线：
 
@@ -22,8 +31,8 @@ LazyCom 是使用 C++20 开发的 Linux 优先 TUI 串口助手。项目使用�
 - C++20，禁用编译器语言扩展。
 - 默认使用仓库内固定版本依赖，配置和构建不得强制联网。
 
-不要从旧报告复制测试数量或完成状态。当前源码、CMake 测试发现结果和本次实际
-执行记录才是当前测试数量及验证状态的依据。
+不要从旧报告复制测试数量或完成状态。只有测试仓库中针对当前源码实际执行的
+记录才能作为当前验证证据；禁止为了更新数量擅自执行测试发现。
 
 ## 2. 事实来源
 
@@ -43,8 +52,7 @@ LazyCom 是使用 C++20 开发的 Linux 优先 TUI 串口助手。项目使用�
 
 - `include/lazycom/`：按模块组织的项目头文件。
 - `src/`：生产实现。
-- `tests/unit/`：确定性的单元和组件测试。
-- `tests/integration/`：文件系统、PTY、backend 和 Linux 集成测试。
+- `../lazycom-test/`：独立测试仓库，不属于本仓库构建。
 - `cmake/`：项目选项、依赖、sanitizer 和 hardening 配置。
 - `include/dependencies/`：固定版本的 header-only 依赖及元数据。
 - `third_party/`：固定版本的源码依赖，按 vendored code 管理。
@@ -87,7 +95,8 @@ LazyCom 是使用 C++20 开发的 Linux 优先 TUI 串口助手。项目使用�
 - 没有持久数据、已发布 API 或明确用户需求时，不添加兼容层。现有配置和日志格式
   属于真实兼容边界。
 - 保持稳定错误码和已发布 schema 的语义，不得复用已有错误码表达新含义。
-- 实现与测试同步修改。可测试的行为修复应包含能覆盖原失败模式的回归测试。
+- 需要回归验证的行为修复应报告未验证范围；只有用户明确要求时，才在
+  `../lazycom-test` 新增、修改或执行对应测试。
 - 有意改变产品行为时更新 `Plan.md`；改变工程契约时更新 `DevelopPlan.md`。
 - 不修改历史报告来伪造新的验证证据。
 
@@ -166,80 +175,31 @@ LazyCom 是使用 C++20 开发的 Linux 优先 TUI 串口助手。项目使用�
 - 默认使用仓库内固定版本依赖，不得替换为任意系统版本或添加 configure-time 下载。
 - 应用功能修复不得修改 `third_party/` 或 `include/dependencies/`。
 - 依赖升级作为独立变更处理，必须固定精确版本，保留或更新许可证，同步 dependency
-  lock、checksum 和本地补丁说明，并运行完整相关验证矩阵。
+  lock、checksum 和本地补丁说明，并按用户明确授权在测试仓库执行相关验证矩阵。
 - libserialport 保持 shared library，不得静态合并到应用。
 - 未经产品和架构批准，不引入 Boost、Asio、协议库、脚本 runtime、plugin loader、
   iconv 或 libudev。
 
-## 10. 构建与测试
+## 10. 构建与验证
 
-所有命令从仓库根目录执行。
-
-默认开发构建和测试：
+所有生产构建命令从本仓库根目录执行：
 
 ```bash
 cmake --preset gcc-debug
 cmake --build --preset gcc-debug
-ctest --preset gcc-debug
 ```
 
-迭代时运行定向测试：
+其他 configure/build presets 为 `clang-debug`、`gcc-release`、
+`gcc-debug-no-diagnostics`、`gcc-asan-ubsan` 和 `gcc-tsan`。
+ASan/UBSan 与 TSan 分开配置；编译 sanitizer 版本不代表运行过 sanitizer 验证。
 
-```bash
-ctest --preset gcc-debug -R "<test-name-regex>"
-```
+本仓库不注册 CTest，不提供 test presets，也不构建或获取 Catch2。
+不要使用迁移前的 build 目录运行遗留测试程序或 CTest 文件。测试仓库使用独立
+build 目录；其操作规则见 `../lazycom-test/AGENTS.md`。
 
-快速迭代可复用已构建的 GCC Debug 产物：
-
-```bash
-ctest --preset gcc-debug-fast
-```
-
-该入口只排除 `build`（依赖重建）与 `extended`（NDJSON 全文档硬上限）标签。
-安全、并发、PTY 和近期回归仍在快速集合中。完整 preset 保持全量，阶段验收与
-下述验证策略不得以快速入口替代。定向慢测可用 `-L build` 或 `-L extended`。
-
-其他支持的 presets：
-
-```bash
-cmake --preset clang-debug
-cmake --build --preset clang-debug
-ctest --preset clang-debug
-
-cmake --preset gcc-release
-cmake --build --preset gcc-release
-ctest --preset gcc-release
-
-cmake --preset gcc-debug-no-diagnostics
-cmake --build --preset gcc-debug-no-diagnostics
-ctest --preset gcc-debug-no-diagnostics
-
-cmake --preset gcc-asan-ubsan
-cmake --build --preset gcc-asan-ubsan
-ctest --preset gcc-asan-ubsan
-```
-
-`gcc-tsan` configure/build/test preset 已存在。TSan 必须与 ASan/UBSan 分开运行，并要求
-当前环境提供可用 libtsan：
-
-```bash
-cmake --preset gcc-tsan
-cmake --build --preset gcc-tsan
-ctest --preset gcc-tsan
-```
-
-验证策略：
-
-- 仅文档修改：检查引用、路径、命令和内部一致性，通常不需要重新构建。
-- 局部纯逻辑修改：构建 GCC Debug，运行定向测试，再运行完整 GCC Debug 测试。
-- 跨模块、持久化、串口、日志、并发、CMake、依赖或发布敏感修改：除非环境阻塞，
-  运行 GCC Debug、Clang Debug、GCC Release、no-diagnostics 和 ASan/UBSan。
-- 并发修改在环境支持时额外运行 TSan。
-- 硬件行为必须使用真实设备验证；PTY 测试不能证明 USB-UART 驱动、权限、拔插或
-  高波特率行为。
-
-未针对当前修改实际执行的 preset、sanitizer、硬件矩阵、压力测试或长时测试，不得
-报告为通过。跳过或阻塞的验证必须明确说明。
+仅文档修改检查路径、引用、命令和内部一致性，通常不需要重建。代码或构建修改
+可按影响范围执行生产构建、静态检查与 diff 审查，不得自动扩展为测试。
+未执行的测试、sanitizer、硬件或性能验证必须明确列为未验证；PTY 不能代替真实硬件证据。
 
 ## 11. 格式化与仓库卫生
 
@@ -262,7 +222,7 @@ ctest --preset gcc-tsan
 
 1. 确认实现符合相关产品和工程契约。
 2. 检查改动路径的正常、失败、取消、边界和 shutdown 行为。
-3. 在可行时增加或更新没有该修复就会失败的测试。
-4. 格式化本次修改的 C++ 文件，并按风险运行相应验证。
+3. 测试仅在用户明确要求时于 `../lazycom-test` 维护和执行，否则报告验证缺口。
+4. 格式化本次修改的 C++ 文件，并按风险执行生产构建与获授权的验证。
 5. 审查最终修改，排除意外编辑、不安全兼容变更、过期文档和无界资源路径。
 6. 报告修改内容、实际测试，以及剩余硬件、性能、sanitizer 或环境限制。

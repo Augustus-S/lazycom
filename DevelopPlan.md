@@ -9,8 +9,13 @@
 - 首版目标平台为现代 Linux，语言标准为 C++20。
 - 首版只提供纯字节串口助手；工业协议、脚本和插件仅是非规范性研究候选，必须先在 `Plan.md` 完成产品审核才可进入实施路线。
 - 当前工程状态：阶段 1 至阶段 6 的主要功能和本轮安全加固已落地；阶段 7 的真实 USB-UART 矩阵、8 小时性能/RSS 验收、完整 diagnostics worker 和发布诊断文档仍待完成。
-- 当前生产 `Application` 尚未接入已经实现并测试的 `GlobalMemoryBudget` 与 `SessionSequencer`，因此 128 MiB 全局 token 仍是未闭环项；各类别、队列、输入和文件尺寸硬上限仍然生效。
+- 生产记录路径已通过 `SessionRecords` 接入 `SessionSequencer` 和共享记录 token，UI 与日志持有同一不可变记录。记录及日志引用的预算已接入；其他运行时类别尚未全部接入，因此 128 MiB 全局 token 仍未闭环，各类别、队列、输入和文件尺寸硬上限继续生效。
 - diagnostics 当前只有编译开关、spdlog 链接探针、`emergency_write()` 与 terminate/FATAL 最小路径，不具备本计划第 7.6、10.5 至 10.8 节描述的完整内部队列、worker、安全 sink、轮换和脱敏能力。
+
+测试代码、测试项、Catch2、test presets 与打包验证脚本由独立 `../lazycom-test`
+仓库维护。本仓库只构建生产 targets；未经用户明确指令，不新增或运行测试。
+本文后续的测试、性能 spike 与阶段验收要求是验收依据，不是自动执行授权。
+历史报告保持原样，不作为迁移后的当前验证结果。
 
 ## 2. 已确认的工程决策
 
@@ -25,7 +30,7 @@
 | 配置 | toml++ |
 | JSON | nlohmann/json |
 | 错误返回 | `tl::expected`，通过项目 `Result<T>` 别名隔离 |
-| 测试 | Catch2 3.x |
+| 测试 | 独立 `../lazycom-test` 仓库中的 Catch2 3.x，仅按明确指令执行 |
 | Header-only 依赖 | 固定源码放入 `include/dependencies/` |
 | 内部诊断日志 | spdlog diagnostics facade/链接探针已编译；完整 worker 与安全 sink 待阶段 7，运行时默认关闭 |
 | 线程 | `std::jthread`、`std::stop_token` 和有界队列 |
@@ -33,7 +38,7 @@
 | 异步模型 | 同步底层后端、异步服务命令与事件 |
 | Asio | 首版不引入 |
 | 插件 ABI | 首版不开放；后续是否提供尚未形成产品承诺 |
-| 管理内存 | 128 MiB 分类预算模型和硬上限已实现；生产 Application 的全局 token 接入待完成，RSS 目标为空载基线 +192 MiB |
+| 管理内存 | 记录及其 payload 与 UI/log 引用已接入共享预算；其他类别仍待闭环，RSS 目标为空载基线 +192 MiB |
 | 会话日志 | NDJSON v1，UTF-8/base64 无损 payload |
 | 连接状态 | 内部和 UI 统一为 Disconnected、Connecting、Connected、Disconnecting、Error |
 | 会话日志状态 | 内部 Off、Waiting、Recording、Error；UI OFF、WAITING、REC、ERROR |
@@ -73,7 +78,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 - Release、RelWithDebInfo 和 MinSizeRel 通过独立 interface targets 应用 PIE、`-fstack-protector-strong`、`_FORTIFY_SOURCE=3`、RELRO、NOW 和 non-executable stack；每个编译/链接参数先经 CMake capability check。
 - hardening 应用于全部 LazyCom 生产 targets；最终可执行文件额外应用链接 hardening。bundled libserialport 的 Release CFLAGS/LDFLAGS 同步启用经检测支持的 stack protector、FORTIFY、RELRO、NOW 和 noexecstack。
 - sanitizer 组合在 configure 阶段互斥校验；TSan 不与 ASan/UBSan 同开，coverage 不与 LTO 同开。
-- `CMakePresets.json` 已提供 `gcc-debug`、`clang-debug`、`gcc-release`、`gcc-debug-no-diagnostics`、`gcc-asan-ubsan` 和 `gcc-tsan` 的 configure/build/test presets。
+- `CMakePresets.json` 已提供 `gcc-debug`、`clang-debug`、`gcc-release`、`gcc-debug-no-diagnostics`、`gcc-asan-ubsan` 和 `gcc-tsan` 的 configure/build presets；test presets 仅由 `../lazycom-test` 提供。
 
 ### 3.3 首版依赖
 
@@ -85,7 +90,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 | nlohmann/json | 固定 3.x tag | header-only target | NDJSON 编码和校验 | MIT |
 | tl::expected | 固定 1.x tag | header-only target | C++20 `Result<T>` | CC0 |
 | spdlog | 固定已验证 tag | 编译静态 target | 默认关闭的内部诊断日志 | MIT |
-| Catch2 | 固定 3.x tag | 仅测试 target | 单元、性质和集成测试 | BSL-1.0 |
+| Catch2（外部测试仓库） | 固定 3.x tag | 仅测试 target | 单元、性质和集成测试 | BSL-1.0 |
 | Threads::Threads | 系统 | CMake imported target | C++ 线程运行时 | 系统 |
 
 构建时工具：
@@ -106,7 +111,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 - 每个 vendored 库必须保留原始许可证；升级时整体替换对应上游头文件并更新 lock，不能手工混合不同版本。
 - CMake 通过独立 `lazycom_header_dependencies` interface target 将各依赖根目录标记为 `SYSTEM INTERFACE`，业务代码仍使用上游 include 名称，例如 `<nlohmann/json.hpp>`。
 - `include/dependencies/` 只作为私有构建输入，不随未来 LazyCom SDK 安装，也不能被项目头文件通过相对路径引用。
-- FTXUI、spdlog 和 Catch2 不是本项目采用的纯 header-only 依赖，使用固定源码或固定 `FetchContent`；Catch2 仅在 `LAZYCOM_BUILD_TESTS=ON` 时获取和构建。
+- FTXUI 和 spdlog 使用仓库内固定源码；Catch2 连同许可证、版本锁和源码由 `../lazycom-test` 独立维护，生产构建不查找或构建 Catch2。
 - spdlog 构建为独立静态 target，关闭其 examples、tests 和 benchmarks，使用其随库提供的 fmt 实现，不向其他模块暴露 fmt API。
 - `LAZYCOM_BUILD_DIAGNOSTICS=OFF` 时仍生成同名 no-op facade target，保留稳定错误代码和 FATAL 所需的最小应急写入接口，但不获取或链接 spdlog。
 - 所有 FetchContent 项目必须固定 tag 或 commit，不允许跟踪分支。
@@ -116,7 +121,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 建议的 CMake options：
 
 ```text
-LAZYCOM_BUILD_TESTS=ON|OFF
 LAZYCOM_BUILD_DIAGNOSTICS=ON|OFF
 LAZYCOM_USE_SYSTEM_LIBSERIALPORT=ON|OFF
 LAZYCOM_USE_SYSTEM_DEPS=ON|OFF
@@ -182,30 +186,28 @@ lazycom/
     ftxui/
     libserialport/
     spdlog/
-    catch2/
-  tests/
-    unit/
-    integration/
-    fixtures/
-    support/
   docs/
   packaging/
 ```
+
+测试目录和 Catch2 位于独立 `../lazycom-test` 仓库，该仓库通过 `LAZYCOM_SOURCE_DIR`
+引用生产源码并复用 targets；默认目录为相邻 `../lazycom`。测试发现使用 `PRE_TEST`，
+配置和构建不执行测试程序，生产构建不会反向加载测试仓库。
 
 首版可根据代码量合并小目录，但依赖方向必须保持。不要为只有一个调用点的简单逻辑创建抽象层。
 
 ### 4.1 CMake targets
 
-建议使用以下 targets：
+当前生产构建使用以下 targets；实现以根目录 `CMakeLists.txt` 为准：
 
 - `lazycom_base`：Error、稳定错误代码、强类型 ID 和其他无 I/O 基础值类型。
-- `lazycom_core`：状态模型、编码、分帧、配置 schema 和纯逻辑。
+- `lazycom_core`：应用版本及构建信息。
+- `lazycom_data_path`：无 I/O 的分帧、编码、共享记录、sequencer 和预算模型。
 - `lazycom_header_dependencies`：本地 header-only 依赖的 `SYSTEM INTERFACE` target。
-- `lazycom_platform_linux`：eventfd、ppoll、安全文件操作和 Linux 辅助代码。
-- `lazycom_serial`：libserialport RAII、owner 和扫描器。
+- `lazycom_serial`：libserialport RAII、owner、扫描器及 owner 内部 scheduler。
 - `lazycom_logging`：日志格式、队列、轮换和配额。
 - `lazycom_config`：TOML schema、验证、安全读取和持久化 worker。
-- `lazycom_diagnostics`：始终存在的诊断 facade；默认构建使用项目 worker、spdlog formatter、等级映射、脱敏、自定义安全 fd sink 和应急写入，关闭构建使用 no-op 实现。
+- `lazycom_diagnostics`：诊断 facade、spdlog 链接探针和最小应急接口；完整 worker、安全 sink 和轮换仍待实现。
 - `lazycom_app`：生命周期、状态机、typed command/event 路由、可靠 completion 和 FATAL coordinator。
 - `lazycom_ui`：FTXUI 组件和事件路由。
 - `lazycom`：最终可执行文件。
@@ -215,16 +217,17 @@ lazycom/
 
 ### 4.2 依赖方向
 
-以下箭头右侧表示 target 的直接依赖：
+以下箭头表示主要架构依赖，省略构建辅助 target 及可执行文件中的显式重复链接；完整直接链接以 `CMakeLists.txt` 为准：
 
 ```text
 base        -> header_dependencies
-diagnostics -> base, spdlog
-core        -> base, header_dependencies
-serial      -> base, platform_linux, diagnostics, libserialport
-logging     -> base, platform_linux, diagnostics, header_dependencies
-config      -> base, platform_linux, diagnostics, header_dependencies
-app         -> core, serial, logging, config, diagnostics
+diagnostics -> base, spdlog（仅 LAZYCOM_BUILD_DIAGNOSTICS=ON）
+core        -> base
+data_path   -> base, Threads
+serial      -> base, config, Threads, libserialport
+logging     -> base, data_path, Threads
+config      -> base
+app         -> core, serial, logging, config, data_path, diagnostics
 ui          -> app, FTXUI
 main        -> app, ui
 ```
@@ -237,6 +240,17 @@ main        -> app, ui
 - FATAL coordinator 属于 app 主线程生命周期，不属于 diagnostics；底层 worker 发布固定 FatalSignal 并唤醒主线程，不能自行协调退出。
 - Catch2 不得成为任何生产 target 的直接或传递依赖。
 - `scheduler/` 是 `lazycom_serial` target 内部的纯 deadline 与 task generation 组件，不创建独立线程或独立 CMake target。
+
+### 4.3 应用内部职责
+
+- `Application` 保留连接状态机、命令守卫、事件归并顺序、跨组件断开 barrier 和正常/FATAL 退出协调。
+- `SettingsCoordinator` 独占三份配置文档的身份、保留文本、read-only、dirty、保存 future 及 quick-send 待提交候选；提交结果返回给应用后再更新展示状态。
+- `SessionLogCoordinator` 独占 writer、Start/End/Disable、rollover owner、backlog、重建和停止 deadline。它返回具名日志状态与关闭边界，不回调应用状态机。串口 Cleanup 和日志关闭仍是两个条件。
+- `SessionRecords` 独占 framer、sequencer、可见记录、跨连接 record ID、RX/TX 统计和淘汰；`AppSnapshot` 借用其只读记录容器。
+- `ReceiveViewModel` 管理过滤后坐标、viewport anchor、稳定 cursor 和搜索导航；TUI 保留输入优先级和 FTXUI 生命周期。覆盖层使用 `ModalKind` 与对应候选类型，沿用有界栈和父页面恢复。
+- 设置接口直接传递具名候选和枚举；UI 只解析文本入口。Application 仍校验候选、连接锁和 stop gate。
+- 公共 worker 信号与 operation/session 值类型分别放在 `base/worker_signals.hpp` 和 `model/session_types.hpp`；底层模块不反向包含 app。
+- 严格 UTF-8、UTC 校验和安全 message projection 放在 `base/text`，payload 显示转义保持在 encoding。Linux 日志后端与异步 writer 分开编译，安全 fd 包装是平台私有实现。
 
 ## 5. 核心 C++ 类型与错误模型
 
@@ -338,9 +352,9 @@ struct FatalSignal {
 
 - 原始数据使用 `std::byte`。
 - 只读参数使用 `std::span<const std::byte>`。
-- 跨队列数据使用不可变引用计数记录或批次，例如 `std::shared_ptr<const SessionRecordBatch>`；一个批次可以包含多个逻辑 record，但每个 record 保留独立 seq。
+- 跨队列数据使用 `std::shared_ptr<const SessionRecord>`。每条记录拥有自己的 payload 和预算 token；UI 与日志共享该记录，按独立 seq 排序并逐条淘汰。
 - payload 的全局预算 token 随共享记录生命周期持有并只计一次；每个 sink 仍统计自己的逻辑消息数和字节数以执行过载策略。
-- 所有容器节点、字符串 capacity、索引和批次元数据按保守值计入 128 MiB 管理预算。
+- 所有容器节点、字符串 capacity、索引和记录元数据按保守值计入 128 MiB 管理预算。
 - UI 文本只是派生表示，不替代原始数据。
 
 ## 6. 同步与异步接口
@@ -370,18 +384,20 @@ public:
 
 ```cpp
 using SerialCompletion = std::variant<
-    ConnectCompleted,
-    SendCompleted,
-    DisconnectCompleted,
-    TaskStopped>;
+    ConnectCompletion,
+    TxCompletion,
+    DisconnectCompletion,
+    TaskStartCompletion,
+    TaskStopCompletion>;
 
 class SerialService {
 public:
-  Result<OperationId> submit_connect(ConnectCommand command);
-  Result<OperationId> submit_tx(SendCommand command);
-  Result<OperationId> request_cancel_connect();
-  Result<OperationId> request_disconnect();
-  Result<OperationId> request_stop_task(TaskGeneration task);
+  Result<OperationId> submit_connect(ConnectRequest request);
+  Result<OperationId> submit_tx(TxRequest request);
+  Result<OperationId> submit_task(StartTaskRequest request);
+  Result<SubmitStatus> request_cancel_connect(CancelConnectCommand command);
+  Result<SubmitStatus> request_disconnect(DisconnectCommand command);
+  Result<SubmitStatus> request_stop_task(StopTaskCommand command);
   std::vector<SerialDataEvent> drain_data(std::size_t max_events);
   std::vector<SerialCompletion> drain_completions();
 };
@@ -401,13 +417,12 @@ public:
 
 ### 6.3 Worker stop protocol
 
-- serial、session log、scanner、persistence 和 diagnostics worker 在初始化时分别创建固定 stop 标志、`NotStarted | Running | AtReturnPoint` 生命周期槽和固定 `WorkerStoppedSignal`。
-- 未编译、运行时未启用或允许降级的初始化失败保持 NotStarted；主线程维护固定 running bitmask，只向曾进入 Running 的 worker 请求 stop 并等待信号。对 NotStarted worker 的 stop 是幂等 no-op。
-- 主线程通过 `request_worker_stop(WorkerKind) noexcept` 设置 stop 标志并触发该 worker 已存在的 eventfd 或 condition-variable predicate；路径不能分配内存或向普通队列 push。
-- 每个线程入口采用外层 trampoline 调用 `worker_body()`。所有可能阻塞的清理、flush、锁释放和 worker-owned 对象析构都必须在 `worker_body()` 返回前完成。
-- `worker_body()` 返回后，trampoline 发布 `WorkerStoppedSignal` 并进入 AtReturnPoint；此后只能执行不抛异常、不分配、不获取锁的固定 nonblocking wake，然后立即 return。
+- serial、session log、scanner 和 persistence worker 各自持有固定 stop 标志与 `WorkerStoppedSignal`。Application 持有成功创建的服务对象，不再维护镜像生命周期登记表；未创建的可选 worker 不参与等待。
+- 主线程调用各服务的 `request_stop() noexcept`，设置 stop 标志并触发已有 eventfd 或 condition-variable predicate；路径不能分配内存或向普通队列 push。
+- 各线程入口保留异常边界。所有可能阻塞的清理、flush、锁释放和 worker-owned 对象析构必须在发布 stopped 信号前完成，不要求额外的通用 trampoline 模板。
+- 发布 `WorkerStoppedSignal` 后，线程进入 AtReturnPoint；此后只能执行不抛异常、不分配、不获取锁的固定 nonblocking wake，然后立即 return。
 - AtReturnPoint 表示线程已到达不可阻塞的最终返回点，不声称内核线程已经完全退出。主线程观察该状态后才 join；deadline 超时直接进入 abort 回退。
-- 正常退出和 FATAL 共用此路径。stop/stopped 槽、wake fd、running bitmask 和状态计数永久计入 control/model 管理预算，并覆盖未启动、初始化失败、OOM、重复 stop 和丢失 wakeup 测试。
+- 正常退出和 FATAL 共用此路径。诊断后端的启停由 diagnostics 模块管理。stop/stopped 槽和 wake fd 属于 control/model 类别的预算接入范围，当前闭环状态见第 9.3 节。
 
 ### 6.4 UI 唤醒
 
@@ -438,12 +453,17 @@ public:
 - owner 独占 `sp_port*`、native serial fd 观察权、eventfd 和当前 TX 状态。
 - 只有 owner 调用配置、非阻塞读写和 `sp_close()`。
 - 定时发送 deadline、部分写 offset 和停止确认都由 owner 管理。
+- `Scheduler` 仅由 owner 访问，`nearest_deadline()` 合并调度和 I/O deadline；UI tick 只归并状态与结果，不推进发送时钟。
+- `submit_task()` 接收会话身份、执行快照和精确的预期替换 generation，预留固定控制 completion 后接纳。停止可以匹配活动 generation 或尚未完成的启动 operation。
+- owner 在处理手工 TX 超时后调度，在每次写入前检查替换/停止意图。旧 TX 的已写前缀及 terminal outcome 先于匹配停止确认发布；确认后不会继续写旧任务。
+- `OperationIdIssuer` 在 SerialService 内为应用提交和 owner 自动 TX 统一发号，避免两条线程上的 operation ID 冲突；task、connection 和 session generation 仍相互独立。
 - UI、日志线程、scanner 和脚本都不能取得 `sp_port*` 或 serial fd。
 
 ### 7.3 会话日志 worker
 
 - 独占当前日志 fd、缓冲、轮换和目录配额状态。
 - 处理有界日志队列、flush deadline 和 barrier。
+- 普通记录的队列计数和字节记账在出队的同一临界区内更新。普通追加只刷新一次目录 inventory，再使用该结果执行配额检查；轮换关闭旧文件后重新刷新，删除候选仍逐个复核身份、owner 和权限。
 - 日志队列满载时停止记录并发出内部 `LogState::Error`，UI 显示 `Log:ERROR`，不能阻塞 serial owner。
 - 日志错误事件不能递归写入已经失败的同一日志队列。
 - 该 worker 实现用户会话日志，不承载 spdlog 内部诊断。
@@ -467,6 +487,7 @@ public:
 - 每个 TOML 最多维护一个固定 `.bak`，不生成时间序列备份；备份使用相同目录 fd、0600、no-follow、尺寸上限和原子替换规则，备份失败时主文件事务返回 NotCommitted。
 - 写入采用目录 fd、no-follow、独占临时文件、文件 fsync、rename 和父目录 fsync。
 - 保存 completion 使用 `NotCommitted`、`Committed`、`CommittedDurabilityUnknown` 三态。rename 前失败为未提交；rename 成功但父目录 fsync 失败为已提交但重启耐久性未知。
+- 两种已提交 completion 均携带本次临时文件对应的已提交身份，与序列化文档一起成为下次保存的冲突检测基线；UI 不得重读目标路径来采用其他写者的身份。
 - UI 在后两种结果中提交已序列化的同一内存快照，并在耐久性未知时警告；未提交时保留旧内存状态和编辑内容。
 - Session Log Settings 的 Directory、Maximum files、Maximum total size、Maximum file size 作为一个候选快照持久化，不提供逐字段运行时提交。`Save for Next Session` 和 `Save and Rotate Now` 都必须保存同一个完整候选及同一三态 completion。
 
@@ -551,9 +572,9 @@ RX、TX 和命令每轮必须有预算；预算耗尽后使用零超时重新 `p
 ### 9.1 Session sequencer
 
 - RX、TX、SYS 和 ERR 进入同一个轻量序列化入口。
-- sequencer 在一次短临界区内校验 SessionId 和 normal/cleanup 来源、分配严格递增 `seq`，再独立投递到 UI 与日志 sink。
-- sequencer 不执行文件 I/O、FTXUI 调用、编码或大规模复制。
-- 事件携带不可变记录批次和必要的显示元数据；批次降低锁和唤醒次数，但不合并逻辑 seq。
+- Application 在串口事件入口校验 SessionId；sequencer 仅由主线程调用，校验 normal/cleanup 来源并分配严格递增 `seq`；SessionRecords 与 SessionLogCoordinator 分别接纳 UI 与日志引用。跨线程只传递不可变记录；不为主线程状态添加 mutex 或通用 sink 接口。
+- sequencer 在预算准入后复制本条 payload 并构造共享记录，不执行文件 I/O、FTXUI 调用或日志编码。
+- 每次准入产生一条不可变共享记录，不为单条数据建立额外的批次容器或 payload 所有权对象。
 - UTC 时间不作为排序依据，`seq` 是唯一业务顺序。
 - fan-out 不提供两个 sink 同时成功的事务语义。UI 满时淘汰旧记录并插入 seq gap；日志满时停止日志并通过永久 `LogStatusSignal` 报告内部 LogState::Error/UI `ERROR`，不占用 operation completion mailbox；二者都不能阻塞 serial owner。
 
@@ -570,12 +591,14 @@ RX、TX 和命令每轮必须有预算；预算耗尽后使用零超时重新 `p
 
 ### 9.3 全局内存预算
 
-- `Plan.md` 的八类管理预算总计 128 MiB；`GlobalMemoryBudget`、共享 payload token 和 `SessionSequencer` 的实现与测试已经存在。
-- 当前生产 `Application` 仍直接维护可见记录、日志投递和 seq，没有接入上述 budget/sequencer 对象。因此现状是各类别、队列、输入和配置组合硬上限已生效，但 128 MiB 全局 token 不是端到端运行时硬边界；阶段 7 必须完成接入后才能宣称闭环。
+- `Plan.md` 的八类管理预算总计 128 MiB；`GlobalMemoryBudget`、共享记录 token 和 `SessionSequencer` 的实现与测试已经存在。
+- 当前生产 `SessionRecords` 通过唯一 `SessionSequencer` 分配 session seq，以不可变 `SessionRecord` 保持逐条淘汰；`VisibleRecord` 借用记录中的字节与文本，日志 worker 直接编码同一记录。跨连接稳定的 record ID 仍独立递增。
+- 已接入的 token 包括记录、payload 及其字段的保守元数据、UI 引用和日志队列/backlog 引用。共享对象计入 `UiRecords`，日志引用计入 `SessionLog`；即使 UI 清空，共享对象的 token 也保持到最后一个日志引用释放。TUI 的过滤坐标和安全文本缓存共享同一 `UiRecords` 预算，增量搜索的查询与结果存储计入 `Model`。
+- ingress、TX、草稿/历史、framer scratch、配置解析/持久化、completion 和固定控制槽尚未全部接入。现有分类及配置组合上限继续生效，128 MiB 全局 token 仍不是端到端运行时硬边界。逐类基线见 `docs/architecture-optimization-results.md`，UI 接入见 `docs/performance-optimization.md`；阶段 7 必须完成剩余接入才能宣称闭环。
 - payload 通过共享 budget token 按实际分配计一次；每个 sink 的逻辑队列配额独立统计，以便执行各自过载策略。
-- UI 记录元数据、容器节点、字符串 capacity、搜索索引、批次对象和 diagnostics 消息都必须记账。
+- UI 记录元数据、容器节点、字符串 capacity、搜索索引和 diagnostics 消息都必须记账。
 - completion 对象、active operation、固定控制槽、OperationId 索引、LogStatusSignal、WorkerStoppedSignal 和 scanner pending 状态计入 control/model 类别，并参与配置组合验证。
-- 分配前先原子预留预算，构造失败或对象销毁时归还；不能先分配后发现超限。
+- 分配前先原子预留预算，构造失败或对象销毁时归还；不能先分配后发现超限。分类上限在构造时验证总和不超过 128 MiB 且此后不可变，每次准入只检查所属分类；`total_used()` 是各分类当前值之和，仅供观察，不提供跨分类的原子快照。
 - 预算耗尽按所属 sink 处理：TX 拒绝、UI 淘汰并 gap、日志停写、diagnostics overrun-oldest、RX ingress 丢失则应急报告并断开。
 
 ## 10. 配置、会话日志与诊断日志
@@ -607,6 +630,7 @@ RX、TX 和命令每轮必须有预算；预算耗尽后使用零超时重新 `p
 - 两种保存操作都一次应用完整 candidate，并通过 persistence worker 异步持久化；连续配置保存合并为最新快照。`Save for Next Session` 不触碰活动 writer，在会话结束后重建。`Save and Rotate Now` 在 Recording 下通过 operation/completion 驱动结束当前文件、重建 writer 和创建新 header；后续失败进入日志 Error，已经安全关闭的旧文件不删除、不改写。
 - Off、Waiting 或 Error 下没有活动文件，`Save and Rotate Now` 与下一会话保存相同 candidate，并返回明确 no-active-file 提示，不能生成虚假 rollover completion。
 - 活动 rollover 与配置持久化结果分别具有 operation ID，但 app coordinator 只在定义的提交点切换完整快照；需要故障注入覆盖保存三态、barrier、旧文件关闭、新文件创建和目录配额失败。
+- 已接受的 rollover 以 connection generation 和 session ID 保留所有权。断开和 shutdown 必须在原停止 deadline 内继续推进 Start/End、writer 重建和 backlog 排空；重复配置更新不得清除当前 session 的收尾责任。
 
 ### 10.3 NDJSON v1
 
@@ -707,6 +731,7 @@ RX、TX 和命令每轮必须有预算；预算耗尽后使用零超时重新 `p
 - 顶部 `HW` 直接由 ConnectionState 派生：Disconnected 显示 `HW:UNLOCKED`；Connecting、Connected、Disconnecting、Error 显示 `HW:LOCKED`。LOCKED 禁止修改设备、baud、data bits、stop bits、parity、flow，断开清理完成后统一解锁，不能由弹窗焦点或最近错误推导。
 - view model 分开保存待用串口配置和活动连接实际快照，Connecting、Connected、Disconnecting、Error 渲染该次活动快照，不能从可能变化的默认配置即时重建。ErrorDialog model 与 Link model 正交；生命周期回到 Disconnected 后仍可保留 dialog，但 Link 必须立即显示 Disconnected。
 - 发送区使用受控多行 Input 模型、自有光标位置和有限高度视口；SendEdit 在 FTXUI 默认处理前拦截 Enter、Alt+Enter、Alt+Up/Down 和 Esc，保证发送、换行、历史与退出语义互不冲突。Enter 只有在解析、连接和队列/command 提交全部成功后才清空草稿并把提交快照写入有界历史；任一同步失败保留草稿和编辑状态，不读取 keep-after-send 配置分支。
+- TUI 启用终端 bracketed paste 并在应用事件路由前收集有界文本，结束后验证 UTF-8 和编辑上下文再原子插入；粘贴期间后台 Custom 事件仍须推进 Application，粘贴内容不得落入按键命令或 job-control 路径。
 - Input 模型必须显式归一化空草稿状态：Backspace 删除最后一个字符和成功发送清空后，cursor column、selection anchor 和 horizontal viewport origin 均为 0，渲染不能使用可用宽度作为空输入光标位置。
 - SendEdit 的鼠标事件继续交给发送 Input，用于放置光标和选择草稿；接收区选择 handler 不能在 SendEdit 抢占鼠标。
 - 未聚焦占位文本是派生显示 Element，不进入草稿；聚焦后隐藏占位、渲染真实光标，并独立设置活动边框和标题颜色。
@@ -719,6 +744,10 @@ RX、TX 和命令每轮必须有预算；预算耗尽后使用零超时重新 `p
 - ErrorDialog 使用红色边框/标题，保存来源 overlay 的字段、光标和焦点；除 F1 外所有事件均由 dialog 消费，关闭事件本身也不得继续路由到底层组件。
 - `P/B/D/N/V/H` 使用强类型列表、radio/check 项和按钮构建预设 popup，不复用自由文本配置控件；`G` 按第 10.2 节构建两级 candidate overlay。
 - 接收区使用虚拟化或按可见范围生成 Element，不能每帧重建全部 100000 条记录的复杂树。
+- 接收坐标在记录集合与方向过滤不变时复用；全部方向可见时直接使用原坐标，不分配索引。过滤索引由 UI 预算预留，容量不足时使用不分配内存的顺序扫描；记录追加、淘汰、清空与过滤切换必须刷新坐标。
+- 接收区按终端与其他面板占用的行数限制渲染范围，最多构造 200 条记录行。安全文本节点缓存最多 200 条、2 MiB，按实际字符串 capacity 加节点开销计入 UI 预算；缓存不能持有被淘汰记录的 payload。
+- 定时器和 worker 通过合并的 FTXUI closure 推进 Application 状态，只有可见状态变化时发送重绘事件；键盘、鼠标、终端 resize 和 FTXUI 动画仍使用原事件路径。25 ms 状态推进保留 idle 分帧、notice 到期及 completion/deadline 处理。
+- 搜索在 UI 线程按捕获的查询、过滤、显示模式与最后记录 ID 分批推进，每批最多 256 条，并按 512 KiB 原始 payload/消息及 2 ms 时间片在记录边界让出。单条记录不拆分，可能超过字节或时间阈值，因此时间片不是硬实时保证。结果及查询存储先预留 Model 预算，旧查询取消或关闭时释放，最多保留 10000 个稳定 ID。
 - Normal 和 ReceiveBrowse 使用 FTXUI 屏幕选区实现无修饰键左键拖选；滚轮和浏览键执行滚动命令时返回未消费，使 FTXUI 保留选区。定时 Custom 刷新同样不得主动清空选择。
 - 复制内容在选区变化回调中通过 `GetSelection()` 捕获当前已渲染安全文本；编码前硬上限 1 MiB，超过上限返回错误且不截断。OSC 52 encoder 只接受该有界值，不允许原始串口字节直接形成控制序列。
 - `y` 在 Normal 且选择非空时执行选区复制；ReceiveBrowse 的第一个 `y` 只建立前缀，`yy` 把 current record 的完整已渲染安全文本交给同一个 1 MiB 有界 OSC 52 encoder。`Ctrl+C` 只有终端转发、没有高优先组件消费且选择非空时复制选区；空选择 no-op。`Ctrl+Shift+C` 通常由终端自身拦截，帮助页说明限制但不注册为应用快捷键；F1 仍是唯一无条件路由。
@@ -753,35 +782,12 @@ LazyCom 不分发内核驱动。常见设备由 Linux 内核模块支持：
 
 ## 13. 测试与质量门禁
 
-### 13.1 测试层次
+### 13.1 外部测试仓库
 
-- 单元测试：纯状态机、编码、HEX、分帧、配置和日志格式。
-- 性质测试：随机字节分帧重组、显示往返和边界配额。
-- 组件测试：假串口、假时钟、假文件系统和故障注入。
-- PTY 集成测试：真实 ppoll、eventfd、读写、HUP 和取消。
-- USB-UART 测试：真实驱动和 libserialport native handle 兼容性。
-- UI 测试：状态和命令路由优先于像素级快照。
-- UI 结构测试：标题无重复 Link/Log、顶部固定 HW/NewLine/View/InputType/Log 字段、统一五态 Link、准确 HW 锁定范围、唯一 Log、RX/TX 独立 View、活动配置快照、结构化颜色 Element、Receive/Input 边框及焦点标题、发送光标/占位、双行动态 footer、`q` 上下文隔离和极小终端降级。
-- 状态测试：ConnectionState 五个内部名称与 UI 一一同名，ErrorDialog 跨清理保留时 Link 回到 Disconnected；LogState 使用 Off/Waiting/Recording/Error 并唯一映射 OFF/WAITING/REC/ERROR，覆盖 `g` 的全部上下文转换。
-- preset 测试：P 仅来自扫描结果，B 覆盖固定 18 个 baud，D/N/V/H 只接受批准集合；V 覆盖 RX/TX 各自 TXT/HEX/MIXED、SYS/ERR 固定 TXT 和四类独立可见性；产品事件模型不存在设备路径文本、任意 baud 或原始配置字符串入口，PTY 明确路径仅从 test seam 进入。
-- 主题测试：`ui.background` 默认 rose-pine、仅接受两个枚举；transparent 的完整渲染树不含 bgcolor，快捷键始终粗体 `#FFFFFF`，连接五态和选择样式在两种模式及 ANSI 回退下可辨识。
-- 选择与复制测试：Normal/ReceiveBrowse 普通拖选、滚轮和 Custom 刷新保留、SendEdit 鼠标光标隔离、OSC 52 安全编码及 1 MiB 边界；Normal `y` 可靠复制选区，ReceiveBrowse `yy` 复制 current safe record，Ctrl+C 仅在被转发且非空选择时复制选区，Ctrl+Shift+C 只显示终端限制，F1 唯一无条件。
-- SendEdit 测试：成功 Enter 提交始终清空并写入 Alt+Up/Down 历史，解析失败、未连接、队列满或 command 提交失败保留草稿；Backspace 删除最终字符后 cursor/anchor/viewport origin 均停在列 0。
-- ReceiveBrowse 测试：稳定 current record ID、一记录一行、过滤/淘汰回退、空游标、`j/k`、`10j/11k`、`gg`、`G`、`yy`、count 上限和箭头/分页/Home/End 等价行为；count 不能修饰 `yy`，待定 `g/y/count` 的无效后续键被消费且不触发 Normal/global command，Esc 返回 Normal。
-- 配置迁移测试：legacy 单一 Receive View 分别迁移到 `rx_view`/`tx_view`，legacy `text` 映射 `txt`，新字段优先；旧 `send.keep_after_send` 的 true/false 均忽略，应用管理重写移除废弃字段并保留其他未知键。
-- overlay 测试：ErrorDialog 消费非 F1 事件且恢复来源字段、内容、光标、选择和焦点；关闭键不穿透到连接、保存、rollover 或发送。
-- 压力测试：执行 `Plan.md` 中的 2 Mbaud、8 小时和 RSS 指标。
-- 错误模型测试：ErrorCode 唯一性、稳定 ID、注册表 domain、底层 cause 和边界恢复动作映射。
-- completion 测试：普通事件队列满、重复完成、旧 SessionId、断开清理和 worker fatal 时状态机仍可终结。
-- 路由测试：TX 队列、普通命令队列和 cancel/disconnect/stop 固定控制槽分别满载，控制操作仍可唤醒且各自 completion 已预留。
-- scanner 测试：一个 active、一个 pending、第三个 busy，所有已接受 OperationId 都得到 completion，旧 generation 不覆盖新列表。
-- 权限测试：启动扫描全部拒绝只弹一次红色 ErrorDialog、部分拒绝只标红对应设备行、选择和连接重检观察权限变化、实际 open 结果权威；消息包含 owner/group/mode/euid 指导，fake platform 断言从不调用 chmod/usermod/udev/sudo。
-- Session Log Settings 测试：两级焦点恢复、Directory 的 absolute/existing/no-final-symlink/euid-owner/write/search 验证、数字现有硬范围、四字段 candidate 整体提交/取消、文件名/schema/format 无配置入口，以及 Recording 下一会话和立即 rollover 两种策略的全部故障点。
-- 诊断测试：默认关闭、内部启用、等级过滤、脱敏、轮换、队列溢出和 sink 失败。
-- libserialport debug 测试：诊断关闭且 `LIBSERIALPORT_DEBUG` 存在时不写 TUI stderr，诊断开启时进入有界 DEBUG 队列。
-- 持久化测试：每文件单一 `.bak`、备份失败、rename 前后和父目录 fsync 失败的三态结果。
-- FATAL 子进程测试：受控非零退出、清理超时和 `std::abort()` 回退。
-- worker stop 测试：固定生命周期槽覆盖正常退出、OOM、重复 stop、wakeup 已 pending 和单个 worker 永不确认；diagnostics build OFF、runtime OFF 和初始化降级均保持 NotStarted 且不阻塞 FATAL。
+既有测试层次、条目及执行入口迁至 `../lazycom-test/docs/engineering-test-plan.md`。
+该仓库保留六套完整 test presets 和 `gcc-debug-fast`，只在明确指令下使用。
+本仓库不包含 `include(CTest)`、测试子目录或 test presets；CI 只构建和打包。
+测试仓库不配置 push、pull request、定时或构建后的自动测试。
 
 ### 13.2 backend viability spike
 
@@ -803,7 +809,7 @@ LazyCom 不分发内核驱动。常见设备由 Linux 内核模块支持：
 在核心 UI 开发前使用 Release 构建完成可重复 microbenchmark：
 
 - 输入速率固定为 2 Mbaud 8N1 对应的 200000 bytes/s，分别测试 1、64、1024 和 65536 字节逻辑 frame 分布。
-- 分别测量分帧、SessionRecordBatch 构造、UI/log fan-out、UTF-8/base64 判定和 NDJSON 编码，不能只测端到端平均值。
+- 分别测量分帧、SessionRecord 构造、UI/log fan-out、UTF-8/base64 判定和 NDJSON 编码，不能只测端到端平均值。
 - 记录 bytes/s、records/s、单核与总 CPU、RSS、管理预算、队列高水位、分配次数和 UI 命令延迟。
 - serial owner 在已连接无数据且没有 deadline 时必须无限期阻塞在 `ppoll()`；稳定后没有周期性 owner wakeup。
 - 2 Mbaud 且 frame 不小于 64 字节时不得发生 RX ingress 丢失，UI 命令处理 p95 目标不超过 50 ms。
@@ -812,7 +818,7 @@ LazyCom 不分发内核驱动。常见设备由 Linux 内核模块支持：
 
 ### 13.4 编译门禁
 
-每次合入至少运行：
+收到明确的完整验证指令后，在测试仓库使用以下矩阵；未执行部分须报告为未验证：
 
 ```text
 Debug + GCC + tests
@@ -826,19 +832,20 @@ TSan + concurrency tests
 - 项目代码启用严格警告，第三方依赖警告不升级为项目错误。
 - CI 中 `LAZYCOM_WARNINGS_AS_ERRORS=ON`。
 - ASan/UBSan 与 TSan 分开运行。
+- `gcc-asan-ubsan` 测试 preset 设置 `UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1`，首个未定义行为报告必须使测试失败，不能仅依赖 CTest 摘要判断 sanitizer 状态。
 - Release 构建必须验证没有依赖 assert 才成立的用户输入检查。
 - Release hardening 必须保留 capability check，并验证 LazyCom targets 获得可用的 PIE、stack protector、FORTIFY、RELRO、NOW 和 noexecstack；bundled libserialport 使用对应的受支持 CFLAGS/LDFLAGS。
 
-当前测试矩阵（2026-07-30）：
+历史测试矩阵（2026-09-20；详细范围见 `docs/test-cleanup-results.md`，不代表迁移后已执行）：
 
-| 配置 | 当前结果 |
+| 配置 | 历史结果 |
 | --- | --- |
-| GCC Debug，严格警告视为错误 | 196/196 通过 |
-| Clang Debug，严格警告视为错误 | 196/196 通过 |
-| GCC Release | 196/196 通过 |
-| GCC Debug + ASan + UBSan | 196/196 通过 |
-| GCC Debug + diagnostics compiled out | 196/196 通过 |
-| GCC TSan | `gcc-tsan` preset 已存在并带 `-fsanitize=thread`；当前机器缺少可用 libtsan 运行库，未得到有效测试结果 |
+| GCC Debug，严格警告视为错误 | 105/105 通过 |
+| Clang Debug，严格警告视为错误 | 105/105 通过 |
+| GCC Release | 105/105 通过 |
+| GCC Debug + ASan + UBSan | 105/105 通过 |
+| GCC Debug + diagnostics compiled out | 105/105 通过 |
+| GCC TSan | 105/105 通过，未报告项目数据竞争 |
 
 上述自动矩阵不包含三类真实 USB-UART 和 8 小时 2 Mbaud 性能/RSS 验收，两者仍是阶段 7 门禁。
 
@@ -879,7 +886,7 @@ GCC/Clang 至少考虑：
 
 ### 13.7 Catch2 边界
 
-- 首版固定使用 Catch2 3.x；Catch2 只用于测试，不链接或传递到 `lazycom` 生产可执行文件。
+- 测试仓库固定使用 Catch2 3.x；Catch2 不保存在生产仓库，不链接或传递到 `lazycom` 生产可执行文件。
 - Catch2 的 `CHECK`、`REQUIRE`、section 和 generator 适合状态机、边界值和字节流用例，因此当前不同时引入 GoogleTest。
 - GoogleTest/GoogleMock 在大型 fixture、typed test、death test 和复杂 mock 生态上更成熟，但本项目优先使用轻量 fake backend 和子进程测试，暂不需要第二套框架。
 - 测试 target 使用 `Catch2::Catch2WithMain` 和 `catch_discover_tests()`；需要自定义进程入口的 FATAL 测试链接 `Catch2::Catch2`。
@@ -926,7 +933,7 @@ GCC/Clang 至少考虑：
 
 ### 阶段 3：数据路径（主要功能已实现，生产全局预算接入除外）
 
-- 已实现并测试 immutable `SessionRecordBatch`、共享 budget token、各 sink 逻辑配额和 `SessionSequencer`；生产 `Application` 的全局预算/sequencer 接入待阶段 7 完成。
+- 生产 `SessionRecords` 已使用 immutable `SessionRecord` 及其预算 token 和 `SessionSequencer`；UI/log 分别执行逻辑配额，运行时其余类别的全局预算接入仍待阶段 7 完成。
 - 实现 CR、LF、CRLF、idle 和最大帧状态机。
 - 实现安全 UTF-8、HEX 和 MIXED 表示、RX/TX 独立 display view，以及仅含有界 TXT message 的 SYS/ERR。
 - 实现 session sequencer、严格 seq、独立 UI/log fan-out 和 seq gap。
@@ -950,7 +957,7 @@ GCC/Clang 至少考虑：
 ### 阶段 5：日志和持久化（会话日志与持久化主路径已实现）
 
 - 实现 NDJSON v1 header/record codec、UTF-8/base64 无损恢复和截断尾行处理。
-- 实现 Off/Waiting/Recording/Error 日志状态机及 OFF/WAITING/REC/ERROR UI 映射、有界批次队列、flush 和 `processed_through_seq` barrier。
+- 实现 Off/Waiting/Recording/Error 日志状态机及 OFF/WAITING/REC/ERROR UI 映射、有界记录队列、flush 和 `processed_through_seq` barrier。
 - 实现安全创建、轮换、目录锁、配额和损坏尾行处理。
 - 实现 Session Log Settings 完整 candidate 持久化、Directory Enter 安全验证、下一会话策略和 Recording 立即 rollover 流程。
 - 实现 TOML 原子写入、三态提交、冲突检测、完整快照验证和只读保护。
@@ -978,7 +985,7 @@ GCC/Clang 至少考虑：
 - 编写不进入普通用户帮助页的内部诊断启用、日志收集和 core dump 支持文档。
 - 生成依赖及许可清单。
 - 验证 `Plan.md` 全部首版验收标准。
-- 将 `GlobalMemoryBudget` 和 `SessionSequencer` 接入生产 `Application`，补齐 128 MiB 全局 token 的实际运行时闭环。
+- 在已接入的共享记录路径之外，补齐 ingress、TX、草稿/历史、scratch、配置、搜索、控制槽等类别的预分配预算与生命周期归还，完成 128 MiB 全局 token 闭环。
 - 完成 diagnostics 有界队列、worker、安全 fd sink、轮换、脱敏、运行时启用和故障注入测试。
 
 ## 15. 第二阶段工程升级
@@ -1126,6 +1133,30 @@ RTU 静默间隔使用单调时钟。必须说明 Linux 用户态只能观察应
 - libserialport 0.1.2 shared library、对应源码、LGPL 许可和动态替换说明。
 - 已知限制，包括 native handle 风险和非实时定时语义。
 
+### 17.4 自动预发布
+
+`.github/workflows/release.yml` 在每次分支 push 和手动触发时，使用 Ubuntu 24.04
+x86_64、GCC 13 和 Clang 18 执行 GCC Debug、Clang Debug、GCC Release、
+no-diagnostics 和 ASan/UBSan 的生产构建。构建与打包成功后发布该次构建提交的
+GitHub prerelease；Pull request 只验证和保留 Actions 产物。
+
+每次运行使用独立 `build-<run_id>-<run_attempt>` 标签，上传名为 `lazycom` 的
+DEB、RPM、AppImage、tar.gz 和统一 SHA-256 校验文件，不覆盖已有发布。包版本使用
+`<项目版本>~pre.<run_number>.<run_attempt>.g<commit前12位>`，支持原生包升级。
+
+`Runtime` 安装组件将程序安装到 `bin/lazycom`，将 bundled libserialport 安装到
+应用私有 `lib/lazycom/`，同时携带对应源码、许可、文档及 `Terminal=true` 桌面项。
+安装 RUNPATH 为 `$ORIGIN/../lib/lazycom`。该组件仅支持 Linux 默认 vendored 模式。
+CPack 原生包前缀为 `/usr`，自动生成系统运行库依赖；私有库不作为公共 RPM 提供。
+AppImage 工具和运行时固定版本及 SHA-256，下载只发生在显式打包步骤。
+
+安装、启动、卸载和 AppImage 验证脚本及原有发行版矩阵由 `../lazycom-test` 管理，
+仅在明确指令下执行。本仓库发布工作流不等待或宣称测试通过；发布说明必须明确
+自动流程只完成构建与打包。真实 USB-UART 与长时性能验收仍未完成。
+
+自动预发布不覆盖 TSan 运行检查、AppImage FUSE 挂载或桌面启动。
+触发条件、下载、运行及动态库替换方法见 [自动构建与预发布](docs/releases.md)。
+
 ## 18. 首次开工顺序
 
 项目开始实施时按以下顺序执行：
@@ -1139,4 +1170,4 @@ RTU 静默间隔使用单调时钟。必须说明 Linux 用户态只能观察应
 7. 只有串口与性能 spike 都通过并记录边界后，进入核心模型和完整 owner 实现。
 8. 每个阶段按第 14 节退出条件完成，不跨阶段堆积未验证基础设施。
 
-当前已知环境工具链满足计划基线，bundled libserialport 0.1.2 shared library 已纳入各构建 preset。`gcc-tsan` preset 已配置，但当前机器缺少可用 libtsan 运行库；真实三类 USB-UART 和 8 小时性能/RSS 验证仍待具备硬件与运行环境后完成。
+当前已知环境工具链满足计划基线，bundled libserialport 0.1.2 shared library 已纳入各构建 preset。`gcc-tsan` preset 已配置，要求可用 libtsan 运行库，并与 ASan/UBSan 分开运行；真实三类 USB-UART 和 8 小时性能/RSS 验证仍待具备硬件与运行环境后完成。

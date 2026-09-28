@@ -34,6 +34,7 @@
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -730,7 +731,19 @@ parse_receive_vim_command(const std::string_view command) noexcept {
 
 struct Tui::Impl {
   ScreenInteractive screen = ScreenInteractive::Fullscreen();
+  mutable model::GlobalMemoryBudget memory_budget;
   std::unique_ptr<app::Application> application;
+  mutable std::optional<ReceiveCoordinates> coordinates;
+  struct CachedRecord {
+    std::uint64_t id{};
+    config::ReceiveView view{config::ReceiveView::Txt};
+    model::BudgetReservation reservation;
+    Element line;
+  };
+  mutable model::BudgetReservation cache_storage;
+  mutable std::unique_ptr<std::array<CachedRecord, 200>> record_cache;
+  mutable std::size_t cache_bytes{};
+  mutable std::size_t cache_slot{};
   std::string draft_input_value;
   int draft_cursor{};
   Component draft_input;
@@ -744,6 +757,7 @@ struct Tui::Impl {
   std::size_t overlay_depth{};
   ModalState modal;
   std::uint64_t quick_save_modal_id{};
+  std::optional<std::tuple<std::uint64_t, bool, std::uint64_t>> port_projection;
   std::size_t help_line{};
   ReceiveViewModel receive_view;
   TextEditState search_editor;
@@ -774,7 +788,7 @@ struct Tui::Impl {
   std::size_t preview_offset{};
   bool preserve_selection{};
   BracketedPaste paste;
-  std::atomic_bool custom_event_pending{};
+  std::atomic_bool update_pending{};
 
   Impl() {
     InputOption option;
@@ -801,20 +815,27 @@ struct Tui::Impl {
     draft_input = Input(&draft_input_value, "", std::move(option));
   }
 
-  void post_custom_event() noexcept {
-    if (custom_event_pending.exchange(true, std::memory_order_acq_rel)) {
+  void post_update() noexcept {
+    if (update_pending.exchange(true, std::memory_order_acq_rel)) {
       return;
     }
     try {
-      screen.PostEvent(Event::Custom);
+      // FTXUI closures do not invalidate the frame. Publish a redraw only
+      // after advancing state on the UI thread and observing a visible change.
+      screen.Post([this] {
+        update_pending.store(false, std::memory_order_release);
+        if (advance()) {
+          screen.PostEvent(Event::Custom);
+        }
+      });
     } catch (...) {
-      custom_event_pending.store(false, std::memory_order_release);
+      update_pending.store(false, std::memory_order_release);
     }
   }
 
   static void wake(void *context) noexcept {
     if (context != nullptr) {
-      static_cast<Impl *>(context)->post_custom_event();
+      static_cast<Impl *>(context)->post_update();
     }
   }
 
@@ -856,9 +877,19 @@ struct Tui::Impl {
 
   void copy_selection() { copy_text(selected_text, "the selection"); }
 
-  [[nodiscard]] ReceiveCoordinates receive_visible_indices() const {
-    const auto &state = application->snapshot();
-    return {state.records, state.filter};
+  [[nodiscard]] const ReceiveCoordinates &
+  filtered_coordinates(app::DirectionFilter filter) const {
+    if (!coordinates) {
+      coordinates.emplace(application->snapshot().records, filter,
+                          memory_budget);
+    } else {
+      coordinates->refresh(filter);
+    }
+    return *coordinates;
+  }
+
+  [[nodiscard]] const ReceiveCoordinates &receive_visible_indices() const {
+    return filtered_coordinates(application->snapshot().filter);
   }
 
   [[nodiscard]] bool search_visible() const {
@@ -871,10 +902,10 @@ struct Tui::Impl {
         [](const auto &frame) { return frame.mode == RouteMode::Search; });
   }
 
-  [[nodiscard]] ReceiveCoordinates view_indices() const {
-    const auto &state = application->snapshot();
-    return {state.records,
-            search_visible() ? search_direction_filter() : state.filter};
+  [[nodiscard]] const ReceiveCoordinates &view_indices() const {
+    return filtered_coordinates(search_visible()
+                                    ? search_direction_filter()
+                                    : application->snapshot().filter);
   }
   void normalize_viewport(const bool follow = false) {
     receive_view.normalize_viewport(view_indices(), follow);
@@ -892,9 +923,9 @@ struct Tui::Impl {
     }
   }
   void move_receive_edge(const bool latest) {
-    const auto coordinates = receive_visible_indices();
-    if (!coordinates.empty()) {
-      receive_view.select(coordinates, latest ? coordinates.size() - 1U : 0U);
+    const auto &visible = receive_visible_indices();
+    if (!visible.empty()) {
+      receive_view.select(visible, latest ? visible.size() - 1U : 0U);
     }
   }
 
@@ -903,9 +934,10 @@ struct Tui::Impl {
       return;
     }
     const auto &records = application->snapshot().records;
-    const auto current = std::ranges::find(records, *receive_view.cursor(),
-                                           &app::VisibleRecord::record_id);
-    if (current != records.end()) {
+    const auto current = std::ranges::lower_bound(
+        records, *receive_view.cursor(), {}, &app::VisibleRecord::record_id);
+    if (current != records.end() &&
+        current->record_id == *receive_view.cursor()) {
       copy_text(application->render_record(*current), "the current record");
     }
   }
@@ -1107,6 +1139,7 @@ struct Tui::Impl {
   }
 
   void close_overlay() {
+    receive_view.set_matches({});
     overlay_depth = 0U;
     mode = RouteMode::Normal;
     application->set_interaction(app::InteractionState::Normal);
@@ -1254,8 +1287,14 @@ struct Tui::Impl {
   }
 
   void run_search() {
-    receive_view.set_matches(
-        application->search(search_editor.value, search_direction_filter()));
+    const auto &state = application->snapshot();
+    if (!receive_view.begin_search(
+            search_editor.value, search_direction_filter(),
+            state.config.receive, state.records, memory_budget)) {
+      set_notice("Not enough memory to search retained records", true);
+      return;
+    }
+    receive_view.advance_search(state.records);
     static_cast<void>(scroll_to_search_match());
   }
   [[nodiscard]] bool scroll_to_search_match() {
@@ -1273,9 +1312,7 @@ struct Tui::Impl {
         forward ? static_cast<std::uint8_t>((current + 1U) % count)
                 : static_cast<std::uint8_t>((current + count - 1U) % count);
     search_direction = static_cast<SearchDirection>(next);
-    if (!search_editor.value.empty()) {
-      run_search();
-    }
+    run_search();
   }
 
   void open_configuration(RoutedAction action) {
@@ -1815,7 +1852,7 @@ struct Tui::Impl {
   }
 
   void scroll(RoutedAction action) {
-    const auto indices = view_indices();
+    const auto &indices = view_indices();
     receive_view.normalize_viewport(indices);
     if (indices.empty()) {
       return;
@@ -1846,6 +1883,118 @@ struct Tui::Impl {
     receive_view.anchor(indices, position);
   }
 
+  [[nodiscard]] auto render_stamp() const {
+    const auto &state = application->snapshot();
+    return std::tuple{
+        state.connection,
+        state.interaction,
+        state.log,
+        state.task,
+        state.rx_bytes,
+        state.tx_bytes,
+        state.display_bytes,
+        state.display_gap_records,
+        state.tx_pending,
+        state.rx_ingress_bytes,
+        state.log_pending,
+        state.notice_revision,
+        state.scanning,
+        state.quick_send_save_pending,
+        state.quick_send_save_failed,
+        state.manual_pause,
+        state.shutting_down,
+        state.records.size(),
+        state.records.empty() ? 0U : state.records.back().record_id,
+        state.alert.has_value(),
+        state.alert ? state.alert->title : std::string{},
+        state.alert ? state.alert->message : std::string{},
+        state.alert ? state.alert->code : ErrorCode::ValidationInvalidValue,
+        mode,
+        port_projection,
+        awaiting_quick_save,
+        modal.id,
+        modal.selected,
+        receive_view.anchor(),
+        receive_view.cursor(),
+        receive_view.match_count(),
+        receive_view.searching()};
+  }
+
+  bool advance() {
+    const auto before = render_stamp();
+    const bool follow = receive_view.at_bottom() &&
+                        !application->snapshot().manual_pause &&
+                        !search_visible() &&
+                        application->snapshot().interaction !=
+                            app::InteractionState::ReceiveBrowse;
+    application->tick();
+    if (application->snapshot().fatal_stopping) {
+      exit_ok = false;
+      screen.Exit();
+      return false;
+    }
+    show_alert_if_needed();
+    const auto next_port_projection =
+        std::tuple{modal.id, application->snapshot().scanning,
+                   application->snapshot().notice_revision};
+    if (mode == RouteMode::Modal && modal.kind == ModalKind::Port &&
+        port_projection != next_port_projection) {
+      port_projection = next_port_projection;
+      const auto &devices = application->snapshot().devices;
+      modal.options.clear();
+      if (application->snapshot().scanning) {
+        modal.options.push_back("Scanning...");
+      } else {
+        for (const auto &device : devices) {
+          modal.options.push_back(
+              device.path + "  " + device.description +
+              (device.permission.access ==
+                       serial::DeviceAccess::PermissionDenied
+                   ? "  [Permission denied]"
+                   : ""));
+        }
+        if (modal.options.empty()) {
+          modal.options.push_back("No scanned serial devices");
+        }
+      }
+      modal.selected = std::min(modal.selected, modal.options.size() - 1U);
+    }
+    if (search_visible()) {
+      prune_search_matches();
+      const bool had_matches = receive_view.match_count() != 0U;
+      receive_view.advance_search(application->snapshot().records);
+      if (!had_matches && receive_view.match_count() != 0U) {
+        static_cast<void>(scroll_to_search_match());
+      }
+    }
+    if (awaiting_quick_save &&
+        !application->snapshot().quick_send_save_pending) {
+      awaiting_quick_save = false;
+      if (application->snapshot().quick_send_save_failed) {
+        modal.title = "F  Save failed; edit is preserved";
+      } else {
+        if (mode == RouteMode::Modal && modal.id == quick_save_modal_id) {
+          close_overlay();
+        } else {
+          for (std::size_t index = 0U; index < overlay_depth; ++index) {
+            auto &frame = overlay_stack[index];
+            if (frame.mode == RouteMode::Modal &&
+                frame.modal_id == quick_save_modal_id) {
+              frame.mode = RouteMode::Normal;
+              frame.interaction = app::InteractionState::Normal;
+            }
+          }
+        }
+      }
+    }
+    if (mode == RouteMode::ReceiveBrowse) {
+      normalize_receive_cursor();
+    } else {
+      normalize_viewport(follow);
+    }
+    return before != render_stamp();
+  }
+
   bool handle(Event event) {
     preserve_selection = false;
     if (event.input() == kPasteBegin) {
@@ -1858,67 +2007,6 @@ struct Tui::Impl {
       return true;
     }
     if (event == Event::Custom) {
-      custom_event_pending.store(false, std::memory_order_release);
-      const bool follow = receive_view.at_bottom() &&
-                          !application->snapshot().manual_pause &&
-                          !search_visible() &&
-                          application->snapshot().interaction !=
-                              app::InteractionState::ReceiveBrowse;
-      application->tick();
-      if (application->snapshot().fatal_stopping) {
-        exit_ok = false;
-        screen.Exit();
-        return true;
-      }
-      show_alert_if_needed();
-      if (mode == RouteMode::Modal && modal.kind == ModalKind::Port) {
-        const auto &devices = application->snapshot().devices;
-        modal.options.clear();
-        if (application->snapshot().scanning) {
-          modal.options.push_back("Scanning...");
-        } else {
-          for (const auto &device : devices) {
-            modal.options.push_back(
-                device.path + "  " + device.description +
-                (device.permission.access ==
-                         serial::DeviceAccess::PermissionDenied
-                     ? "  [Permission denied]"
-                     : ""));
-          }
-          if (modal.options.empty()) {
-            modal.options.push_back("No scanned serial devices");
-          }
-        }
-        modal.selected = std::min(modal.selected, modal.options.size() - 1U);
-      }
-      if (search_visible()) {
-        prune_search_matches();
-      }
-      if (awaiting_quick_save &&
-          !application->snapshot().quick_send_save_pending) {
-        awaiting_quick_save = false;
-        if (application->snapshot().quick_send_save_failed) {
-          modal.title = "F  Save failed; edit is preserved";
-        } else {
-          if (mode == RouteMode::Modal && modal.id == quick_save_modal_id) {
-            close_overlay();
-          } else {
-            for (std::size_t index = 0U; index < overlay_depth; ++index) {
-              auto &frame = overlay_stack[index];
-              if (frame.mode == RouteMode::Modal &&
-                  frame.modal_id == quick_save_modal_id) {
-                frame.mode = RouteMode::Normal;
-                frame.interaction = app::InteractionState::Normal;
-              }
-            }
-          }
-        }
-      }
-      if (mode == RouteMode::ReceiveBrowse) {
-        normalize_receive_cursor();
-      } else {
-        normalize_viewport(follow);
-      }
       return false;
     }
     if (paste.active()) {
@@ -2294,7 +2382,7 @@ struct Tui::Impl {
       copy_selection();
       break;
     case RoutedAction::Redraw:
-      post_custom_event();
+      post_update();
       break;
     case RoutedAction::ScrollUp:
     case RoutedAction::ScrollDown:
@@ -2330,28 +2418,99 @@ struct Tui::Impl {
     return true;
   }
 
-  [[nodiscard]] Element records_element() const {
+  [[nodiscard]] Element record_element(const app::VisibleRecord &record) const {
+    const auto &settings = application->snapshot().config.receive;
+    const auto view = record.direction == app::RecordDirection::Rx
+                          ? settings.rx_view
+                      : record.direction == app::RecordDirection::Tx
+                          ? settings.tx_view
+                          : config::ReceiveView::Txt;
+    if (record_cache) {
+      for (const auto &entry : *record_cache) {
+        if (entry.line && entry.id == record.record_id && entry.view == view) {
+          return entry.line;
+        }
+      }
+    }
+    auto rendered = application->render_record(record);
+    const auto bytes = rendered.capacity() + 512U;
+    constexpr std::size_t maximum_cache_bytes = 2U * 1024U * 1024U;
+    constexpr auto storage_bytes = sizeof(std::array<CachedRecord, 200>);
+    if (bytes > maximum_cache_bytes - storage_bytes) {
+      return text(std::move(rendered));
+    }
+    if (!record_cache) {
+      auto reserved = memory_budget.try_reserve(
+          model::BudgetCategory::UiRecords, storage_bytes);
+      if (!reserved) {
+        return text(std::move(rendered));
+      }
+      record_cache = std::make_unique<std::array<CachedRecord, 200>>();
+      cache_storage = std::move(*reserved);
+      cache_bytes = storage_bytes;
+    }
+    for (std::size_t attempt = 0U; attempt < record_cache->size(); ++attempt) {
+      auto &entry = (*record_cache)[cache_slot];
+      entry.line.reset();
+      cache_bytes -= entry.reservation.bytes();
+      entry.reservation.reset();
+      if (cache_bytes <= maximum_cache_bytes - bytes) {
+        auto reserved =
+            memory_budget.try_reserve(model::BudgetCategory::UiRecords, bytes);
+        if (!reserved) {
+          return text(std::move(rendered));
+        }
+        entry.id = record.record_id;
+        entry.view = view;
+        entry.reservation = std::move(*reserved);
+        entry.line = text(std::move(rendered));
+        cache_bytes += bytes;
+        cache_slot = (cache_slot + 1U) % record_cache->size();
+        return entry.line;
+      }
+      cache_slot = (cache_slot + 1U) % record_cache->size();
+    }
+    return text(std::move(rendered));
+  }
+
+  [[nodiscard]] Element records_element(std::size_t maximum_rows) const {
     const auto &state = application->snapshot();
+    if (state.records.empty()) {
+      record_cache.reset();
+      cache_storage.reset();
+      cache_bytes = 0U;
+      cache_slot = 0U;
+    } else if (record_cache) {
+      for (auto &entry : *record_cache) {
+        if (entry.line && (entry.id < state.records.front().record_id ||
+                           entry.id > state.records.back().record_id)) {
+          entry.line.reset();
+          cache_bytes -= entry.reservation.bytes();
+          entry.reservation.reset();
+        }
+      }
+    }
     Elements rows;
     if (state.display_gap_records != 0U) {
+      maximum_rows -= std::min(maximum_rows, std::size_t{1U});
       rows.push_back(
           text("... GAP: " + std::to_string(state.display_gap_records) +
                " evicted record(s) ...") |
           color(theme::gold));
     }
-    const auto indices = view_indices();
-    const auto [begin, end] =
-        receive_view.viewport(indices, 200U, mode == RouteMode::ReceiveBrowse);
+    const auto &indices = view_indices();
+    const auto [begin, end] = receive_view.viewport(
+        indices, maximum_rows, mode == RouteMode::ReceiveBrowse);
     for (std::size_t position = begin; position < end; ++position) {
       const auto index = indices[position];
       const auto &record = state.records[index];
       const bool current = mode == RouteMode::ReceiveBrowse &&
                            receive_view.cursor() &&
                            record.record_id == *receive_view.cursor();
-      auto row = text((mode == RouteMode::ReceiveBrowse
-                           ? std::string{current ? "> " : "  "}
-                           : std::string{}) +
-                      application->render_record(record));
+      auto row = record_element(record);
+      if (mode == RouteMode::ReceiveBrowse) {
+        row = hbox({text(current ? "> " : "  "), std::move(row)});
+      }
       if (record.direction == app::RecordDirection::Rx) {
         row |= color(theme::foam);
       } else if (record.direction == app::RecordDirection::Tx) {
@@ -2380,7 +2539,7 @@ struct Tui::Impl {
     return vbox(std::move(rows)) | yframe | flex;
   }
 
-  [[nodiscard]] Element receive_element() const {
+  [[nodiscard]] Element receive_element(std::size_t maximum_rows) const {
     const bool focused = mode == RouteMode::ReceiveBrowse;
     Elements title;
     if (focused) {
@@ -2398,7 +2557,8 @@ struct Tui::Impl {
       title.push_back(text(" Receive ") | color(theme::subtle));
     }
     auto panel = panel_background(
-        window(hbox(std::move(title)), records_element()), theme::surface);
+        window(hbox(std::move(title)), records_element(maximum_rows)),
+        theme::surface);
     panel |= color(focused ? theme::iris : theme::subtle);
     return panel | flex;
   }
@@ -2674,7 +2834,14 @@ struct Tui::Impl {
 
   [[nodiscard]] Element main_element() const {
     const auto &state = application->snapshot();
-    const bool compact = Terminal::Size().dimy < 16;
+    const auto height = Terminal::Size().dimy;
+    const bool compact = height < 16;
+    auto draft = draft_element();
+    draft->ComputeRequirement();
+    const auto fixed_rows = 9 + (compact ? 0 : 2) + draft->requirement().min_y +
+                            (state.configuration_notice.empty() ? 0 : 1);
+    const auto receive_rows =
+        static_cast<std::size_t>(std::clamp(height - fixed_rows, 1, 200));
     Elements content;
     content.push_back(
         hbox({text(" LazyCom ") | color(theme::rose) | bold, filler()}));
@@ -2685,8 +2852,8 @@ struct Tui::Impl {
     if (!compact) {
       content.push_back(separator() | color(theme::subtle));
     }
-    content.push_back(receive_element());
-    content.push_back(draft_element());
+    content.push_back(receive_element(receive_rows));
+    content.push_back(std::move(draft));
     if (!state.configuration_notice.empty()) {
       content.push_back(text(state.configuration_notice) | color(theme::gold));
     }
@@ -2821,7 +2988,9 @@ struct Tui::Impl {
       return window(text(" Search ") | bold,
                     vbox({std::move(query), std::move(direction),
                           text("Matches: " +
-                               std::to_string(receive_view.match_count())),
+                               std::to_string(receive_view.match_count()) +
+                               (receive_view.searching() ? " (searching...)"
+                                                         : "")),
                           text("Tab focus | Left/Right/Space direction | "
                                "Enter search | F3/Shift+F3 navigate | End "
                                "latest | Esc close") |
@@ -2927,7 +3096,8 @@ Tui::Tui() : impl_(std::make_unique<Impl>()) {}
 Tui::~Tui() = default;
 
 int Tui::run() {
-  auto created = app::Application::create_default(&Impl::wake, impl_.get());
+  auto created = app::Application::create_default(&Impl::wake, impl_.get(),
+                                                  impl_->memory_budget);
   if (!created) {
     throw std::runtime_error(status_error(created.error()));
   }
@@ -2949,7 +3119,7 @@ int Tui::run() {
       while (!stop.stop_requested()) {
         std::this_thread::sleep_for(25ms);
         if (!stop.stop_requested()) {
-          impl_->post_custom_event();
+          impl_->post_update();
         }
       }
     } catch (...) {

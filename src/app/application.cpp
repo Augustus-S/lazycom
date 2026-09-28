@@ -204,7 +204,8 @@ Application::create(ApplicationDependencies dependencies) {
 
 Result<std::unique_ptr<Application>>
 Application::create_default(const serial::UiWakeCallback wake_callback,
-                            void *const wake_context) {
+                            void *const wake_context,
+                            model::GlobalMemoryBudget budget) {
   ApplicationDependencies dependencies;
   dependencies.serial_backend =
       std::make_unique<serial::LibserialportBackend>();
@@ -212,6 +213,7 @@ Application::create_default(const serial::UiWakeCallback wake_callback,
       std::make_unique<serial::LibserialportBackend>();
   dependencies.wake_callback = wake_callback;
   dependencies.wake_context = wake_context;
+  dependencies.memory_budget = std::move(budget);
   return create(std::move(dependencies));
 }
 

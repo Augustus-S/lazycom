@@ -4,8 +4,8 @@
 
 - 当前阶段：阶段 1 至阶段 6 的主要功能和本轮安全加固已经实现；阶段 7 的真实硬件、长时性能、完整内部诊断和发布验收仍待完成。
 - 当前程序已包含 CMake 工程、串口 owner、数据路径、核心 TUI、会话日志、配置持久化、快捷发送和定时任务，不再处于“尚未实施”状态。
-- 当前自动测试基线为 196 项；GCC Debug、Clang Debug、GCC Release、GCC no-diagnostics 和 GCC ASan+UBSan 已通过。`gcc-tsan` preset 已存在，当前机器缺少可用的 libtsan 运行库，尚未形成 TSan 通过结论。
-- `GlobalMemoryBudget`、共享 token、`SessionSequencer` 和各类别硬上限已有模型与测试，但生产 `Application` 尚未接入前两者，因此不能声称 128 MiB 运行时全局 token 已闭环。
+- 测试代码与测试清单由独立 `../lazycom-test` 仓库维护；本仓库不新增测试项，不自动运行测试。新增或执行测试须有用户明确指令。`docs/test-cleanup-results.md` 仅记录历史验证，不能作为迁移后当前源码的通过证据。
+- 生产记录路径已接入 `SessionSequencer`、共享 payload 和记录引用预算，UI 与日志复用不可变记录；其余运行时类别尚未全部接入，128 MiB 全局 token 仍未闭环。
 - diagnostics 当前只有编译开关、`emergency_write()` 和 terminate/FATAL 所需的最小路径；完整内部诊断队列、worker、安全 sink、轮换和脱敏链路仍待实现。
 - 首版目标平台为 Ubuntu 24.04 同代或更新的现代 Linux。
 
@@ -75,7 +75,7 @@ LazyCom 是一款使用 C++ 和 FTXUI 开发的 TUI 串口助手，面向嵌入�
 - CMake。
 - Linux 优先。
 - Release/RelWithDebInfo/MinSizeRel 在编译器和链接器支持时启用 PIE、`-fstack-protector-strong`、`_FORTIFY_SOURCE=3`、RELRO、NOW 和 non-executable stack；选项先经 CMake 能力检查，不把不支持的参数硬编码为所有平台前提。
-- 已提供独立 `gcc-tsan` configure/build/test preset；TSan 与 ASan/UBSan 互斥。
+- 已提供独立 `gcc-tsan` configure/build presets；test presets 由 `../lazycom-test` 维护；TSan 与 ASan/UBSan 互斥。
 
 ### 4.2 首版依赖
 
@@ -85,14 +85,14 @@ LazyCom 是一款使用 C++ 和 FTXUI 开发的 TUI 串口助手，面向嵌入�
 - nlohmann/json：NDJSON 会话日志编码和校验。
 - tl::expected：C++20 的显式错误返回。
 - spdlog：当前用于 diagnostics 编译/链接 facade；完整内部诊断日志 worker 待阶段 7 实现，不承载用户会话日志。
-- Catch2 3.x：仅测试构建使用。
+- Catch2 3.x：仅由独立 `../lazycom-test` 仓库提供，生产仓库不依赖它。
 
 首版不需要 iconv。GB18030 加入第二阶段时再引入系统 iconv。
 
 ### 4.3 依赖策略
 
 - toml++、nlohmann/json 和 tl::expected 的固定源码放在 `include/dependencies/`，构建时不联网下载。
-- FTXUI、spdlog 和 Catch2 使用固定源码或固定 `FetchContent`，发布构建必须支持离线源码包。
+- FTXUI、spdlog 使用仓库内固定源码，发布构建必须支持离线源码包；测试仓库独立保存固定 Catch2。
 - 非 header-only 依赖的系统模式默认关闭；用户显式启用时必须匹配锁定兼容版本并通过对应 smoke test，不能用任意系统版本替代已验证源码。
 - libserialport 固定以 shared library 动态链接；默认构建随附 0.1.2，只有明确验证的系统 0.1.2+ 才可替换。
 - 发布包保留 libserialport 的 LGPL-3.0+ 许可、对应源码和动态替换条件。
@@ -209,6 +209,7 @@ Receive 使用与 Input 对应的有边框面板并占据主要空间：
 - 自动跟随最新记录。
 - 手动暂停。
 - 搜索和上一个、下一个匹配。
+- 搜索在提交时固定查询、方向、显示模式和当前记录范围，分批更新结果并显示进行中状态；期间可导航已找到的匹配。再次提交或切换方向替换原查询，退出搜索取消剩余工作，新到达的记录需再次提交后才参与匹配。已淘汰记录不保留在结果中，结果最多 10000 条。
 - RX、TX、SYS、ERR 各自独立的可见性开关，至少保留一个方向/类型。
 - RX 和 TX 分别独立选择 TXT、HEX、MIXED 并可在线修改；SYS 和 ERR 始终以 TXT 显示，不受 RX/TX 模式影响。
 - 明确清空当前会话全部内存记录。
@@ -265,6 +266,8 @@ auto_follow = !manual_pause && at_bottom
 - Enter 发送请求通过内容解析、连接状态和队列守卫并成功提交后，始终立即清空草稿和输入选择，光标回到列 0；不存在“发送后保留”配置。提交前失败，包括 TXT/HEX 校验失败、未连接、队列满或命令提交失败，均保留草稿、选择和可继续编辑的位置。
 - 成功提交的内容在清空前加入有界发送历史，仍可通过 Alt+Up/Alt+Down 取回；清空输入不清空历史。
 - 多行光标使用 Up/Down；Alt+Enter 插入换行；发送历史使用 Alt+Up/Alt+Down，避免冲突。
+- 支持 bracketed paste 的终端中，粘贴内容在结束标记到达后一次插入当前文本编辑器；其中的换行不能触发发送，控制序列不能执行快捷键。非文本上下文、非法 UTF-8、超限或期间编辑上下文变化时拒绝整段粘贴。
+- 草稿修改超出输入字节上限或包含非法 UTF-8 时保留原草稿，不按字节截断候选。
 - Backspace 删除最后一个字符后，空输入的光标必须保持在输入视口起点的列 0，视口同步回到起点，绝不能跳到输入区右边缘。
 
 ### 6.6 底部运行状态与上下文提示
@@ -453,11 +456,11 @@ TXT Input 显示 Newline，HEX Input 不显示；空间不足时按当前状态�
 | model、搜索结果和其他有界状态 | 8 MiB |
 
 - 不可变记录被多个 sink 引用时，全局预算按实际 payload 只计一次；各 sink 仍按逻辑字节分别执行自己的过载策略。
-- 容器节点、字符串 capacity、索引和批次元数据按保守估算计入所属类别，不能只统计 payload 长度。
+- 容器节点、字符串 capacity、索引和记录元数据按保守估算计入所属类别，不能只统计 payload 长度。
 - operation completion、active operation、固定控制槽、OperationId 索引、LogStatusSignal 和 WorkerStoppedSignal 的对象及容器开销计入 model/control 类别。
 - 配置只能在类别硬预算内调整；任何组合都不能扩大 128 MiB 总预算。
 - 额外 64 MiB RSS 空间留给线程栈、FTXUI、allocator、shared library 和不可精确预留的运行时开销。
-- 当前实现状态：类别限制、`GlobalMemoryBudget`、共享 payload token 和 `SessionSequencer` 已有实现与测试，但生产 `Application` 仍使用自身的可见记录、日志投递和 seq 路径。完成生产接入前，128 MiB 只能作为配置组合和分类硬上限模型，不能宣称运行时全局 token 已端到端闭环。
+- 当前实现状态：生产 `SessionRecords` 已使用唯一 `SessionSequencer`，UI 与日志共享同一不可变记录及其预算 token；UI 引用、过滤坐标、安全文本缓存、增量搜索存储、日志队列和 rollover backlog 引用也已记账。ingress、TX、草稿/历史、scratch、配置和控制槽等类别仍未全部接入，因此不能宣称 128 MiB 运行时全局 token 已端到端闭环。
 
 ### 8.4 事件顺序与时间
 
@@ -675,6 +678,8 @@ Directory 验证失败时打开红色 `ErrorDialog`；关闭后返回原第二�
 四个值组成单一候选设置：第二级确认只更新候选，不改变运行设置；`Cancel` 丢弃整个候选。保存时完整候选一次更新到当前进程配置并异步持久化，连续保存合并为最新快照；持久化失败会明确报告，但不回滚本次进程内配置。`Save for Next Session` 不触碰当前 REC writer，在下一次进入 REC 前重建 writer。`Save and Rotate Now` 若当前为 REC，则先结束当前文件，再按新设置重建 writer 并创建下一文件；重建或新文件创建失败时进入日志 ERROR，已安全关闭的旧文件保持可读，不伪造成功回滚。
 
 活动 REC 下必须明确提供两种策略：下一会话生效，或立即 rollover。WAITING/OFF/ERROR 下 `Save and Rotate Now` 保存候选但没有活动文件可轮换，界面明确提示“已保存；下次进入 REC 生效”，不得伪造一次 rollover。保存配置的三态耐久结果仍按第 12 节处理。
+
+已接受的 rollover 在断开或退出期间继续完成，把同一 session 暂存的记录和最终清理事件写出后关闭；连续保存设置不能取消进行中的收尾责任。失败须明确进入日志 ERROR，不能静默丢弃暂存记录并报告成功。
 
 ## 12. TOML 配置与持久化
 
@@ -1052,98 +1057,15 @@ ReceiveBrowse 只承诺本表列出的 Vim 核心命令。单个 `g`、单个 `y
 - 完成压力、故障注入、真实 USB-UART 和终端兼容测试。
 - 编写安装、权限、配置、日志格式和快捷键文档。
 - 验证所有首版验收标准。
-- 将 `GlobalMemoryBudget` 和 `SessionSequencer` 接入生产 `Application`，完成 128 MiB 运行时全局 token 闭环。
+- 在已接入的共享记录链路之外，补齐其余运行时类别的预分配预算与归还，完成 128 MiB 全局 token 闭环。
 - 实现完整 diagnostics worker、内部有界队列、安全 fd sink、轮换、脱敏和运行时启用链路。
 
-## 17. 测试计划
+## 17. 验证归属与性能指标
 
-当前基线：196 项测试已在 GCC Debug、Clang Debug、GCC Release、GCC no-diagnostics 和 GCC ASan+UBSan 配置通过。`gcc-tsan` preset 已配置，但当前机器缺少 libtsan 运行库，尚未执行出有效 TSan 结果。以下仍是持续门禁和阶段 7 验收清单，不应将其中真实 USB-UART 或 8 小时项目误记为已经完成。
-
-### 17.1 单元与性质测试
-
-- 全部 CR、LF、CRLF 读取切分组合。
-- pending CR 在 idle、断开和最大帧边界的行为。
-- `max_frame_bytes - 1 + CR + LF`、`max_frame_bytes + CR` 和最大帧优先规则。
-- 随机字节流分帧后拼接必须等于输入。
-- 全部 0 至 255 字节的安全显示与日志恢复。
-- UTF-8 跨读取、非法序列、NUL、ESC 和 bidi 控制字符。
-- HEX ASCII whitespace 和错误定位。
-- TX 部分写入、取消、超时和不交错。
-- TX 已接受前缀、最后接受时间、operation_id 和后续 ERR 顺序。
-- 连接和任务 generation 的迟到事件过滤。
-- Disconnecting 拒绝新业务数据，但保留同一 session 的 TX 前缀、pending CR、RX 尾帧和最终 SYS/ERR，直到 DisconnectCompleted。
-- 所有有界队列的满载策略。
-- 定时器 0、9、10、86400000 和越界值。
-- 日志 seq、UTC、TXT 往返判定和 HEX 回退。
-- 非 UTF-8 设备路径和 USB 元数据的 HEX 回退。
-- TOML schema、范围、未知版本和语法错误保护。
-- 配置迁移覆盖 legacy 单一 Receive View 同时映射到 `rx_view`/`tx_view`、legacy `text` 到 `txt`，以及旧 `send.keep_after_send` 被忽略并在重写时移除；新旧 Receive 字段并存时新字段优先。
-- 连接内部状态和 UI Link 对五个统一名称逐一映射；ErrorDialog 持续存在时 Link 仍随生命周期回到 Disconnected。
-- 日志内部 Waiting 转换、界面 WAITING 映射及 `g` 在 OFF/WAITING/REC/ERROR 下的全部转换。
-- 全部固定 baud preset 和 D/N/V/H 预设合法集合；任意字符串、任意 baud 和空方向过滤不能进入候选配置。
-- `[ui].background` 两个枚举值、默认 rose-pine、非法值拒绝及 transparent 渲染树不含任何 bgcolor 属性。
-- OSC 52 编码、控制字节安全、空选择 no-op、恰好 1 MiB 成功和超限拒绝且不截断。
-- RX/TX 独立 TXT/HEX/MIXED 模式互不覆盖，SYS/ERR 始终为 TXT 消息；四类可见性开关分别生效。
-- ReceiveBrowse 当前记录使用稳定 record ID 和非纯颜色的可见游标标记；过滤、淘汰、新记录和重绘后按定义保持或移动，空列表产生空游标。
-- ReceiveBrowse 命令解析覆盖 `j/k`、`10j`、`11k`、`gg`、`G`、`yy`、有界 count、无效前缀消费和 Esc；count 不能用于 `yy`，待定 `g/y/count` 不产生全局动作。
-
-### 17.2 集成测试
-
-- 使用明确 PTY 路径或 `socat` 完成双向收发。
-- PTY 明确路径只经内部测试接口传入，用户设备弹窗无法输入或粘贴路径。
-- 连接中取消、关闭、设备消失和快速重连。
-- 普通命令队列满时停止和断开仍可唤醒 owner。
-- TX 队列、普通命令队列和固定控制槽分别满载时，配额、优先级和 completion 预留符合各自语义。
-- worker 固定生命周期槽在正常退出、OOM、重复 stop 和 wakeup 已 pending 时均不依赖动态队列；未构建或未启动的 diagnostics 不进入等待集合，任一 Running worker 超时触发 abort 回退。
-- writer 忙时断开和停止定时任务。
-- 活动定时请求停止确认后没有该 generation 的迟到写入。
-- UI、TX 和日志队列满载。
-- 磁盘满、只读目录、尾行截断和 flush 失败。
-- 日志轮换、配额、活动文件保护和目录锁。
-- 日志单条记录超过单文件上限及 projected size 精确边界。
-- 配置写入在 write、fsync、rename 前后故障注入。
-- 配置 rename 成功但父目录 fsync 失败时返回“已提交但耐久性未知”，内存与可见文件保持一致。
-- 三个 TOML 各自最多一个 `.bak`，备份失败不提交主文件且反复保存不会累积文件。
-- `state.toml` 原子写入及三个 TOML 文件的符号链接、错误所有者和权限。
-- 成功 Enter 提交清空草稿并写入有界历史；TXT/HEX 解析失败、未连接、TX 队列满和提交失败均保留草稿。
-- 串口符号链接在检查与打开之间被替换。
-- 至少一种真实 USB-UART 的设备枚举和连接测试。
-- 启动扫描全部拒绝时红色 ErrorDialog 只出现一次，部分拒绝时仅对应设备行标红；选择和连接重检可观察权限变化，实际 open 结果覆盖预检。
-- 权限错误显示最终路径、owner/group/mode 和有效用户指导，ErrorDialog 不穿透按键；测试确认应用从不调用 chmod、usermod、sudo 或修改 udev。
-- `G` 的 Directory 覆盖相对路径、不存在、最终符号链接、错误 euid owner、不可写和不可搜索；失败关闭 ErrorDialog 后内容、光标、选择和焦点保持。
-- `G` 四项候选整体提交，Cancel 全部回滚；REC 下下一会话策略不轮换、立即策略执行 barrier 和 rollover，提交前失败保留旧设置及活动文件。
-- 诊断关闭且外部设置 `LIBSERIALPORT_DEBUG` 时，默认 handler 不向 TUI stderr 输出。
-
-### 17.3 UI 与快捷键测试
-
-- 顶部标题不包含 Link 或 Log，顶部状态行中 `Log` 恰好出现一次，`LOGQ` 只作为底部运行指标出现。
-- Link 精确显示 Disconnected、Connecting、Connected、Disconnecting、Error，颜色分别符合红、Gold、绿、Gold、红色粗体反选；四个活动/过渡状态显示该次串口配置快照，外部默认值变化不能改写该快照。
-- Error 经清理回到 Disconnected 后 ErrorDialog 可以保留，但 Link、颜色和配置快照必须表达真实 Disconnected，不能继续显示 Error。
-- 顶部固定使用 `HW:LOCKED`/`HW:UNLOCKED`、`[NewLine<N>]`、`[View<V>]`、`[InputType<H>]`、`[Log<g/G>]`；HW 锁定范围和连接生命周期一致，Log 用户状态只出现 OFF、WAITING、REC、ERROR。
-- 未聚焦发送区显示正确 TXT/HEX 标题和占位文本；`i` 聚焦后占位消失、真实光标可见、边框和标题变绿，断开状态行为一致。
-- 未聚焦接收区显示带 Subtle 边框的 `<R> Receive`；`R` 后使用 Iris 活动边框和 `Receive [Browse]` 标题，内部状态保持 ReceiveBrowse，Esc 恢复 Normal 和未聚焦样式。
-- 底部运行指标和动态上下文提示保持两行分离，Normal、Input、Browse 只显示各自可执行动作，且不重复顶部 `C/P/B/D/N/V/H/g/G`。
-- Rosé Pine Moon RGB、连接五态语义、白色粗体快捷键和可见文本标签正确；transparent 模式没有任何 bgcolor，ANSI 回退和极小终端仍安全、可辨识且不依赖颜色表达状态。
-- 编辑态和所有弹窗中的事件优先级。
-- F1 覆盖 Search、Confirm 和字段编辑后能恢复完整来源覆盖层及焦点。
-- 其他应用键不穿透文本和弹窗。
-- Normal、SendEdit、ReceiveBrowse、Search 状态转换。
-- 连接成功保持 Normal。
-- 断开时允许编辑但不能发送。
-- Enter 成功提交后输入始终清空且可用 Alt+Up/Down 取回历史；失败或未连接时草稿保留，不存在 keep-after-send 行为分支。
-- Backspace 删除最后一个字符后，光标保持输入视口起点列 0，发送清空后的空输入也不跳到右边缘。
-- 硬件参数在线锁定，显示和发送参数在线可改。
-- 手动暂停与离开底部状态互不覆盖。
-- 搜索结果导航和退出位置行为。
-- ReceiveBrowse 一行对应一条可见记录，稳定当前记录游标和 `j/k`、count+j/k、`gg`、`G`、`yy` 正确；count 不修饰 `yy`，待定 `g/y/count` 的无效后续键不泄漏为日志、退出、选区复制或其他全局动作。
-- 多行 Alt+Enter、光标移动和历史导航互不冲突。
-- 搜索输入中的普通 n/N、F3/Shift+F3 及过滤字段焦点行为。
-- 鼠标与键盘调用相同状态守卫。
-- Normal/ReceiveBrowse 普通左键拖动选择、滚轮保留和选择清除规则正确；SendEdit 鼠标仍控制草稿光标/选择。
-- Normal 的 `y` 在非空选择时可靠复制；ReceiveBrowse 的 `yy` 复制当前安全记录；终端转发的 Ctrl+C 只在选择非空时复制，空选择无动作，所有 OSC 52 路径受同一 1 MiB 上限约束且不穿透覆盖层；帮助页解释 Ctrl+Shift+C 由终端控制而非应用快捷键。
-- rose-pine 与 transparent 下活动/失焦选择样式均可辨识，transparent 不产生背景色。
-- 常见终端中的 Alt、功能键和 BackTab 编码。
-- `q` 只在 Normal 和 ReceiveBrowse 退出，`Q` 无动作，`q` 不穿透 SendEdit、Search、Modal、Confirm 或 Help，F1 仍可无条件打开和恢复 Help。
+既有单元、集成和 UI 测试条目保存在
+`../lazycom-test/docs/product-test-plan.md`；实际测试清单见
+`../lazycom-test/test_items.md`。本仓库保留产品性能与验收契约，不维护测试项。
+只有用户明确要求时才可在测试仓库新增或执行测试，以下指标不构成执行授权。
 
 ### 17.4 压力指标
 

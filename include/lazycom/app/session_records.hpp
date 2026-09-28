@@ -29,6 +29,7 @@ struct DirectionFilter {
   bool tx{true};
   bool system{true};
   bool error{true};
+  bool operator==(const DirectionFilter &) const = default;
 };
 
 [[nodiscard]] bool direction_visible(RecordDirection direction,

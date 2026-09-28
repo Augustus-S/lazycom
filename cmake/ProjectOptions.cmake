@@ -1,4 +1,3 @@
-option(LAZYCOM_BUILD_TESTS "Build LazyCom tests" ON)
 option(LAZYCOM_BUILD_DIAGNOSTICS "Compile internal diagnostics support" ON)
 option(LAZYCOM_USE_SYSTEM_LIBSERIALPORT "Use a validated system libserialport" OFF)
 option(LAZYCOM_USE_SYSTEM_DEPS "Use validated system non-header dependencies" OFF)

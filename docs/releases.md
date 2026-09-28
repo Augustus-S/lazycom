@@ -1,6 +1,6 @@
 # 自动构建与安装包
 
-`.github/workflows/release.yml` 在每次分支 push 时构建最新提交，并在全部测试通过后
+`.github/workflows/release.yml` 在每次分支 push 时构建最新提交，并在生产构建和打包成功后
 创建 GitHub 预发布。一次 push 包含多个提交时，只发布最后一个提交。Actions 页面
 支持手动触发；Pull request 执行相同检查并保留产物，但不发布。仅推送 tag 不触发。
 
@@ -16,10 +16,9 @@
 | tar.gz | `lazycom-<版本>-linux-x86_64.tar.gz` | 与 DEB 相同的构建基线 |
 | 校验文件 | `SHA256SUMS` | 覆盖上述四个附件 |
 
-截至 2026-09-22，当前稳定系列为 [Debian 13](https://www.debian.org/releases/)、
-[Ubuntu 26.04 LTS](https://ubuntu.com/download/desktop) 和
-[Fedora 44](https://fedoraproject.org/workstation/download/)。工作流固定这些测试镜像
-的版本；新增发行版支持时更新 `install-test` 矩阵并验证安装、启动和卸载。
+上述发行版是原有安装验证的目标。安装、启动和卸载验证由独立
+`../lazycom-test` 仓库维护，仅在用户明确指令下执行。本仓库的自动发布不执行测试，
+也不代表当前产物已在上述系统通过安装验证。
 
 版本形式为 `0.1.0~pre.<run_number>.<run_attempt>.g<commit前12位>`，基础版本来自
 `CMakeLists.txt`。递增的预发布编号支持包管理器升级，同一基础版本的正式版排在
@@ -89,7 +88,7 @@ AppImage 保留系统 glibc、libstdc++ 和 libgcc 依赖，运行基线为 Ubun
 
 ## 构建和验证流程
 
-构建矩阵执行五个完整 presets：`gcc-debug`、`clang-debug`、`gcc-release`、
+生产构建矩阵使用五个 configure/build presets：`gcc-debug`、`clang-debug`、`gcc-release`、
 `gcc-debug-no-diagnostics`、`gcc-asan-ubsan`。发布使用 GCC Release 产物。
 
 CPack 生成 DEB、RPM 和 tar.gz，`packaging/build-appimage.sh` 生成 AppImage。
@@ -98,14 +97,12 @@ AppImage 打包工具固定为 1.9.1，type2 runtime 固定为 20251108，二者
 仓库内固定依赖，不下载应用依赖。runner 工具安装、容器镜像及首次 AppImage 工具
 获取需要联网。
 
-构建通过后，在四种发行版的独立容器中安装原生包，确认命令路径、动态库加载，
-以非 root 用户在 PTY 中验证界面启动和 `q` 正常退出，再卸载包并运行 AppImage。
-原生包和 AppImage 均通过后才允许发布。AppImage 的 FUSE 挂载启动、桌面菜单、
-真实 USB-UART、TSan 和 8 小时性能/RSS 验收不在此流程内。
+自动流程只执行生产构建、打包、附件校验与发布，不执行 CTest、安装验证或 TUI
+冒烟检查。原验证脚本与手动测试工作流位于 `../lazycom-test`；测试结果必须关联
+实际生产提交和产物。真实 USB-UART、TSan 运行检查及 8 小时性能/RSS 验收仍未完成。
 
-构建与安装测试 job 仅申请 `contents: read`；发布 job 使用自动提供的
-`GITHUB_TOKEN` 并申请 `contents: write`，不需要个人 token。仓库或组织策略须允许
-Actions 及该权限；发布权限错误时检查 Actions 策略和 tag rulesets。
+构建 job 仅申请 `contents: read`；发布 job 使用自动提供的 `GITHUB_TOKEN`
+并申请 `contents: write`，不需要个人 token。仓库或组织策略须允许 Actions 及该权限。
 Actions 中间产物保留 7 天，Releases 附件不受此期限影响。
 
 ## 本地打包
@@ -117,7 +114,6 @@ sudo apt install cmake ninja-build make gcc-13 g++-13 dpkg-dev rpm \
   file binutils curl desktop-file-utils squashfs-tools
 cmake --preset gcc-release -DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13
 cmake --build --preset gcc-release
-ctest --preset gcc-release
 cpack --config build/gcc-release/CPackConfig.cmake -G DEB -B build/packages
 cpack --config build/gcc-release/CPackConfig.cmake -G RPM -B build/packages
 cpack --config build/gcc-release/CPackConfig.cmake -G TGZ -B build/packages
@@ -140,7 +136,7 @@ cmake --install build/gcc-release --component Runtime \
 
 `share/lazycom/DEPENDENCIES.lock` 记录依赖版本，`COMMIT` 记录构建提交，
 `licenses/` 保留第三方许可；fmt 的完整许可位于 `fmt-license-and-header.h` 开头。
-Catch2 只用于测试，不进入发布程序。
+Catch2 由独立测试仓库保存，不进入生产构建或发布程序。
 
 libserialport 的 LGPL 许可和对应源码位于 `share/lazycom/licenses/` 及
 `share/lazycom/source/libserialport/`。用户可以修改源码，重新编译并替换动态库，

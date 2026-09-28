@@ -11,7 +11,9 @@ SHA-256 values are recorded in `include/dependencies/DEPENDENCIES.lock`.
 | nlohmann/json | 3.12.0 | MIT | `include/dependencies/licenses/nlohmann-json-LICENSE.MIT` |
 | tl::expected | 1.2.0 | CC0-1.0 | `include/dependencies/licenses/tl-expected-COPYING` |
 | spdlog | 1.15.3 | MIT | `third_party/spdlog/LICENSE` |
-| Catch2 | 3.8.1 | BSL-1.0 | `third_party/catch2/LICENSE.txt` |
+
+Catch2 and the test sources are maintained in the separate `../lazycom-test`
+repository. It preserves their licenses, dependency lock and migration hashes.
 
 libserialport is built as a shared library. Distribution must preserve the
 LGPL license, corresponding source, and the user's ability to replace the
@@ -20,5 +22,6 @@ library with a compatible build.
 Vendored trees are trimmed to the Linux build inputs; non-building upstream
 content (examples, tests, docs, CI/ecosystem metadata, non-Linux sources) is
 removed. `third_party/libserialport/LAZYCOM_PATCHES.md` records the details for
-libserialport. Upstream source URLs and SHA-256 values in
+libserialport; `third_party/ftxui/LAZYCOM_PATCHES.md` records the FTXUI test-support
+removal. Upstream source URLs and SHA-256 values in
 `include/dependencies/DEPENDENCIES.lock` still identify the original archives.

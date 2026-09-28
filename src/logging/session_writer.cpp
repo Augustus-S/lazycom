@@ -180,11 +180,6 @@ struct SessionWriter::Impl {
   }
 
   void handle(RecordItem &item) {
-    {
-      std::scoped_lock lock{mutex};
-      --queued_record_count;
-      queued_byte_count -= item.bytes;
-    }
     observe_overload();
     if (!worker_active ||
         state.load(std::memory_order_acquire) == SessionLogState::Error) {
@@ -472,7 +467,10 @@ struct SessionWriter::Impl {
           }
           if (!items.empty()) {
             item.emplace(std::move(items.front()));
-            if (!std::holds_alternative<RecordItem>(*item)) {
+            if (const auto *record = std::get_if<RecordItem>(&*item)) {
+              --queued_record_count;
+              queued_byte_count -= record->bytes;
+            } else {
               --queued_control_count;
             }
             items.pop_front();

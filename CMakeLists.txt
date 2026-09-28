@@ -7,7 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-include(CTest)
 include(cmake/ProjectOptions.cmake)
 include(cmake/Dependencies.cmake)
 
@@ -157,7 +156,3 @@ endforeach()
 target_link_libraries(lazycom PRIVATE lazycom_release_link_hardening)
 
 include(cmake/Install.cmake)
-
-if(BUILD_TESTING AND LAZYCOM_BUILD_TESTS)
-  add_subdirectory(tests)
-endif()
