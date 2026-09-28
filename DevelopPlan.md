@@ -1121,6 +1121,7 @@ RTU 静默间隔使用单调时钟。必须说明 Linux 用户态只能观察应
 - 快捷键和故障诊断文档。
 - 稳定错误代码目录和内部诊断支持说明。
 - 第三方依赖版本和许可清单。
+- LazyCom 自身使用 GPL-3.0-only，发布包携带根目录 `LICENSE`；第三方组件保留原许可。
 - libserialport 0.1.2 shared library、对应源码、LGPL 许可和动态替换说明。
 - 已知限制，包括 native handle 风险和非实时定时语义。
 
@@ -1147,6 +1148,25 @@ AppImage 工具和运行时固定版本及 SHA-256，下载只发生在显式打
 
 自动预发布不覆盖 TSan 运行检查、AppImage FUSE 挂载或桌面启动。
 触发条件、下载、运行及动态库替换方法见 [自动构建与预发布](docs/releases.md)。
+
+### 17.5 Fedora 原生 RPM 与 COPR 源码入口
+
+`packaging/lazycom.spec` 使用 Fedora 工具链从 SRPM 构建，保留默认固定版本依赖，
+不引入系统依赖替换或 configure-time 下载。CMake 安装目录支持
+`CMAKE_INSTALL_LIBDIR`，默认 `lib`，Fedora spec 显式选择 `%{_lib}`；私有串口库
+RUNPATH 根据 bin/lib 相对位置生成。原生 RPM 将许可证和文档放入发行版标准目录，
+并保留 libserialport 对应源码。RPM 管理 strip 和 debuginfo，安装阶段不提前 strip。
+
+libserialport 的 ExternalProject 继承 CMake C 编译参数、当前构建类型参数及共享库
+链接参数，以保留发行版的调试和加固设置。依赖仍只构建 shared library。
+
+`.copr/Makefile` 的 `srpm` target 调用 `packaging/build-srpm.sh`，从干净的已跟踪
+工作树归档 `HEAD` 并注入完整提交号。`vX.Y.Z` 标签指向该提交时生成正式版本；
+否则生成 `X.Y.Z~pre.<提交UTC时间>.g<commit前12位>`。CMake 与 spec 的上游版本
+必须一致，RPM Release 含 `%{?dist}`。SRPM 自包含生产构建所需源码与固定依赖。
+
+spec 不提供 `%check` 或任何测试入口，源码生成和打包不依赖测试仓库。COPR 项目
+创建、目标 chroot、凭据及上传由维护者管理；生产仓库不自动触发 COPR 发布。
 
 ## 18. 首次开工顺序
 

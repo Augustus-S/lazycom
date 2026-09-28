@@ -73,24 +73,36 @@ else()
   endif()
 
   set(lazycom_libserialport_environment "CC=${CMAKE_C_COMPILER}")
+  # ExternalProject does not inherit CMake's configured compiler/linker flags.
+  string(TOUPPER "${CMAKE_BUILD_TYPE}" lazycom_libserialport_configuration)
+  set(lazycom_libserialport_cflags_string
+    "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_${lazycom_libserialport_configuration}}"
+  )
+  set(lazycom_libserialport_ldflags_string
+    "${CMAKE_SHARED_LINKER_FLAGS} ${CMAKE_SHARED_LINKER_FLAGS_${lazycom_libserialport_configuration}}"
+  )
   if(lazycom_libserialport_cflags)
     list(REMOVE_DUPLICATES lazycom_libserialport_cflags)
-    string(JOIN " " lazycom_libserialport_cflags_string
+    string(JOIN " " lazycom_libserialport_extra_cflags
       ${lazycom_libserialport_cflags}
     )
-    list(APPEND lazycom_libserialport_environment
-      "CFLAGS=${lazycom_libserialport_cflags_string}"
-    )
+    string(APPEND lazycom_libserialport_cflags_string
+      " ${lazycom_libserialport_extra_cflags}")
   endif()
   if(lazycom_libserialport_ldflags)
     list(REMOVE_DUPLICATES lazycom_libserialport_ldflags)
-    string(JOIN " " lazycom_libserialport_ldflags_string
+    string(JOIN " " lazycom_libserialport_extra_ldflags
       ${lazycom_libserialport_ldflags}
     )
-    list(APPEND lazycom_libserialport_environment
-      "LDFLAGS=${lazycom_libserialport_ldflags_string}"
-    )
+    string(APPEND lazycom_libserialport_ldflags_string
+      " ${lazycom_libserialport_extra_ldflags}")
   endif()
+  string(STRIP "${lazycom_libserialport_cflags_string}" lazycom_libserialport_cflags_string)
+  string(STRIP "${lazycom_libserialport_ldflags_string}" lazycom_libserialport_ldflags_string)
+  list(APPEND lazycom_libserialport_environment
+    "CFLAGS=${lazycom_libserialport_cflags_string}"
+    "LDFLAGS=${lazycom_libserialport_ldflags_string}"
+  )
 
   # Use the shipped Autotools outputs even when checkout timestamps put their
   # inputs later. Regeneration would require the upstream maintainer toolchain

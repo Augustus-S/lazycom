@@ -4,7 +4,7 @@ set(LAZYCOM_PACKAGE_VERSION "${PROJECT_VERSION}${LAZYCOM_PACKAGE_SUFFIX}")
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/package-version.txt" CONTENT "${LAZYCOM_PACKAGE_VERSION}\n")
 file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/package-commit.txt" CONTENT "${LAZYCOM_BUILD_COMMIT}\n")
 install(FILES "${CMAKE_BINARY_DIR}/package-commit.txt"
-  DESTINATION share/lazycom COMPONENT Runtime RENAME COMMIT
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/lazycom" COMPONENT Runtime RENAME COMMIT
 )
 
 set(CPACK_PACKAGE_NAME lazycom)
@@ -27,13 +27,12 @@ set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 
 set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
 set(CPACK_RPM_PACKAGE_RELEASE 1)
-# The repository does not declare a license for LazyCom itself.
-set(CPACK_RPM_PACKAGE_LICENSE "NOASSERTION")
+set(CPACK_RPM_PACKAGE_LICENSE "GPL-3.0-only AND LGPL-3.0-or-later AND MIT AND CC0-1.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Communications")
 set(CPACK_RPM_PACKAGE_AUTOREQPROV ON)
 set(CPACK_RPM_PACKAGE_RELOCATABLE OFF)
 set(CPACK_RPM_SPEC_MORE_DEFINE
-  "%define __provides_exclude_from ^/usr/lib/lazycom/.*$\n%define __requires_exclude ^libserialport[.]so.*$\n%define __requires_exclude_from ^/usr/share/lazycom/source/.*$"
+  "%define __provides_exclude_from ^/usr/${CMAKE_INSTALL_LIBDIR}/lazycom/.*$\n%define __requires_exclude ^libserialport[.]so.*$\n%define __requires_exclude_from ^/usr/${CMAKE_INSTALL_DATADIR}/lazycom/source/.*$"
 )
 
 include(CPack)
