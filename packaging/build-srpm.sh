@@ -27,6 +27,10 @@ if [[ $(git rev-parse --verify "refs/tags/v$version^{commit}" 2>/dev/null || tru
   suffix="~pre.$timestamp.g${commit:0:12}"
 fi
 package_version="$version$suffix"
+spec_suffix='%{nil}'
+if [[ -n $suffix ]]; then
+  spec_suffix=$suffix
+fi
 
 mkdir -p "$output_dir"
 staging=$(mktemp -d "$output_dir/.srpm.XXXXXX")
@@ -36,7 +40,7 @@ git archive --format=tar --prefix="lazycom-$package_version/" "$commit" |
   gzip -n > "$staging/SOURCES/lazycom-$package_version.tar.gz"
 git show "$commit:$spec_file" |
   sed -e "s/^%global source_commit .*/%global source_commit $commit/" \
-      -e "s/^%global package_suffix .*/%global package_suffix ${suffix:-%{nil}}/" \
+      -e "s/^%global package_suffix .*/%global package_suffix $spec_suffix/" \
   > "$staging/SPECS/lazycom.spec"
 
 rpmbuild -bs --define "_topdir $staging" --define "_srcrpmdir $output_dir" \
