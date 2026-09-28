@@ -217,6 +217,12 @@ SRPM 包含完整生产源码、固定依赖和构建文件，不需要在 confi
 `packaging/lazycom.spec`。源码生成环境需提供 Git、GNU Make、Bash、GNU coreutils、
 awk、sed、gzip 和 rpmbuild。
 
+COPR 在隔离环境外克隆仓库，执行 `make srpm` 的最小环境不一定包含 Git。
+入口在缺少 Git 且以 root 运行时通过 `dnf` 安装 `git-core`；普通用户缺少 Git 时
+会收到安装提示并退出，不尝试提权。此步骤属于源码包准备，可能访问 Fedora
+软件源；不改变生产 CMake configure/build 的离线要求。仅在 spec 添加
+`BuildRequires: git-core` 无法解决该阶段缺少 Git 的问题。
+
 版本规则：
 
 - `CMakeLists.txt` 的版本和 spec 的 `upstream_version` 必须一致。

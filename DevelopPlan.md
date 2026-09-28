@@ -1165,6 +1165,10 @@ libserialport 的 ExternalProject 继承 CMake C 编译参数、当前构建类�
 否则生成 `X.Y.Z~pre.<提交UTC时间>.g<commit前12位>`。CMake 与 spec 的上游版本
 必须一致，RPM Release 含 `%{?dist}`。SRPM 自包含生产构建所需源码与固定依赖。
 
+COPR 的 Git 克隆发生在源码构建隔离环境外。`srpm` 入口在该环境缺少 Git 且以
+root 运行时通过 `dnf` 安装 `git-core`；普通用户缺少 Git 时明确报错，不调用
+提权工具。此源码准备步骤可以访问发行版软件源，生产 CMake 构建仍使用固定本地依赖。
+
 spec 不提供 `%check` 或任何测试入口，源码生成和打包不依赖测试仓库。COPR 项目
 创建、目标 chroot、凭据及上传由维护者管理；生产仓库不自动触发 COPR 发布。
 
