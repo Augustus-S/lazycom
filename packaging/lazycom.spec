@@ -42,6 +42,7 @@ session logging. A private shared libserialport and its source are included.
 
 %build
 %cmake \
+    -DBUILD_SHARED_LIBS:BOOL=OFF \
     -DCMAKE_BUILD_TYPE:STRING=Release \
     -DCMAKE_INSTALL_LIBDIR:PATH=%{_lib} \
     -DLAZYCOM_BUILD_DIAGNOSTICS:BOOL=ON \
