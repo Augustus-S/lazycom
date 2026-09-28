@@ -1,29 +1,64 @@
-# 自动构建与安装包
+# 发布、安装与 GitHub Actions
 
-`.github/workflows/release.yml` 在每次分支 push 时构建最新提交，并在生产构建和打包成功后
-创建 GitHub 预发布。一次 push 包含多个提交时，只发布最后一个提交。Actions 页面
-支持手动触发；Pull request 执行相同检查并保留产物，但不发布。仅推送 tag 不触发。
+本文按 2026-09-28 的 [发布工作流](../.github/workflows/release.yml)、
+[安装规则](../cmake/Install.cmake)、[CPack 配置](../cmake/Packaging.cmake)
+和 [AppImage 脚本](../packaging/build-appimage.sh) 整理。开发沿革与历史验证见
+[history.md](history.md)。
+
+## GitHub Actions
+
+工作流名称为 `Build and prerelease`，触发规则如下：
+
+| 事件 | 构建与打包 | GitHub 预发布 |
+| --- | --- | --- |
+| 任意分支 push | 构建该次 push 的末尾提交 | 整个构建矩阵成功后发布 |
+| Pull request | 构建并保留 Actions 产物 | 不发布 |
+| Actions 页面手动触发 | 构建所选 ref | 整个构建矩阵成功后发布 |
+| 仅推送 tag | 不触发 | 不发布 |
+
+runner 固定为 `ubuntu-24.04`，安装 GCC 13 和 Clang 18。生产构建矩阵为：
+
+| Preset | 编译器 | 用途 |
+| --- | --- | --- |
+| `gcc-debug` | GCC 13 | Debug 编译 |
+| `clang-debug` | Clang 18 | Clang 编译兼容性 |
+| `gcc-release` | GCC 13 | Release 编译及全部安装包 |
+| `gcc-debug-no-diagnostics` | GCC 13 | diagnostics 关闭时的编译 |
+| `gcc-asan-ubsan` | GCC 13 | ASan/UBSan 插桩版本编译 |
+
+工作流只执行生产构建、打包和附件校验，不运行应用、CTest、sanitizer 或安装
+冒烟验证。`gcc-tsan` 是本地 configure/build preset，没有加入自动矩阵。
+测试代码与执行入口由独立 `../lazycom-test` 仓库维护，须按明确指令使用。
+
+Release job 下载 `release-linux-x86_64` artifact，核对 `SHA256SUMS` 后发布。
+构建 job 使用 `contents: read`，发布 job 使用自动提供的 `GITHUB_TOKEN` 和
+`contents: write`；仓库或组织策略须允许该权限，无需配置个人 token。
+Actions artifact 保留 7 天；该期限不删除已经上传到 Releases 的附件。
+
+包版本为 `<项目版本>~pre.<run_number>.<run_attempt>.g<commit前12位>`。
+项目版本来自根 `CMakeLists.txt`，后缀在 configure 步骤注入。发布标签为
+`build-<run_id>-<run_attempt>`，绑定构建提交，并设置 prerelease、`latest=false`。
+工作流不自动删除旧预发布，也没有配置新 push 取消旧运行。
+
+排查未生成预发布时，先确认触发事件，再查看五个构建 job；GCC Release 已上传
+artifact 并不代表整个矩阵成功。若构建通过但发布失败，检查附件校验、Actions
+写权限与仓库 tag rulesets。
 
 ## 发布产物与兼容范围
 
 所有产物均为 x86_64，使用 Ubuntu 24.04、GCC 13 和 C++20 Release 构建。
 
-| 格式 | 包名或文件名 | 安装与运行验证目标 |
+| 格式 | 包名或文件名 | 使用方式 |
 | --- | --- | --- |
-| DEB | `lazycom_<版本>_amd64.deb` | Debian 13、Ubuntu 24.04、Ubuntu 26.04 |
-| RPM | `lazycom-<版本>-1.x86_64.rpm` | Fedora 44 |
-| AppImage | `lazycom-<版本>-x86_64.AppImage` | 上述四种系统，无 FUSE 的解包运行模式 |
-| tar.gz | `lazycom-<版本>-linux-x86_64.tar.gz` | 与 DEB 相同的构建基线 |
-| 校验文件 | `SHA256SUMS` | 覆盖上述四个附件 |
+| DEB | `lazycom_<版本>_amd64.deb` | 通过 apt 安装 |
+| RPM | `lazycom-<版本>-1.x86_64.rpm` | 通过 dnf 安装 |
+| AppImage | `lazycom-<版本>-x86_64.AppImage` | 可执行文件，支持解包运行 |
+| tar.gz | `lazycom-<版本>-linux-x86_64.tar.gz` | 解压后保留完整目录树 |
+| 校验文件 | `SHA256SUMS` | 校验上述四个附件 |
 
-上述发行版是原有安装验证的目标。安装、启动和卸载验证由独立
-`../lazycom-test` 仓库维护，仅在用户明确指令下执行。本仓库的自动发布不执行测试，
-也不代表当前产物已在上述系统通过安装验证。
-
-版本形式为 `0.1.0~pre.<run_number>.<run_attempt>.g<commit前12位>`，基础版本来自
-`CMakeLists.txt`。递增的预发布编号支持包管理器升级，同一基础版本的正式版排在
-预发布之后。GitHub 标签使用 `build-<run_id>-<run_attempt>`，绑定实际构建提交；
-重新运行产生新预发布，不覆盖旧版，不标记为 Latest，也不因后续 push 取消旧构建。
+工作流发布说明列出的目标系统为 Debian 13、Ubuntu 24.04 / 26.04 和 Fedora 44。
+这是目标范围，当前自动流程不提供这些系统的安装、启动或卸载验证结果。
+真实 USB-UART 与长时性能验收也未由发布流程完成。
 
 ## 安装与运行
 
@@ -86,24 +121,13 @@ AppImage 保留系统 glibc、libstdc++ 和 libgcc 依赖，运行基线为 Ubun
 组成员变更后可能需要重新登录。遇到设备忙时检查 ModemManager、brltty 或其他
 串口程序。配置、日志和快捷键说明见 `/usr/share/lazycom/Plan.md`。
 
-## 构建和验证流程
-
-生产构建矩阵使用五个 configure/build presets：`gcc-debug`、`clang-debug`、`gcc-release`、
-`gcc-debug-no-diagnostics`、`gcc-asan-ubsan`。发布使用 GCC Release 产物。
+## 打包与依赖来源
 
 CPack 生成 DEB、RPM 和 tar.gz，`packaging/build-appimage.sh` 生成 AppImage。
 AppImage 打包工具固定为 1.9.1，type2 runtime 固定为 20251108，二者下载后必须通过
 脚本中固定的 SHA-256 校验；提供已缓存文件时仍校验。CMake configure/build 使用
-仓库内固定依赖，不下载应用依赖。runner 工具安装、容器镜像及首次 AppImage 工具
-获取需要联网。
-
-自动流程只执行生产构建、打包、附件校验与发布，不执行 CTest、安装验证或 TUI
-冒烟检查。原验证脚本与手动测试工作流位于 `../lazycom-test`；测试结果必须关联
-实际生产提交和产物。真实 USB-UART、TSan 运行检查及 8 小时性能/RSS 验收仍未完成。
-
-构建 job 仅申请 `contents: read`；发布 job 使用自动提供的 `GITHUB_TOKEN`
-并申请 `contents: write`，不需要个人 token。仓库或组织策略须允许 Actions 及该权限。
-Actions 中间产物保留 7 天，Releases 附件不受此期限影响。
+仓库内固定依赖，不下载应用依赖。runner 工具安装和首次 AppImage 工具获取需要
+联网；提供两个已缓存且校验一致的 AppImage 工具文件后，打包脚本不会重新下载。
 
 ## 本地打包
 
@@ -123,7 +147,9 @@ bash packaging/build-appimage.sh build/gcc-release build/packages
 在 Fedora 本地可使用 CPack RPM，但该二进制的最低运行库版本由本机构建环境决定。
 DEB 自动依赖分析要求在 Debian/Ubuntu 环境运行。默认本地包版本等于项目版本；
 可在 configure 时传入 `LAZYCOM_PACKAGE_SUFFIX` 和 `LAZYCOM_BUILD_COMMIT`。
-`APPIMAGE_TOOL_DIR` 可指向预先下载两个固定工具的缓存目录。
+本地未设置 `LAZYCOM_BUILD_COMMIT` 时，包内 `COMMIT` 写入 `unknown`。
+`APPIMAGE_TOOL_DIR` 可指向工具缓存目录，其中的文件名必须是
+`appimagetool-x86_64.AppImage` 和 `runtime-x86_64`。
 
 `Runtime` 安装组件仅支持 Linux 默认 vendored 模式，安装前必须先构建程序：
 

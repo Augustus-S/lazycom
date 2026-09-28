@@ -594,7 +594,7 @@ RX、TX 和命令每轮必须有预算；预算耗尽后使用零超时重新 `p
 - `Plan.md` 的八类管理预算总计 128 MiB；`GlobalMemoryBudget`、共享记录 token 和 `SessionSequencer` 的实现与测试已经存在。
 - 当前生产 `SessionRecords` 通过唯一 `SessionSequencer` 分配 session seq，以不可变 `SessionRecord` 保持逐条淘汰；`VisibleRecord` 借用记录中的字节与文本，日志 worker 直接编码同一记录。跨连接稳定的 record ID 仍独立递增。
 - 已接入的 token 包括记录、payload 及其字段的保守元数据、UI 引用和日志队列/backlog 引用。共享对象计入 `UiRecords`，日志引用计入 `SessionLog`；即使 UI 清空，共享对象的 token 也保持到最后一个日志引用释放。TUI 的过滤坐标和安全文本缓存共享同一 `UiRecords` 预算，增量搜索的查询与结果存储计入 `Model`。
-- ingress、TX、草稿/历史、framer scratch、配置解析/持久化、completion 和固定控制槽尚未全部接入。现有分类及配置组合上限继续生效，128 MiB 全局 token 仍不是端到端运行时硬边界。逐类基线见 `docs/architecture-optimization-results.md`，UI 接入见 `docs/performance-optimization.md`；阶段 7 必须完成剩余接入才能宣称闭环。
+- ingress、TX、草稿/历史、framer scratch、配置解析/持久化、completion 和固定控制槽尚未全部接入。现有分类及配置组合上限继续生效，128 MiB 全局 token 仍不是端到端运行时硬边界。接入沿革见 [开发历史](docs/history.md)；阶段 7 必须完成剩余接入才能宣称闭环。
 - payload 通过共享 budget token 按实际分配计一次；每个 sink 的逻辑队列配额独立统计，以便执行各自过载策略。
 - UI 记录元数据、容器节点、字符串 capacity、搜索索引和 diagnostics 消息都必须记账。
 - completion 对象、active operation、固定控制槽、OperationId 索引、LogStatusSignal、WorkerStoppedSignal 和 scanner pending 状态计入 control/model 类别，并参与配置组合验证。
@@ -836,18 +836,9 @@ TSan + concurrency tests
 - Release 构建必须验证没有依赖 assert 才成立的用户输入检查。
 - Release hardening 必须保留 capability check，并验证 LazyCom targets 获得可用的 PIE、stack protector、FORTIFY、RELRO、NOW 和 noexecstack；bundled libserialport 使用对应的受支持 CFLAGS/LDFLAGS。
 
-历史测试矩阵（2026-09-20；详细范围见 `docs/test-cleanup-results.md`，不代表迁移后已执行）：
-
-| 配置 | 历史结果 |
-| --- | --- |
-| GCC Debug，严格警告视为错误 | 105/105 通过 |
-| Clang Debug，严格警告视为错误 | 105/105 通过 |
-| GCC Release | 105/105 通过 |
-| GCC Debug + ASan + UBSan | 105/105 通过 |
-| GCC Debug + diagnostics compiled out | 105/105 通过 |
-| GCC TSan | 105/105 通过，未报告项目数据竞争 |
-
-上述自动矩阵不包含三类真实 USB-UART 和 8 小时 2 Mbaud 性能/RSS 验收，两者仍是阶段 7 门禁。
+历史验证范围见 [开发历史](docs/history.md#验证记录)。迁移前的通过记录不表示
+当前源码或发布产物已经完成测试；sanitizer 版本编译成功也不表示执行过运行检查。
+三类真实 USB-UART 和 8 小时 2 Mbaud 性能/RSS 验收仍是阶段 7 门禁。
 
 ### 13.5 推荐警告
 
