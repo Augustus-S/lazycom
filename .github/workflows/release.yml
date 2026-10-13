@@ -136,9 +136,6 @@ jobs:
           - AppImage: 设置可执行权限后运行；无 FUSE 时可设置 APPIMAGE_EXTRACT_AND_RUN=1。
           - tar.gz: 解压后运行 usr/bin/lazycom，保留 usr 目录结构。
           - SHA256SUMS: 下载所需附件后使用 sha256sum --check --ignore-missing SHA256SUMS 校验。
-
-          此版本通过自动构建；测试由独立 lazycom-test 仓库按明确指令执行，本发布流程不执行测试。
-          尚未完成真实串口硬件及长时性能验收。
           EOF
           gh release create "$tag" ./*.deb ./*.rpm ./*.AppImage ./*.tar.gz SHA256SUMS \
             --verify-tag \
