@@ -11,14 +11,15 @@ LazyCom 自身采用 [GNU GPL 第 3 版](../LICENSE)，SPDX 标识为 `GPL-3.0-o
 
 ## GitHub Actions
 
-工作流名称为 `Build and prerelease`，触发规则如下：
+工作流名称为 `Build and release`，触发规则如下：
 
-| 事件 | 构建与打包 | GitHub 预发布 |
+| 事件 | 构建与打包 | GitHub Release |
 | --- | --- | --- |
-| 任意分支 push | 构建该次 push 的末尾提交 | 整个构建矩阵成功后发布 |
+| 任意分支 push | 构建该次 push 的末尾提交 | 不发布 |
 | Pull request | 构建并保留 Actions 产物 | 不发布 |
-| Actions 页面手动触发 | 构建所选 ref | 整个构建矩阵成功后发布 |
-| 仅推送 tag | 不触发 | 不发布 |
+| Actions 手动触发 | 构建所选 ref | 仅版本标签在整个矩阵成功后发布 |
+| 推送 `v*` tag | 校验版本并构建标签提交 | 整个构建矩阵成功后发布 |
+| 其他 tag | 不触发 | 不发布 |
 
 runner 固定为 `ubuntu-24.04`，安装 GCC 13 和 Clang 18。生产构建矩阵为：
 
@@ -39,12 +40,23 @@ Release job 下载 `release-linux-x86_64` artifact，核对 `SHA256SUMS` 后发�
 `contents: write`；仓库或组织策略须允许该权限，无需配置个人 token。
 Actions artifact 保留 7 天；该期限不删除已经上传到 Releases 的附件。
 
-包版本为 `<项目版本>~pre.<run_number>.<run_attempt>.g<commit前12位>`。
-项目版本来自根 `CMakeLists.txt`，后缀在 configure 步骤注入。发布标签为
-`build-<run_id>-<run_attempt>`，绑定构建提交，并设置 prerelease、`latest=false`。
-工作流不自动删除旧预发布，也没有配置新 push 取消旧运行。
+项目版本来自根 `CMakeLists.txt`。版本标签必须是 `v<项目版本>`；补丁版本为零时
+也接受省略 `.0`，例如 `v0.1` 对应程序及安装包版本 `0.1.0`。标签构建使用无后缀
+包版本，发布标题为 `LazyCom <标签>`，不标记为 prerelease。分支构建的包版本为
+`<项目版本>~pre.<run_number>.<run_attempt>.g<commit前12位>`。
+工作流不再创建 `build-*` 标签，不覆盖已有 Release，也不自动清理旧标签或发布。
 
-排查未生成预发布时，先确认触发事件，再查看五个构建 job；GCC Release 已上传
+发布前提交并推送源码，再创建和推送版本标签，例如：
+
+```bash
+git tag -a v0.1 -m 'LazyCom v0.1'
+git push origin v0.1
+```
+
+若构建失败，可重跑失败任务，或使用 `gh workflow run release.yml --ref v0.1`
+重试尚未成功的发布。已成功发布的标签不应移动或重复发布。
+
+排查未生成 Release 时，先确认触发事件，再查看五个构建 job；GCC Release 已上传
 artifact 并不代表整个矩阵成功。若构建通过但发布失败，检查附件校验、Actions
 写权限与仓库 tag rulesets。
 

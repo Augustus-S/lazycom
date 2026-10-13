@@ -1125,16 +1125,19 @@ RTU 静默间隔使用单调时钟。必须说明 Linux 用户态只能观察应
 - libserialport 0.1.2 shared library、对应源码、LGPL 许可和动态替换说明。
 - 已知限制，包括 native handle 风险和非实时定时语义。
 
-### 17.4 自动预发布
+### 17.4 自动构建与版本发布
 
-`.github/workflows/release.yml` 在每次分支 push 和手动触发时，使用 Ubuntu 24.04
-x86_64、GCC 13 和 Clang 18 执行 GCC Debug、Clang Debug、GCC Release、
-no-diagnostics 和 ASan/UBSan 的生产构建。构建与打包成功后发布该次构建提交的
-GitHub prerelease；Pull request 只验证和保留 Actions 产物。
+`.github/workflows/release.yml` 在分支 push、`v*` 标签 push、Pull request 和手动
+触发时，使用 Ubuntu 24.04 x86_64、GCC 13 和 Clang 18 执行 GCC Debug、Clang
+Debug、GCC Release、no-diagnostics 和 ASan/UBSan 的生产构建。只有版本标签构建
+在整个矩阵及打包成功后创建 GitHub Release；分支和 Pull request 只保留 Actions
+产物，不创建标签或发布。
 
-每次运行使用独立 `build-<run_id>-<run_attempt>` 标签，上传名为 `lazycom` 的
-DEB、RPM、AppImage、tar.gz 和统一 SHA-256 校验文件，不覆盖已有发布。包版本使用
-`<项目版本>~pre.<run_number>.<run_attempt>.g<commit前12位>`，支持原生包升级。
+发布标签必须为 `v<项目版本>`；补丁版本为零时也接受省略 `.0`，例如 `v0.1`
+对应项目及包版本 `0.1.0`。标签构建不加包版本后缀；分支构建使用
+`<项目版本>~pre.<run_number>.<run_attempt>.g<commit前12位>`。
+发布上传 DEB、RPM、AppImage、tar.gz 和统一 SHA-256 校验文件，不覆盖已有发布。
+手动选择版本标签可重试尚未成功的发布；工作流不自动删除旧标签或 Release。
 
 `Runtime` 安装组件将程序安装到 `bin/lazycom`，将 bundled libserialport 安装到
 应用私有 `lib/lazycom/`，同时携带对应源码、许可、文档及 `Terminal=true` 桌面项。
@@ -1146,8 +1149,8 @@ AppImage 工具和运行时固定版本及 SHA-256，下载只发生在显式打
 仅在明确指令下执行。本仓库发布工作流不等待或宣称测试通过；发布说明必须明确
 自动流程只完成构建与打包。真实 USB-UART 与长时性能验收仍未完成。
 
-自动预发布不覆盖 TSan 运行检查、AppImage FUSE 挂载或桌面启动。
-触发条件、下载、运行及动态库替换方法见 [自动构建与预发布](docs/releases.md)。
+自动发布不覆盖 TSan 运行检查、AppImage FUSE 挂载或桌面启动。
+触发条件、下载、运行及动态库替换方法见 [自动构建与发布](docs/releases.md)。
 
 ### 17.5 Fedora 原生 RPM 与 COPR 源码入口
 

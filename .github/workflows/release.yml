@@ -1,8 +1,9 @@
-name: Build and prerelease
+name: Build and release
 
 on:
   push:
     branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -51,10 +52,20 @@ jobs:
             c_compiler=gcc-13
             cxx_compiler=g++-13
           fi
+          package_suffix="~pre.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.g${GITHUB_SHA:0:12}"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            version=$(awk '$1 == "project(lazycom" && $2 == "VERSION" {print $3}' CMakeLists.txt)
+            if [[ "$GITHUB_REF_NAME" != "v$version" &&
+                  ! ( "$version" == *.0 && "$GITHUB_REF_NAME" == "v${version%.0}" ) ]]; then
+              echo "Release tag must match project version $version" >&2
+              exit 1
+            fi
+            package_suffix=
+          fi
           cmake --preset "$PRESET" \
             -DCMAKE_C_COMPILER="$c_compiler" -DCMAKE_CXX_COMPILER="$cxx_compiler" \
             -DLAZYCOM_BUILD_COMMIT="$GITHUB_SHA" \
-            -DLAZYCOM_PACKAGE_SUFFIX="~pre.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}.g${GITHUB_SHA:0:12}"
+            -DLAZYCOM_PACKAGE_SUFFIX="$package_suffix"
 
       - name: Build
         run: cmake --build --preset "$PRESET"
@@ -92,8 +103,8 @@ jobs:
           compression-level: 0
 
   release:
-    name: Publish prerelease
-    if: github.event_name != 'pull_request'
+    name: Publish release
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -106,16 +117,16 @@ jobs:
           name: release-linux-x86_64
           path: release-assets
 
-      - name: Publish GitHub prerelease
+      - name: Publish GitHub release
         working-directory: release-assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           sha256sum --check SHA256SUMS
-          tag="build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tag="$GITHUB_REF_NAME"
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          LazyCom Linux x86_64 预发布版本。
+          LazyCom $tag Linux x86_64 版本。
 
           - Commit: $GITHUB_SHA
           - 构建记录: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
@@ -130,7 +141,6 @@ jobs:
           尚未完成真实串口硬件及长时性能验收。
           EOF
           gh release create "$tag" ./*.deb ./*.rpm ./*.AppImage ./*.tar.gz SHA256SUMS \
-            --target "$GITHUB_SHA" \
-            --title "Build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT} (${GITHUB_SHA:0:12})" \
-            --notes-file "$RUNNER_TEMP/release-notes.md" \
-            --prerelease --latest=false
+            --verify-tag \
+            --title "LazyCom $tag" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"
