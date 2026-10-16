@@ -7,7 +7,7 @@
 - 测试代码与测试清单由独立 `../lazycom-test` 仓库维护；本仓库不新增测试项，不自动运行测试。新增或执行测试须有用户明确指令。[开发历史](docs/history.md) 中的验证记录不能作为当前源码的通过证据。
 - 生产记录路径已接入 `SessionSequencer`、共享 payload 和记录引用预算，UI 与日志复用不可变记录；其余运行时类别尚未全部接入，128 MiB 全局 token 仍未闭环。
 - diagnostics 当前只有编译开关、`emergency_write()` 和 terminate/FATAL 所需的最小路径；完整内部诊断队列、worker、安全 sink、轮换和脱敏链路仍待实现。
-- 首版目标平台为 Ubuntu 24.04 同代或更新的现代 Linux。
+- 发布二进制面向 x86_64 和 aarch64 Linux，兼容目标为 Ubuntu 18.04+、Debian 11+；源码构建仍要求现代 C++20 工具链。
 
 ## 2. 产品定位与版本范围
 
@@ -62,7 +62,7 @@ LazyCom 是一款使用 C++ 和 FTXUI 开发的 TUI 串口助手，面向嵌入�
 - `interval_ms = 10..86400000` 表示尽力而为的定时发送，不提供实时性保证。
 - 外部编辑器、多标签、GB18030 和主动线路控制移到第二阶段。
 - 首版日志必须明确记录顺序和时间语义，不能声称无法证明的物理线路送达。
-- 首版以 Ubuntu 24.04 档为最低环境：Linux kernel 6.8、glibc 2.39、GCC 13 或 Clang 18、CMake 3.28。
+- 发布二进制最低运行目标为 Linux kernel 4.15、glibc 2.27；源码构建要求 GCC 13 或 Clang 18、CMake 3.28，不要求旧系统自带编译器可用。旧系统安装、启动和串口行为须单独验收。
 - 串口使用 libserialport 0.1.2，借用 native fd 仅用于 `ppoll()` readiness 和连接后 `fstat()`。
 - 各消费端过载相互隔离：UI 显示 gap、日志安全停写；只有原始 RX ingress 已知丢失才断开会话。
 - 应用管理的动态内存硬预算为 128 MiB，RSS 验收目标为空载基线增加不超过 192 MiB。
@@ -74,7 +74,7 @@ LazyCom 是一款使用 C++ 和 FTXUI 开发的 TUI 串口助手，面向嵌入�
 - C++20。
 - CMake。
 - Linux 优先。
-- Release/RelWithDebInfo/MinSizeRel 在编译器和链接器支持时启用 PIE、`-fstack-protector-strong`、`_FORTIFY_SOURCE=3`、RELRO、NOW 和 non-executable stack；选项先经 CMake 能力检查，不把不支持的参数硬编码为所有平台前提。
+- Release/RelWithDebInfo/MinSizeRel 在编译器和链接器支持时启用 PIE、`-fstack-protector-strong`、`_FORTIFY_SOURCE=3`（旧 glibc 使用 level 2）、RELRO、NOW 和 non-executable stack；选项先经 CMake 能力检查，不把不支持的参数硬编码为所有平台前提。
 - 已提供独立 `gcc-tsan` configure/build presets；test presets 由 `../lazycom-test` 维护；TSan 与 ASan/UBSan 互斥。
 
 ### 4.2 首版依赖

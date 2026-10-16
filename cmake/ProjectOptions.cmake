@@ -121,10 +121,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     )
   endif()
 
-  check_cxx_compiler_flag("-D_FORTIFY_SOURCE=3" LAZYCOM_CXX_HAS_FORTIFY_SOURCE_3)
+  # glibc before 2.33 only supports level 2; probe its headers, not just the flag.
+  include(CheckCSourceCompiles)
+  check_c_source_compiles("#include <features.h>\n#if !defined(__GLIBC__) || !__GLIBC_PREREQ(2, 33)\n#error Unsupported fortify level\n#endif\nint main(void) { return 0; }"
+    LAZYCOM_HAS_FORTIFY_LEVEL_3)
+  if(LAZYCOM_HAS_FORTIFY_LEVEL_3)
+    set(lazycom_fortify_level 3)
+  else()
+    set(lazycom_fortify_level 2)
+  endif()
+  check_cxx_compiler_flag("-D_FORTIFY_SOURCE=${lazycom_fortify_level}" LAZYCOM_CXX_HAS_FORTIFY_SOURCE_3)
   if(LAZYCOM_CXX_HAS_FORTIFY_SOURCE_3)
     target_compile_options(lazycom_release_hardening INTERFACE
-      "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-D_FORTIFY_SOURCE=3>"
+      "$<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:-D_FORTIFY_SOURCE=${lazycom_fortify_level}>"
     )
   endif()
 
@@ -153,9 +162,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
     )
   endif()
 
-  check_c_compiler_flag("-D_FORTIFY_SOURCE=3" LAZYCOM_C_HAS_FORTIFY_SOURCE_3)
+  check_c_compiler_flag("-D_FORTIFY_SOURCE=${lazycom_fortify_level}" LAZYCOM_C_HAS_FORTIFY_SOURCE_3)
   if(LAZYCOM_C_HAS_OPTIMIZATION AND LAZYCOM_C_HAS_FORTIFY_SOURCE_3)
-    list(APPEND LAZYCOM_LIBSERIALPORT_RELEASE_CFLAGS -D_FORTIFY_SOURCE=3)
+    list(APPEND LAZYCOM_LIBSERIALPORT_RELEASE_CFLAGS -D_FORTIFY_SOURCE=${lazycom_fortify_level})
   endif()
 
   foreach(lazycom_linker_option IN ITEMS relro now noexecstack)

@@ -4,7 +4,7 @@
 
 - 本文档定义 LazyCom 的工程实现、构建系统、模块边界、并发接口、依赖管理、测试门禁和版本演进路线。
 - `Plan.md` 是产品行为、交互、状态语义和验收标准的事实来源；本文档不得改变其中已确认的产品语义。
-- 工具链、依赖最低版本、模块边界和实现方式以本文档为准，并与 `Plan.md` 已确认的 Ubuntu 24.04 和 libserialport 0.1.2 基线保持一致。
+- 工具链、依赖最低版本、模块边界和实现方式以本文档为准，并与 `Plan.md` 的运行兼容目标及 libserialport 0.1.2 基线保持一致。
 - 两份文档在产品行为上冲突时，先停止实现并完成设计审核，不在代码中隐式选择一种行为。
 - 首版目标平台为现代 Linux，语言标准为 C++20。
 - 首版只提供纯字节串口助手；工业协议、脚本和插件仅是非规范性研究候选，必须先在 `Plan.md` 完成产品审核才可进入实施路线。
@@ -64,7 +64,7 @@
 ```cmake
 cmake_minimum_required(VERSION 3.28)
 
-project(lazycom VERSION 0.1.0 LANGUAGES C CXX)
+project(lazycom VERSION 0.1.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -759,7 +759,7 @@ RX、TX 和命令每轮必须有预算；预算耗尽后使用零超时重新 `p
 
 ## 12. Linux 驱动与运行环境
 
-首版最低运行和构建基线为 Ubuntu 24.04 档：Linux kernel 6.8、glibc 2.39、GCC 13 或 Clang 18、CMake 3.28。CI 可以使用更新工具链，但不得无意引入高于该基线的 ABI 或系统调用依赖。
+发布二进制最低运行目标为 Linux kernel 4.15、glibc 2.27，架构为 x86_64 和 aarch64；目标发行版为 Ubuntu 18.04+、Debian 11+。源码构建仍要求 GCC 13 或 Clang 18、CMake 3.28。旧系统自带编译器不属于支持要求。兼容包在 Ubuntu 18.04 容器内使用 GCC 13.4.0 构建，静态链接 libstdc++ 和 libgcc，glibc 与 libserialport 保持动态链接。不得因宿主 runner 更新引入更高 ABI 或系统调用要求；容器共享宿主内核，构建成功不能替代旧内核运行验收。
 
 LazyCom 不分发内核驱动。常见设备由 Linux 内核模块支持：
 
@@ -1136,7 +1136,13 @@ Debug、GCC Release、no-diagnostics 和 ASan/UBSan 的生产构建。只有版�
 发布标签必须为 `v<项目版本>`；补丁版本为零时也接受省略 `.0`，例如 `v0.1`
 对应项目及包版本 `0.1.0`。标签构建不加包版本后缀；分支构建使用
 `<项目版本>~pre.<run_number>.<run_attempt>.g<commit前12位>`。
-发布上传 DEB、RPM、AppImage、tar.gz 和统一 SHA-256 校验文件，不覆盖已有发布。
+发布额外要求 x86_64 与 aarch64 两个打包 job 成功。Ubuntu 24.04 / Ubuntu 24.04 ARM runner
+分别运行固定镜像摘要的 Ubuntu 18.04 容器；GCC 13.4.0 源码和 CMake 3.31.10
+工具包固定校验和，下载仅发生在显式容器工具链准备阶段。生产 configure 不联网。
+DEB、RPM 和 tar.gz 在容器内生成，AppImage 在宿主打包旧 ABI 的同一二进制。
+旧 glibc 使用 `_FORTIFY_SOURCE=2`，支持 level 3 的系统维持原设置。
+静态 GCC runtime 的 GPLv3 与 GCC Runtime Library Exception 许可随包携带。
+发布上传两个架构的 DEB、RPM、AppImage、tar.gz 和统一 SHA-256 校验文件，不覆盖已有发布。
 手动选择版本标签可重试尚未成功的发布；工作流不自动删除旧标签或 Release。
 
 `Runtime` 安装组件将程序安装到 `bin/lazycom`，将 bundled libserialport 安装到

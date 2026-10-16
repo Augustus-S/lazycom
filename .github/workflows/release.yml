@@ -70,32 +70,55 @@ jobs:
       - name: Build
         run: cmake --build --preset "$PRESET"
 
-      - name: Install packaging tools
-        if: matrix.preset == 'gcc-release'
+  package:
+    name: Package ${{ matrix.arch }} (glibc 2.27)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            base: ubuntu@sha256:dca176c9663a7ba4c1f0e710986f5a25e672842963d95b960191e2d9f7185ebe
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            base: ubuntu@sha256:f97a5103cca28097326814718e711c9c41b54853c26959d73495e40b1dd608f2
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Build Ubuntu 18.04 toolchain
+        env:
+          BASE_IMAGE: ${{ matrix.base }}
+        run: docker build --build-arg BASE_IMAGE="$BASE_IMAGE" -f packaging/legacy.Dockerfile -t lazycom-legacy packaging
+
+      - name: Build portable packages
         run: |
+          docker run --rm -v "$PWD:$PWD" -w "$PWD" \
+            -e GITHUB_SHA -e GITHUB_REF_TYPE -e GITHUB_REF_NAME \
+            -e GITHUB_RUN_NUMBER -e GITHUB_RUN_ATTEMPT -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            lazycom-legacy bash packaging/build-legacy.sh
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             dpkg-dev rpm file binutils curl desktop-file-utils squashfs-tools
 
-      - name: Build DEB, RPM, archive and AppImage
-        if: matrix.preset == 'gcc-release'
+      - name: Build AppImage with host packaging tools
         run: |
-          for generator in DEB RPM TGZ; do
-            cpack --config build/gcc-release/CPackConfig.cmake \
-              -G "$generator" -B build/packages
-          done
-          mkdir -p build/release-assets
-          cp build/packages/*.deb build/packages/*.rpm build/packages/*.tar.gz \
-            build/release-assets/
+          sudo chown -R "$(id -u):$(id -g)" build
           bash packaging/build-appimage.sh build/gcc-release build/release-assets
-
           cd build/release-assets
-          sha256sum ./*.deb ./*.rpm ./*.tar.gz ./*.AppImage > SHA256SUMS
+          sha256sum ./*.deb ./*.rpm ./*.tar.gz ./*.AppImage > "SHA256SUMS-$(uname -m)"
 
       - name: Upload release bundle
-        if: matrix.preset == 'gcc-release'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
-          name: release-linux-x86_64
+          name: release-linux-${{ matrix.arch }}
           path: build/release-assets/
           if-no-files-found: error
           overwrite: true
@@ -105,7 +128,7 @@ jobs:
   release:
     name: Publish release
     if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -114,7 +137,8 @@ jobs:
       - name: Download release bundle
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          name: release-linux-x86_64
+          pattern: release-linux-*
+          merge-multiple: true
           path: release-assets
 
       - name: Publish GitHub release
@@ -123,14 +147,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          cat SHA256SUMS-* > SHA256SUMS
           sha256sum --check SHA256SUMS
           tag="$GITHUB_REF_NAME"
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
-          LazyCom $tag Linux x86_64 版本。
+          LazyCom $tag Linux x86_64 / aarch64 (ARM64) 版本。
 
           - Commit: $GITHUB_SHA
           - 构建记录: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
-          - DEB: Debian 13、Ubuntu 24.04 / 26.04；使用 apt install ./lazycom_*.deb 安装。
+          - 兼容目标：Ubuntu 18.04+、Debian 11+（glibc 2.27+）；按 CPU 架构选择附件。
+          - DEB: amd64 或 arm64；使用 apt install ./lazycom_*.deb 安装。
           - RPM: Fedora 44；使用 dnf install ./lazycom-*.rpm 安装。
           - 安装后的命令为 lazycom。
           - AppImage: 设置可执行权限后运行；无 FUSE 时可设置 APPIMAGE_EXTRACT_AND_RUN=1。

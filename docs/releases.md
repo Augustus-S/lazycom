@@ -35,7 +35,10 @@ runner 固定为 `ubuntu-24.04`，安装 GCC 13 和 Clang 18。生产构建矩�
 冒烟验证。`gcc-tsan` 是本地 configure/build preset，没有加入自动矩阵。
 测试代码与执行入口由独立 `../lazycom-test` 仓库维护，须按明确指令使用。
 
-Release job 下载 `release-linux-x86_64` artifact，核对 `SHA256SUMS` 后发布。
+独立打包 job 在 `ubuntu-24.04` 和 `ubuntu-24.04-arm` runner 上分别构建 x86_64 与
+aarch64 包。每个 job 使用固定摘要的 Ubuntu 18.04 容器及 GCC 13.4.0、CMake 3.31.10，
+工具源码或归档均固定校验和；构建定义见 `packaging/legacy.Dockerfile`。
+Release job 下载两个 `release-linux-*` artifact，合并并核对 `SHA256SUMS` 后发布。
 构建 job 使用 `contents: read`，发布 job 使用自动提供的 `GITHUB_TOKEN` 和
 `contents: write`；仓库或组织策略须允许该权限，无需配置个人 token。
 Actions artifact 保留 7 天；该期限不删除已经上传到 Releases 的附件。
@@ -62,18 +65,21 @@ artifact 并不代表整个矩阵成功。若构建通过但发布失败，检�
 
 ## 发布产物与兼容范围
 
-GitHub Actions 的产物均为 x86_64，使用 Ubuntu 24.04、GCC 13 和 C++20 Release 构建。
-Fedora 原生 RPM/SRPM 使用下文单独的构建入口。
+GitHub Actions 为 x86_64 和 aarch64（ARM64，不含 ARM 32 位）提供相同格式的附件。
+发布二进制在 Ubuntu 18.04 / glibc 2.27 上用 GCC 13.4.0 和 C++20 Release 构建，
+静态链接 libstdc++、libgcc，动态链接系统 glibc 和随包 libserialport。
+这不要求用户升级系统 glibc 或 C++ 运行库。Fedora 原生 RPM/SRPM 使用下文单独入口。
 
 | 格式 | 包名或文件名 | 使用方式 |
 | --- | --- | --- |
-| DEB | `lazycom_<版本>_amd64.deb` | 通过 apt 安装 |
-| RPM | `lazycom-<版本>-1.x86_64.rpm` | 通过 dnf 安装 |
-| AppImage | `lazycom-<版本>-x86_64.AppImage` | 可执行文件，支持解包运行 |
-| tar.gz | `lazycom-<版本>-linux-x86_64.tar.gz` | 解压后保留完整目录树 |
-| 校验文件 | `SHA256SUMS` | 校验上述四个附件 |
+| DEB | `lazycom_<版本>_<amd64或arm64>.deb` | 通过 apt 安装 |
+| RPM | `lazycom-<版本>-1.<x86_64或aarch64>.rpm` | 通过 dnf 安装 |
+| AppImage | `lazycom-<版本>-<x86_64或aarch64>.AppImage` | 可执行文件，支持解包运行 |
+| tar.gz | `lazycom-<版本>-linux-<x86_64或aarch64>.tar.gz` | 解压后保留完整目录树 |
+| 校验文件 | `SHA256SUMS` | 校验两个架构的八个附件 |
 
-工作流发布说明列出的目标系统为 Debian 13、Ubuntu 24.04 / 26.04 和 Fedora 44。
+DEB 的兼容目标为 Debian 11+、Ubuntu 18.04+，RPM 目标仍为 Fedora 44。
+最低运行目标为 Linux kernel 4.15、glibc 2.27；容器共享宿主内核，不能证明旧内核兼容。
 这是目标范围，当前自动流程不提供这些系统的安装、启动或卸载验证结果。
 真实 USB-UART 与长时性能验收也未由发布流程完成。
 
@@ -130,8 +136,8 @@ chmod +x lazycom-*-x86_64.AppImage
 APPIMAGE_EXTRACT_AND_RUN=1 ./lazycom-*-x86_64.AppImage
 ```
 
-AppImage 保留系统 glibc、libstdc++ 和 libgcc 依赖，运行基线为 Ubuntu 24.04
-同代或更新的兼容系统。tar.gz 解压后运行 `usr/bin/lazycom`；移动时保留整个 `usr/`
+发布 AppImage 保留系统 glibc 依赖，兼容目标为 glibc 2.27+，不依赖系统的新版
+libstdc++ 或 libgcc。上述示例使用 x86_64，ARM64 用户替换为 aarch64 附件。tar.gz 解压后运行 `usr/bin/lazycom`；移动时保留整个 `usr/`
 目录树。二者都保留可替换的 libserialport shared library。
 
 串口设备组可能为 `dialout`、`uucp` 或发行版自定义组，访问权限由管理员配置；
@@ -166,7 +172,10 @@ DEB 自动依赖分析要求在 Debian/Ubuntu 环境运行。默认本地包版�
 可在 configure 时传入 `LAZYCOM_PACKAGE_SUFFIX` 和 `LAZYCOM_BUILD_COMMIT`。
 本地未设置 `LAZYCOM_BUILD_COMMIT` 时，包内 `COMMIT` 写入 `unknown`。
 `APPIMAGE_TOOL_DIR` 可指向工具缓存目录，其中的文件名必须是
-`appimagetool-x86_64.AppImage` 和 `runtime-x86_64`。
+`appimagetool-<架构>.AppImage` 和 `runtime-<架构>`（x86_64 或 aarch64）。
+本地现代系统直接构建的包不会自动获得 glibc 2.27 兼容性；低 ABI 发布包必须使用
+`packaging/legacy.Dockerfile` 与 `packaging/build-legacy.sh`，不能只静态链接 C++ runtime
+或手工降低 DEB 依赖声明。
 
 `Runtime` 安装组件仅支持 Linux 默认 vendored 模式，安装前必须先构建程序：
 

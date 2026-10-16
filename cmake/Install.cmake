@@ -25,6 +25,14 @@ install(DIRECTORY third_party/libserialport
   DESTINATION "${CMAKE_INSTALL_DATADIR}/lazycom/source" COMPONENT Runtime
   USE_SOURCE_PERMISSIONS
 )
+set(LAZYCOM_GCC_RUNTIME_LICENSE_DIR "" CACHE PATH "License directory for statically linked GCC runtime")
+if(LAZYCOM_GCC_RUNTIME_LICENSE_DIR)
+  install(FILES
+    "${LAZYCOM_GCC_RUNTIME_LICENSE_DIR}/COPYING3"
+    "${LAZYCOM_GCC_RUNTIME_LICENSE_DIR}/COPYING.RUNTIME"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/lazycom/licenses/gcc-runtime" COMPONENT Runtime
+  )
+endif()
 install(FILES LICENSE
   DESTINATION "${CMAKE_INSTALL_DATADIR}/lazycom/licenses" COMPONENT Runtime
 )

@@ -1,4 +1,4 @@
-%global upstream_version 0.1.0
+%global upstream_version 0.1.1
 %global source_commit unknown
 %global package_suffix %{nil}
 
